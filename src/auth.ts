@@ -7,9 +7,11 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
+export type TokenKind = "deployment" | "person" | "runner";
+
 export interface TokenRecord {
   id: string;
-  kind: "deployment" | "person";
+  kind: TokenKind;
   namespace: string; // d/<packId>/<agentId> | u/<user>
   token_hash: string;
   created_at: string;
@@ -19,8 +21,8 @@ export interface TokenRecord {
 
 export interface Scope {
   tokenId: string;
-  kind: "deployment" | "person";
-  namespace: string;
+  kind: TokenKind;
+  namespace: string; // runner tokens carry "*"
 }
 
 function hash(token: string, pepper: string): string {
@@ -41,7 +43,7 @@ export class TokenStore {
     );
   }
 
-  mint(kind: "deployment" | "person", namespace: string, label?: string): { token: string; id: string } {
+  mint(kind: TokenKind, namespace: string, label?: string): { token: string; id: string } {
     const token = "fdm_" + randomBytes(24).toString("hex");
     const id = randomBytes(8).toString("hex");
     this.db
@@ -55,7 +57,7 @@ export class TokenStore {
       .prepare("SELECT id, kind, namespace, revoked_at FROM tokens WHERE token_hash=?")
       .get(hash(token, this.pepper)) as (Omit<TokenRecord, "token_hash" | "created_at" | "label"> & { kind: string }) | undefined;
     if (!row || row.revoked_at) return null;
-    return { tokenId: row.id, kind: row.kind as "deployment" | "person", namespace: row.namespace };
+    return { tokenId: row.id, kind: row.kind as TokenKind, namespace: row.namespace };
   }
 
   revoke(id: string): boolean {
@@ -88,6 +90,8 @@ export function namespaceParts(ns: string): { rootKey: string; project: string }
 
 export function scopeAllowsNamespace(scope: Scope, ns: string): boolean {
   if (scope.kind === "deployment") return ns === scope.namespace;
+  // runner scope: capture into any deployment namespace (d/*), nothing else
+  if (scope.kind === "runner") return ns.startsWith("d/");
   // person scope: anything under their u/<user> root
   return ns === scope.namespace || ns.startsWith(scope.namespace + "/");
 }

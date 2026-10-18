@@ -219,3 +219,43 @@ test("http service: auth 401, capture 200, mcp initialize + tools/list round-tri
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("runner token: capture into many d/ namespaces, MCP refused, deployment token ignores payload ns", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const runnerTok = svc.tokens.mint("runner", "*").token;
+    const depTok = svc.tokens.mint("deployment", "d/p1/a1").token;
+    server = createServer((req, res) => {
+      (svc as any).route(req, res).catch((e: unknown) => { res.writeHead(500); res.end(String(e)); });
+    });
+    await new Promise<void>((r) => (server ? server.listen(0, "127.0.0.1", r) : r()));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+
+    const post = (tok: string, body: unknown) =>
+      fetch(base + "/capture", { method: "POST", headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+
+    // runner token lands the same session id in two deployment namespaces
+    let r = await post(runnerTok, { namespace: "d/p1/a1", events: [{ event: "session-start", session_id: "s1" }] });
+    assert.equal(r.status, 200);
+    r = await post(runnerTok, { namespace: "d/p2/a2", events: [{ event: "stop", session_id: "s1", summary: "turn ok" }] });
+    assert.equal(r.status, 200);
+    // runner may not touch person namespaces
+    r = await post(runnerTok, { namespace: "u/alice", events: [{ event: "stop", session_id: "s1" }] });
+    assert.equal(r.status, 403);
+    // runner token on the MCP face is refused
+    const mcp = await fetch(base + "/mcp", { method: "POST", headers: { authorization: `Bearer ${runnerTok}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
+    assert.equal(mcp.status, 403);
+    // deployment token ignores a payload namespace override (scope stays its own)
+    r = await post(depTok, { namespace: "d/p2/a2", events: [{ event: "session-start", session_id: "s2" }] });
+    assert.equal(r.status, 200);
+    const root2 = svc.rootFor({ tokenId: "x", kind: "deployment", namespace: "d/p2/a2" });
+    assert.equal(root2.db.observationsForSession("s2").length, 0);
+    const root1 = svc.rootFor({ tokenId: "x", kind: "deployment", namespace: "d/p1/a1" });
+    assert.equal(root1.db.observationsForSession("s2").length, 1);
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

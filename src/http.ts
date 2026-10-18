@@ -4,7 +4,7 @@
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { TokenStore, Scope, namespaceParts } from "./auth.js";
+import { TokenStore, Scope, namespaceParts, scopeAllowsNamespace } from "./auth.js";
 import { StoreRoot } from "./store.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools } from "./mcp.js";
@@ -75,15 +75,27 @@ export class Service {
     }
 
     if (path === "/capture" && req.method === "POST") {
-      const body = await this.body<{ events?: CaptureEvent[] } | CaptureEvent[]>(req);
+      const body = await this.body<{ events?: CaptureEvent[]; namespace?: string } | CaptureEvent[]>(req);
       const events = Array.isArray(body) ? body : (body.events ?? [body as CaptureEvent]);
-      const { rootKey, project } = namespaceParts(scope.namespace);
+      // Deployment/person tokens always land in their own namespace (a
+      // payload namespace is ignored, never honored). Runner tokens are
+      // capture-only and carry the target d/ namespace per batch.
+      const ns = scope.kind === "runner" ? String((body as { namespace?: string }).namespace ?? "") : scope.namespace;
+      if (scope.kind === "runner" && !scopeAllowsNamespace(scope, ns)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "forbidden_namespace" }));
+      }
+      const { rootKey, project } = namespaceParts(ns);
       const out = this.ingest.ingest(rootKey, project, events);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
 
     if (path === "/mcp" && req.method === "POST") {
+      if (scope.kind === "runner") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "runner tokens are capture-only" } }));
+      }
       return this.mcp(req, res, scope);
     }
 
