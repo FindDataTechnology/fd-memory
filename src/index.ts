@@ -24,7 +24,8 @@ usage:
 env:
   FD_MEMORY_DATA     data directory (default ~/Library/Application Support/fd-memory)
   FD_MEMORY_PEPPER   token hash pepper (set this in production)
-  FD_MEMORY_PORT     listen port (default 49375)`);
+  FD_MEMORY_PORT     listen port (default 49375)
+  FD_MEMORY_HOST     bind host (default 127.0.0.1; containers set 0.0.0.0)`);
   process.exit(0);
 }
 
@@ -32,7 +33,7 @@ mkdirSync(dataDir(), { recursive: true });
 
 if (cmd === "serve") {
   const port = Number(process.env.FD_MEMORY_PORT ?? argValue("--port") ?? 49375);
-  new Service({ dataDir: dataDir(), port, pepper: pepper() }).listen();
+  new Service({ dataDir: dataDir(), port, host: process.env.FD_MEMORY_HOST ?? "127.0.0.1", pepper: pepper() }).listen();
 } else if (cmd === "token") {
   const store = new TokenStore(dataDir() + "/tokens.db", pepper());
   const sub = process.argv[3];

@@ -13,6 +13,7 @@ export interface ServiceOptions {
   dataDir: string;
   port: number;
   pepper: string;
+  host?: string;
 }
 
 export class Service {
@@ -42,8 +43,9 @@ export class Service {
         res.end(JSON.stringify({ error: "internal", message: String(err?.message ?? err) }));
       });
     });
-    server.listen(this.opts.port, "127.0.0.1");
-    console.log(`[fd-memory] listening on 127.0.0.1:${this.opts.port} data=${this.opts.dataDir}`);
+    const host = this.opts.host ?? "127.0.0.1";
+    server.listen(this.opts.port, host);
+    console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
   }
 
   private auth(req: IncomingMessage): Scope | null {
