@@ -7,7 +7,7 @@ import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 import { RootDb, HandoffRow } from "./db.js";
-import { newPage, writePageFile, readPageFile, appendLedger, projectManifest } from "./okf.js";
+import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
 import { sanitize } from "./sanitize.js";
 
 export interface HandoffInput {
@@ -32,6 +32,7 @@ export class StoreRoot {
     this.rootDir = join(dataDir, "owners", rootKey);
     this.wikiDir = join(this.rootDir, "wiki");
     mkdirSync(this.wikiDir, { recursive: true });
+    workspaceManifest(this.wikiDir);
     this.db = new RootDb(join(this.rootDir, "db", "memory.sqlite"));
     this.ensureGit();
   }

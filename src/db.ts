@@ -93,16 +93,30 @@ export class RootDb {
         return [];
       }
     })();
-    if (fts.length > 0) return fts;
-    // trigram needs >=3 chars; fall back to LIKE for shorter queries
-    return (
+    let rows = fts;
+    if (rows.length === 0) {
+      // trigram needs >=3 chars; fall back to LIKE for shorter queries
+      rows = (
+        this.db
+          .prepare(
+            `SELECT path, title, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
+             FROM pages WHERE title LIKE ? OR body LIKE ? LIMIT ${Math.max(1, limit | 0)}`,
+          )
+          .all(query, `%${query}%`, `%${query}%`) as unknown as Array<{ path: string; title: string; snippet: string }>
+      );
+    }
+    // observations join the search face (spec: manager-captured observations
+    // are searchable) — LIKE scan at v1 scale, FTS promotion later.
+    const obs = (
       this.db
         .prepare(
-          `SELECT path, title, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
-           FROM pages WHERE title LIKE ? OR body LIKE ? LIMIT ${Math.max(1, limit | 0)}`,
+          `SELECT session_id || '/' || event AS path, coalesce(tool, event) AS title,
+             substr(summary, max(1, instr(lower(summary), lower(?)) - 40), 120) AS snippet
+           FROM observations WHERE summary LIKE ? OR tool LIKE ? LIMIT ${Math.max(1, limit | 0)}`,
         )
         .all(query, `%${query}%`, `%${query}%`) as unknown as Array<{ path: string; title: string; snippet: string }>
     );
+    return [...rows, ...obs].slice(0, limit);
   }
 
   private ftsQuery(q: string): string {

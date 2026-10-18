@@ -56,13 +56,19 @@ export function appendLedger(projectDir: string, event: string, title: string, a
   appendFileSync(ledgerFile(projectDir, at), line, "utf8");
 }
 
+// Scope Manifest, verbatim ai-memory 3.0.0 shape (fixtures/okf-3.0.0 real
+// sample) — plain frontmatter, no body, so a stock node reindexes our tree.
 export function projectManifest(projectDir: string, name: string): void {
   const meta = join(projectDir, "_meta.md");
   if (!existsSync(meta)) {
-    writePageFile(meta, {
-      frontmatter: { type: "meta", title: name, generated: { by: "process:fd-memory/0.1", at: new Date().toISOString() } },
-      body: `project: ${name}\n`,
-    });
+    writeFileSync(meta, `---\nproject: ${name}\ntype: Scope Manifest\n---\n`, "utf8");
+  }
+}
+
+export function workspaceManifest(wikiDir: string, name = "default"): void {
+  const meta = join(wikiDir, "_meta.md");
+  if (!existsSync(meta)) {
+    writeFileSync(meta, `---\nworkspace: ${name}\ntype: Scope Manifest\n---\n`, "utf8");
   }
 }
 
