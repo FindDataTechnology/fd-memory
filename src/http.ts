@@ -188,6 +188,23 @@ export class Service {
       return void res.end(JSON.stringify({ error: "method_not_allowed" }));
     }
     const body = await this.body<Record<string, string>>(req);
+    if (path === "/admin/mint") {
+      // Runner-only (add-fleet-memory-v1): the platform seam mints per-deployment
+      // tokens at first spawn; runner tokens themselves stay capture-only.
+      if (scope.kind !== "runner") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "runner_only" }));
+      }
+      const ns = String(body.namespace ?? "");
+      if (!ns.startsWith("d/") || ns.split("/").length !== 3) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId>/<agentId>" }));
+      }
+      const out = this.tokens.mint("deployment", ns, String(body.label ?? "runner-minted"));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(out));
+    }
+
     if (path === "/admin/reindex") {
       const root = this.rootFor(scope);
       const count = root.db.reindexFromWiki(root.wikiDir);

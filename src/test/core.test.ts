@@ -259,3 +259,33 @@ test("runner token: capture into many d/ namespaces, MCP refused, deployment tok
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("runner token mints per-deployment tokens; other scopes cannot mint", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const runnerTok = svc.tokens.mint("runner", "*").token;
+    server = createServer((req, res) => {
+      (svc as any).route(req, res).catch((e: unknown) => { res.writeHead(500); res.end(String(e)); });
+    });
+    await new Promise<void>((r) => (server ? server.listen(0, "127.0.0.1", r) : r()));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const mint = (tok: string, ns: string) =>
+      fetch(base + "/admin/mint", { method: "POST", headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: JSON.stringify({ namespace: ns }) });
+    const ok = await mint(runnerTok, "d/p9/a9");
+    assert.equal(ok.status, 200);
+    const { token } = (await ok.json()) as { token: string };
+    // minted token is a real deployment token: MCP works, scope bound
+    const init = await fetch(base + "/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
+    assert.equal(init.status, 200);
+    const depTok = svc.tokens.mint("deployment", "d/p1/a1").token;
+    const forbidden = await mint(depTok, "d/p9/a9");
+    assert.equal(forbidden.status, 403);
+    const badNs = await mint(runnerTok, "u/alice");
+    assert.equal(badNs.status, 400);
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
