@@ -49,6 +49,13 @@ export class RootDb {
         tool TEXT, summary TEXT, created_at TEXT
       );
       CREATE INDEX IF NOT EXISTS obs_session ON observations(session_id);
+      CREATE TABLE IF NOT EXISTS hook_dedupe (
+        ingest_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        event TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (ingest_key, session_id, event)
+      );
       CREATE TABLE IF NOT EXISTS handoffs (
         id TEXT PRIMARY KEY, project TEXT, from_agent TEXT, summary TEXT,
         open_questions TEXT, next_steps TEXT, files_touched TEXT,

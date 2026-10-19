@@ -260,7 +260,11 @@ export class Service {
       // other kind — and every cross-target ask — is refused.
       const ns = String(body.namespace ?? "");
       if (scope.kind === "runner") {
-        if (!ns.startsWith("d/") || ns.split("/").length !== 3) {
+        if (!ns.startsWith("d/")) {
+          res.writeHead(403, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "cross_family_mint", runner_mints: "d/<packId>/<agentId>" }));
+        }
+        if (ns.split("/").length !== 3) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId>/<agentId>" }));
         }
@@ -269,7 +273,11 @@ export class Service {
         return void res.end(JSON.stringify(out));
       }
       if (scope.kind === "platform") {
-        if (!ns.startsWith("u/") || ns.split("/").length !== 2 || !ns.slice(2)) {
+        if (!ns.startsWith("u/")) {
+          res.writeHead(403, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "cross_family_mint", platform_mints: "u/<user>" }));
+        }
+        if (ns.split("/").length !== 2 || !ns.slice(2)) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "u/<user>" }));
         }

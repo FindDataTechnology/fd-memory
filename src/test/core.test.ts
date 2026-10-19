@@ -326,7 +326,7 @@ test("federation: /hook person face + platform minting matrix + idempotency", as
     // ② platform minting face: mints u/ person; refuses d/; runner refuses u/
     const mint = (tok: string, ns: string) => post("/admin/mint", tok, JSON.stringify({ namespace: ns })).then((x) => x.status);
     assert.equal(await mint(platform, "u/bob"), 200);
-    assert.equal(await mint(platform, "d/p/a"), 400);
+    assert.equal(await mint(platform, "d/p/a"), 403);
     assert.equal(await mint(runner, "u/bob"), 403);
     assert.equal(await mint(person, "u/bob"), 403);
 
