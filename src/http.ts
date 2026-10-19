@@ -39,6 +39,7 @@ export class Service {
   listen(): void {
     const server = createServer((req, res) => {
       this.route(req, res).catch((err) => {
+        console.error("[fd-memory] internal error on", req.method, req.url, String(err?.stack ?? err));
         res.writeHead(500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "internal", message: String(err?.message ?? err) }));
       });

@@ -37,13 +37,24 @@ export class StoreRoot {
     this.ensureGit();
   }
 
+  // Git is OPTIONAL (node:22-slim ships no git): without it the wiki is still
+  // the durable truth on the PV — snapshots are a best-effort bonus (and the
+  // daily snapshot cron on the host does the versioning when git exists).
+  private gitAvailable = false;
+
   private ensureGit(): void {
     try {
       execFileSync("git", ["-C", this.wikiDir, "rev-parse", "--is-inside-work-tree"], { stdio: "ignore" });
+      this.gitAvailable = true;
     } catch {
-      execFileSync("git", ["init", "-q"], { cwd: this.wikiDir });
-      execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@finddata"]);
-      execFileSync("git", ["-C", this.wikiDir, "config", "user.name", "fd-memory"]);
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: this.wikiDir, stdio: "ignore" });
+        execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@finddata"], { stdio: "ignore" });
+        execFileSync("git", ["-C", this.wikiDir, "config", "user.name", "fd-memory"], { stdio: "ignore" });
+        this.gitAvailable = true;
+      } catch {
+        this.gitAvailable = false;
+      }
     }
   }
 
@@ -51,6 +62,7 @@ export class StoreRoot {
     if (this.gitTimer) return;
     this.gitTimer = setTimeout(() => {
       this.gitTimer = null;
+      if (!this.gitAvailable) return;
       try {
         execFileSync("git", ["-C", this.wikiDir, "add", "-A"], { stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { stdio: "ignore" });
