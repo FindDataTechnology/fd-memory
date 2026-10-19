@@ -18,7 +18,7 @@ if (cmd === "--help" || cmd === "help") {
   console.log(`fd-memory — fleet working-memory service
 usage:
   fd-memory serve [--port N]        start the HTTP service (default)
-  fd-memory token mint --kind deployment|person|runner --namespace <ns|*> [--label L]
+  fd-memory token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]
   fd-memory token list
   fd-memory token revoke --id <id>
 env:
@@ -38,11 +38,11 @@ if (cmd === "serve") {
   const store = new TokenStore(dataDir() + "/tokens.db", pepper());
   const sub = process.argv[3];
   if (sub === "mint") {
-    const kind = argValue("--kind") as "deployment" | "person" | "runner";
+    const kind = argValue("--kind") as "deployment" | "person" | "runner" | "platform";
     const namespace = argValue("--namespace");
     const label = argValue("--label");
-    if (!kind || !namespace || !["deployment", "person", "runner"].includes(kind)) {
-      console.error("usage: token mint --kind deployment|person|runner --namespace <ns|*> [--label L]");
+    if (!kind || !namespace || !["deployment", "person", "runner", "platform"].includes(kind)) {
+      console.error("usage: token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]");
       process.exit(2);
     }
     if (kind === "deployment" && !namespace.startsWith("d/")) {
@@ -55,6 +55,10 @@ if (cmd === "serve") {
     }
     if (kind === "runner" && namespace !== "*") {
       console.error("runner tokens use --namespace * (capture-only, any d/ target)");
+      process.exit(2);
+    }
+    if (kind === "platform" && namespace !== "*") {
+      console.error("platform tokens use --namespace * (minting-only, mints u/ person tokens)");
       process.exit(2);
     }
     const out = store.mint(kind, namespace, label);

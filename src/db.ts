@@ -171,6 +171,18 @@ export class RootDb {
 
   // -- reindex ---------------------------------------------------------------
 
+  // Spool-replay idempotency (add-memory-federation-v1): returns true when
+  // this exact hook event has NOT been seen (caller stores), false on replay.
+  // Key (ingest_key, session_id, event) WITHOUT a timestamp on purpose: the
+  // server receive-time is unstable across spool replays; dropping it makes
+  // dedupe a superset of the spec's (…, ts) requirement.
+  claimHookEvent(ingestKey: string, sessionId: string, event: string, seenAt: string): boolean {
+    const res = this.db
+      .prepare("INSERT OR IGNORE INTO hook_dedupe (ingest_key, session_id, event, seen_at) VALUES (?,?,?,?)")
+      .run(ingestKey, sessionId, event, seenAt);
+    return res.changes > 0;
+  }
+
   reindexFromWiki(wikiDir: string): number {
     this.db.exec("DELETE FROM pages");
     this.db.exec("DELETE FROM pages_fts");

@@ -289,3 +289,62 @@ test("runner token mints per-deployment tokens; other scopes cannot mint", async
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("federation: /hook person face + platform minting matrix + idempotency", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const runner = svc.tokens.mint("runner", "*").token;
+    const platform = svc.tokens.mint("platform", "*").token;
+    server = createServer((req, res) => {
+      (svc as any).route(req, res).catch((e: unknown) => { res.writeHead(500); res.end(String(e)); });
+    });
+    await new Promise<void>((r) => (server ? server.listen(0, "127.0.0.1", r) : r()));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const post = (p: string, tok: string, body?: string) =>
+      fetch(base + p, { method: "POST", headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" }, body: body ?? "{}" });
+
+    // ① person /hook: valid event lands in u/alice/p/<cwd basename>
+    const q = "/hook?event=user-prompt-submit&agent=zcode&cwd=%2FUsers%2Fx%2Fproj77&ingest_key=k1";
+    let r = await post(q, person, JSON.stringify({ session_id: "s-fed-1", cwd: "/Users/x/proj77", prompt: "联邦首投 hello" }));
+    assert.equal(r.status, 200);
+    assert.equal((await r.json()).stored, 1);
+    // idempotent replay (same ingest_key+session+event)
+    r = await post(q, person, JSON.stringify({ session_id: "s-fed-1", cwd: "/Users/x/proj77", prompt: "联邦首投 hello" }));
+    assert.equal((await r.json()).stored, 0);
+    // bad event 400
+    r = await post("/hook?event=bogus&agent=z&cwd=/x&ingest_key=k2", person, JSON.stringify({ session_id: "s" }));
+    assert.equal(r.status, 400);
+    // runner + platform both rejected on /hook
+    r = await post("/hook?event=stop&agent=z&cwd=/x&ingest_key=k3", runner, JSON.stringify({ session_id: "s" }));
+    assert.equal(r.status, 403);
+    r = await post("/hook?event=stop&agent=z&cwd=/x&ingest_key=k4", platform, JSON.stringify({ session_id: "s" }));
+    assert.equal(r.status, 403);
+
+    // ② platform minting face: mints u/ person; refuses d/; runner refuses u/
+    const mint = (tok: string, ns: string) => post("/admin/mint", tok, JSON.stringify({ namespace: ns })).then((x) => x.status);
+    assert.equal(await mint(platform, "u/bob"), 200);
+    assert.equal(await mint(platform, "d/p/a"), 400);
+    assert.equal(await mint(runner, "u/bob"), 403);
+    assert.equal(await mint(person, "u/bob"), 403);
+
+    // ③ platform on data faces all 403
+    assert.equal(await post("/capture", platform, JSON.stringify({ events: [] }) || "{}").then((x) => x.status) >= 400, true);
+    const mcp = await fetch(base + "/mcp", { method: "POST", headers: { authorization: `Bearer ${platform}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
+    assert.equal(mcp.status, 403);
+
+    // ④ platform-minted person token full-power on its own namespace
+    const bobTok = (await (await post("/admin/mint", platform, JSON.stringify({ namespace: "u/bob", label: "t" }))).json()).token;
+    const init = await fetch(base + "/mcp", { method: "POST", headers: { authorization: `Bearer ${bobTok}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) });
+    assert.equal(init.status, 200);
+
+    // ⑤ the fed event is searchable in alice's root
+    const rootAlice = svc.rootFor({ tokenId: "x", kind: "person", namespace: "u/alice" });
+    assert.equal(rootAlice.db.searchPages("联邦首投").length >= 1, true);
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

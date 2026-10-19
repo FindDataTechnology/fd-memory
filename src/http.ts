@@ -56,6 +56,12 @@ export class Service {
     return this.tokens.verify(m[1].trim());
   }
 
+  private async rawBody(req: IncomingMessage): Promise<string> {
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    return text;
+  }
+
   private async body<T>(req: IncomingMessage): Promise<T> {
     let text = "";
     for await (const chunk of req) text += chunk;
@@ -78,6 +84,10 @@ export class Service {
     }
 
     if (path === "/capture" && req.method === "POST") {
+      if (scope.kind === "platform") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "platform_is_minting_only" }));
+      }
       const body = await this.body<{ events?: CaptureEvent[]; namespace?: string } | CaptureEvent[]>(req);
       const events = Array.isArray(body) ? body : (body.events ?? [body as CaptureEvent]);
       // Deployment/person tokens always land in their own namespace (a
@@ -90,6 +100,59 @@ export class Service {
       }
       const { rootKey, project } = namespaceParts(ns);
       const out = this.ingest.ingest(rootKey, project, events);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(out));
+    }
+
+    // ── /hook compat face (add-memory-federation-v1): the upstream ai-memory
+    // wire protocol, verbatim from the spike — POST /hook?event&agent&cwd&
+    // ingest_key with the raw hook payload as body and a person token bearer.
+    // Person tokens only: this is the local-node federation lane (u/ roots).
+    if (path === "/hook" && req.method === "POST") {
+      if (scope.kind !== "person") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const q = new URL(req.url ?? "/", "http://local").searchParams;
+      const event = String(q.get("event") ?? "");
+      const agent = String(q.get("agent") ?? "unknown");
+      const cwd = String(q.get("cwd") ?? "");
+      const ingestKey = String(q.get("ingest_key") ?? "");
+      const ALLOWED = ["session-start", "user-prompt-submit", "pre-tool-use", "post-tool-use", "stop", "session-end"];
+      if (!ALLOWED.includes(event) || !ingestKey) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_hook", allowed_events: ALLOWED }));
+      }
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(await this.rawBody(req)); } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_body" }));
+      }
+      const sessionId = String(payload.session_id ?? "");
+      if (!sessionId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "session_id_required" }));
+      }
+      // namespace: person root + project from cwd basename (empty → "cell")
+      const project = (cwd.split("/").filter(Boolean).pop() ?? "cell") || "cell";
+      const { rootKey } = namespaceParts(`${scope.namespace}/p/${project}`);
+      const root = this.rootFor(scope);
+      const at = new Date().toISOString();
+      if (!root.db.claimHookEvent(ingestKey, sessionId, event, at)) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ stored: 0, duplicate: true }));
+      }
+      const ev: CaptureEvent = {
+        event: event as CaptureEvent["event"],
+        session_id: sessionId,
+        agent,
+        cwd: cwd || undefined,
+        tool_name: payload.tool_name != null ? String(payload.tool_name) : undefined,
+        summary: payload.prompt != null ? String(payload.prompt) : payload.summary != null ? String(payload.summary) : undefined,
+        tool_input: payload.tool_input != null ? String(payload.tool_input) : undefined,
+        at,
+      };
+      const out = this.ingest.ingest(rootKey, project, [ev]);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
@@ -192,20 +255,30 @@ export class Service {
     }
     const body = await this.body<Record<string, string>>(req);
     if (path === "/admin/mint") {
-      // Runner-only (add-fleet-memory-v1): the platform seam mints per-deployment
-      // tokens at first spawn; runner tokens themselves stay capture-only.
-      if (scope.kind !== "runner") {
-        res.writeHead(403, { "content-type": "application/json" });
-        return void res.end(JSON.stringify({ error: "runner_only" }));
-      }
+      // Split authority (add-memory-federation-v1): runner mints deployment
+      // tokens (d/), platform mints person tokens (u/) for its users. Every
+      // other kind — and every cross-target ask — is refused.
       const ns = String(body.namespace ?? "");
-      if (!ns.startsWith("d/") || ns.split("/").length !== 3) {
-        res.writeHead(400, { "content-type": "application/json" });
-        return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId>/<agentId>" }));
+      if (scope.kind === "runner") {
+        if (!ns.startsWith("d/") || ns.split("/").length !== 3) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId>/<agentId>" }));
+        }
+        const out = this.tokens.mint("deployment", ns, String(body.label ?? "runner-minted"));
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify(out));
       }
-      const out = this.tokens.mint("deployment", ns, String(body.label ?? "runner-minted"));
-      res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify(out));
+      if (scope.kind === "platform") {
+        if (!ns.startsWith("u/") || ns.split("/").length !== 2 || !ns.slice(2)) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "u/<user>" }));
+        }
+        const out = this.tokens.mint("person", ns, String(body.label ?? "platform-minted"));
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify(out));
+      }
+      res.writeHead(403, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment", "platform:person"] }));
     }
 
     if (path === "/admin/reindex") {

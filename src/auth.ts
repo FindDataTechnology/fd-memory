@@ -7,7 +7,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
-export type TokenKind = "deployment" | "person" | "runner";
+export type TokenKind = "deployment" | "person" | "runner" | "platform";
 
 export interface TokenRecord {
   id: string;
@@ -92,6 +92,9 @@ export function scopeAllowsNamespace(scope: Scope, ns: string): boolean {
   if (scope.kind === "deployment") return ns === scope.namespace;
   // runner scope: capture into any deployment namespace (d/*), nothing else
   if (scope.kind === "runner") return ns.startsWith("d/");
+  // platform is a pure minting face (add-memory-federation-v1): no data
+  // namespace is ever in its scope — the mint route is its only authority.
+  if (scope.kind === "platform") return false;
   // person scope: anything under their u/<user> root
   return ns === scope.namespace || ns.startsWith(scope.namespace + "/");
 }
