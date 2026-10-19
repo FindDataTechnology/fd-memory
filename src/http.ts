@@ -158,9 +158,9 @@ export class Service {
     }
 
     if (path === "/mcp" && req.method === "POST") {
-      if (scope.kind === "runner") {
+      if (scope.kind === "runner" || scope.kind === "platform") {
         res.writeHead(403, { "content-type": "application/json" });
-        return void res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "runner tokens are capture-only" } }));
+        return void res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "service tokens carry no data-plane identity" } }));
       }
       return this.mcp(req, res, scope);
     }

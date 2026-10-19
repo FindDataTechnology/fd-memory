@@ -283,7 +283,7 @@ test("runner token mints per-deployment tokens; other scopes cannot mint", async
     const forbidden = await mint(depTok, "d/p9/a9");
     assert.equal(forbidden.status, 403);
     const badNs = await mint(runnerTok, "u/alice");
-    assert.equal(badNs.status, 400);
+    assert.equal(badNs.status, 403);
   } finally {
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
