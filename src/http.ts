@@ -1,13 +1,15 @@
 // HTTP wiring: /mcp (JSON-RPC over streamable-http), /capture (hooks-shaped
-// event ingest), /healthz, /admin/* (token ops, root-scoped). Auth on every
+// event ingest), /pages (platform-seam project read/write face — the wire
+// carries a project NAME resolved inside the caller's own root, never a
+// namespace), /healthz, /admin/* (token ops, root-scoped). Auth on every
 // route except /healthz; auth failures are structured JSON.
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { TokenStore, Scope, namespaceParts, scopeAllowsNamespace } from "./auth.js";
+import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot } from "./store.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
-import { buildTools } from "./mcp.js";
+import { buildTools, writeNotePage } from "./mcp.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -28,6 +30,10 @@ export class Service {
 
   rootFor(scope: Scope): StoreRoot {
     const { rootKey } = namespaceParts(scope.namespace);
+    return this.rootForKey(rootKey);
+  }
+
+  rootForKey(rootKey: string): StoreRoot {
     let root = this.roots.get(rootKey);
     if (!root) {
       root = new StoreRoot(this.opts.dataDir, rootKey);
@@ -88,18 +94,24 @@ export class Service {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "platform_is_minting_only" }));
       }
+      // Pod tokens are mount credentials for the MCP face; the capture lane
+      // stays runner (per-batch target) or self-namespace.
+      if (scope.kind === "pod") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "pod_tokens_are_mcp_only" }));
+      }
       const body = await this.body<{ events?: CaptureEvent[]; namespace?: string } | CaptureEvent[]>(req);
       const events = Array.isArray(body) ? body : (body.events ?? [body as CaptureEvent]);
       // Deployment/person tokens always land in their own namespace (a
       // payload namespace is ignored, never honored). Runner tokens are
       // capture-only and carry the target d/ namespace per batch.
       const ns = scope.kind === "runner" ? String((body as { namespace?: string }).namespace ?? "") : scope.namespace;
-      if (scope.kind === "runner" && !scopeAllowsNamespace(scope, ns)) {
+      if (scope.kind === "runner" && !ns.startsWith("d/")) {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "forbidden_namespace" }));
       }
       const { rootKey, project } = namespaceParts(ns);
-      const out = this.ingest.ingest(rootKey, project, events);
+      const out = this.ingest.ingest(rootKey, project, events, { principal: `${scope.kind}:${scope.tokenId}`, scope: ns });
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
@@ -152,7 +164,7 @@ export class Service {
         tool_input: payload.tool_input != null ? String(payload.tool_input) : undefined,
         at,
       };
-      const out = this.ingest.ingest(rootKey, project, [ev]);
+      const out = this.ingest.ingest(rootKey, project, [ev], { principal: `person:${scope.tokenId}`, scope: `${scope.namespace}/p/${project}` });
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
@@ -165,6 +177,58 @@ export class Service {
       return this.mcp(req, res, scope);
     }
 
+    // ── /pages (add-memory-scopes-and-cluster-sharing): the platform-seam
+    // project face. Callers name a project INSIDE their own root (the wire
+    // carries no namespace); authorization is the grant table, writes are
+    // audited. This is the lane the cell's cluster-turn orchestration (and
+    // later the distiller) uses — trusted platform seams, not model-facing.
+    if (path === "/pages" && (req.method === "GET" || req.method === "POST")) {
+      if (scope.kind === "runner" || scope.kind === "platform") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "service_tokens_carry_no_data_plane_identity" }));
+      }
+      const isDeploy = scope.kind === "deployment" || scope.kind === "pod";
+      const packNs = isDeploy ? "d/" + namespaceParts(scope.namespace).rootKey.slice(2) : null;
+      const nsOfProject = (project: string): string =>
+        scope.kind === "person" ? `${scope.namespace}/p/${project}` : project === "shared" ? packNs! : `${packNs}/${project}`;
+      const projectOf = (raw: unknown): string => String(raw ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
+      const auditOf = (project: string) => ({ principal: `${scope.kind}:${scope.tokenId}`, scope: nsOfProject(project) });
+      if (req.method === "GET") {
+        const project = projectOf(url.searchParams.get("project"));
+        if (!project) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "project_required" }));
+        }
+        if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
+          res.writeHead(403, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "forbidden_project", project }));
+        }
+        const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 10)));
+        const root = this.rootFor(scope);
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ project, pages: root.db.recentPages(limit, [project]) }));
+      }
+      const body = await this.body<{ project?: string; title?: string; body?: string }>(req);
+      const project = projectOf(body.project);
+      const title = String(body.title ?? "").trim();
+      const pageBody = String(body.body ?? "");
+      if (!project || !title || !pageBody) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "project_title_body_required" }));
+      }
+      if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "rw")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "forbidden_project", project }));
+      }
+      const root = this.rootFor(scope);
+      // Pages from this face are plain notes — reindex treats them like any
+      // other page; the audit row names the platform-seam principal.
+      const rel = writeNotePage(root, project, title, pageBody);
+      this.auditRoot(root, auditOf(project), rel, "page_write");
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ project, path: rel }));
+    }
+
     // namespace overrides never apply: the wire protocol has no namespace
     // parameter; a query-string attempt is ignored, not honored.
     if (path.startsWith("/admin/")) {
@@ -173,6 +237,14 @@ export class Service {
 
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "not_found", path }));
+  }
+
+  private auditRoot(root: StoreRoot, a: { principal: string; scope: string }, pageRel: string, op: string): void {
+    try {
+      root.db.addWrite(a.principal, a.scope, pageRel, op);
+    } catch {
+      /* companion record only */
+    }
   }
 
   // -- MCP (streamable-http) -------------------------------------------------
@@ -215,19 +287,23 @@ export class Service {
       return void res.end();
     }
 
+    // Grants consulted per call (fresh table read): revoking a grant narrows
+    // the tool face immediately, mirroring the token's own no-cache rule.
+    const tools = () => buildTools(session.scope, session.root, { allows: (ns, mode) => this.tokens.allows(session.scope.tokenId, ns, mode) });
+
     if (msg.method === "tools/list") {
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({
         jsonrpc: "2.0",
         id: msg.id,
-        result: { tools: buildTools(session.scope, session.root).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) },
+        result: { tools: tools().map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) },
       }));
     }
 
     if (msg.method === "tools/call") {
       const name = String(msg.params?.name ?? "");
       const args = (msg.params?.arguments ?? {}) as Record<string, unknown>;
-      const tool = buildTools(session.scope, session.root).find((t) => t.name === name);
+      const tool = tools().find((t) => t.name === name);
       if (!tool) {
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `unknown tool ${name}` } }));
@@ -257,20 +333,28 @@ export class Service {
     if (path === "/admin/mint") {
       // Split authority (add-memory-federation-v1): runner mints deployment
       // tokens (d/), platform mints person tokens (u/) for its users. Every
-      // other kind — and every cross-target ask — is refused.
+      // other kind — and every cross-target ask — is refused. A d/ namespace
+      // of TWO segments mints a pod token (the pack's shared mount); THREE
+      // segments mint a member token (add-memory-scopes-and-cluster-sharing).
       const ns = String(body.namespace ?? "");
       if (scope.kind === "runner") {
         if (!ns.startsWith("d/")) {
           res.writeHead(403, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "cross_family_mint", runner_mints: "d/<packId>/<agentId>" }));
+          return void res.end(JSON.stringify({ error: "cross_family_mint", runner_mints: "d/<packId>[/<agentId>]" }));
         }
-        if (ns.split("/").length !== 3) {
-          res.writeHead(400, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId>/<agentId>" }));
+        const segs = ns.slice(2).split("/").filter(Boolean);
+        if (segs.length === 2) {
+          const out = this.tokens.mint("deployment", ns, String(body.label ?? "runner-minted"));
+          res.writeHead(200, { "content-type": "application/json" });
+          return void res.end(JSON.stringify(out));
         }
-        const out = this.tokens.mint("deployment", ns, String(body.label ?? "runner-minted"));
-        res.writeHead(200, { "content-type": "application/json" });
-        return void res.end(JSON.stringify(out));
+        if (segs.length === 1) {
+          const out = this.tokens.mint("pod", ns, String(body.label ?? "runner-minted"));
+          res.writeHead(200, { "content-type": "application/json" });
+          return void res.end(JSON.stringify(out));
+        }
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId> (pod) | d/<packId>/<agentId> (member)" }));
       }
       if (scope.kind === "platform") {
         if (!ns.startsWith("u/")) {
@@ -286,7 +370,7 @@ export class Service {
         return void res.end(JSON.stringify(out));
       }
       res.writeHead(403, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment", "platform:person"] }));
+      return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment|pod", "platform:person"] }));
     }
 
     if (path === "/admin/reindex") {
@@ -295,7 +379,30 @@ export class Service {
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ reindexed: count }));
     }
+
+    // Memory report for one root: the grants that reach into it (with their
+    // token identities) and the root's recent write audit. Persons and data
+    // tokens see their own root; runner/platform may name any root (ops).
+    if (path === "/admin/report") {
+      let rootKey: string;
+      if (scope.kind === "runner" || scope.kind === "platform") {
+        rootKey = String(body.rootKey ?? "");
+        if (!rootKey) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_required" }));
+        }
+      } else {
+        rootKey = namespaceParts(scope.namespace).rootKey;
+      }
+      const root = this.rootForKey(rootKey);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({
+        rootKey,
+        grants: this.tokens.grantsForRoot(rootKey),
+        recent_writes: root.db.recentWrites(50),
+      }));
+    }
     res.writeHead(404, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: "not_found" }));
+    res.end(JSON.stringify({ error: "not_found", path }));
   }
 }

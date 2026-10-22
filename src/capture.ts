@@ -2,7 +2,7 @@
 // manager) or from local nodes. Identity comes from the token; events land in
 // the token's namespace only.
 
-import { StoreRoot } from "./store.js";
+import { StoreRoot, AuditIdentity } from "./store.js";
 import { newPage, appendLedger } from "./okf.js";
 import { sanitize } from "./sanitize.js";
 
@@ -40,7 +40,7 @@ export class CaptureIngest {
     private openRoot: (rootKey: string) => StoreRoot,
   ) {}
 
-  ingest(rootKey: string, project: string, events: CaptureEvent[]): { stored: number } {
+  ingest(rootKey: string, project: string, events: CaptureEvent[], audit?: AuditIdentity): { stored: number } {
     const root = this.roots.get(rootKey) ?? this.openRoot(rootKey);
     if (!this.roots.has(rootKey)) this.roots.set(rootKey, root);
     root.ensureProject(project);
@@ -56,6 +56,7 @@ export class CaptureIngest {
         tool: e.tool_name ? sanitize(String(e.tool_name)) : null,
         summary: summaryOf(e),
         created_at: e.at ?? new Date().toISOString(),
+        project,
       });
       sessions.add(e.session_id);
       stored++;
@@ -70,6 +71,13 @@ export class CaptureIngest {
     for (const e of events) {
       if (!e || typeof e.event !== "string") continue;
       appendLedger(dir, e.event, `${e.session_id.slice(0, 8)}${e.tool_name ? " " + sanitize(e.tool_name) : ""}`, e.at ? new Date(e.at) : undefined);
+    }
+    if (audit && stored > 0) {
+      try {
+        root.db.addWrite(audit.principal, audit.scope, project, "capture_batch");
+      } catch {
+        /* companion record only */
+      }
     }
     root.snapshotSoon(`capture: ${stored} events`);
     return { stored };

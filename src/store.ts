@@ -1,12 +1,19 @@
 // Store roots: one physically isolated root per memory owner. Cross-owner
 // data never shares a directory tree or a database file — isolation by
 // construction, not by query discipline.
+//
+// v2 (add-memory-scopes-and-cluster-sharing): a d/ root is the PACK's root —
+// members' projects and the shared project live in one tree; rootKey derives
+// from namespaceParts so d/<packId> and d/<packId>/<agentId> meet in
+// d-<packId>. Writes carry an optional audit identity (principal + scope)
+// recorded as companion rows.
 
 import { mkdirSync, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
 import { RootDb, HandoffRow } from "./db.js";
+import { namespaceParts } from "./auth.js";
 import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
 import { sanitize } from "./sanitize.js";
 
@@ -15,11 +22,17 @@ export interface HandoffInput {
   open_questions?: string[];
   next_steps?: string[];
   files_touched?: string[];
+  to_agent?: string;
 }
 
-// rootKey: "u-<user>" (person, projects inside) | "d-<packId>--<agentId>" (deployment, single project)
+export interface AuditIdentity {
+  principal: string;
+  scope: string;
+}
+
+// rootKey mirrors namespaceParts (v2): u/<user>… → u-<user>; d/<packId>[/<agentId>] → d-<packId>.
 export function rootKeyForNamespace(ns: string): string {
-  return ns.replace(/^u\//, "u-").replace(/^d\//, "d-").replace(/\//g, "--");
+  return namespaceParts(ns).rootKey;
 }
 
 export class StoreRoot {
@@ -72,7 +85,8 @@ export class StoreRoot {
     }, 500);
   }
 
-  // projectDir: for persons the p/<name> segment; deployments use "default".
+  // projectDir: the project's wiki subtree (persons may carry p/<name>, d/
+  // members use their agentId, the shared area is "shared").
   projectDir(project: string): string {
     return join(this.wikiDir, project);
   }
@@ -84,11 +98,12 @@ export class StoreRoot {
     return dir;
   }
 
-  writePage(project: string, typeDir: string, slug: string, page: ReturnType<typeof newPage>): string {
+  writePage(project: string, typeDir: string, slug: string, page: ReturnType<typeof newPage>, audit?: AuditIdentity): string {
     const dir = this.ensureProject(project);
     const rel = `${project}/${typeDir}/${slug}.md`;
     writePageFile(join(this.wikiDir, rel), page);
     this.db.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? slug), page.body);
+    if (audit) this.audit(audit, rel, "page_write");
     this.snapshotSoon(`page: ${rel}`);
     return rel;
   }
@@ -99,7 +114,15 @@ export class StoreRoot {
     return readPageFile(full);
   }
 
-  beginHandoff(project: string, fromAgent: string, input: HandoffInput): HandoffRow {
+  private audit(a: AuditIdentity, pageRel: string, op: string): void {
+    try {
+      this.db.addWrite(a.principal, a.scope, pageRel, op);
+    } catch {
+      /* audit is a companion record; never fail the write it describes */
+    }
+  }
+
+  beginHandoff(project: string, fromAgent: string, input: HandoffInput, audit?: AuditIdentity): HandoffRow {
     const id = randomUUID();
     const row: HandoffRow = {
       id,
@@ -109,6 +132,7 @@ export class StoreRoot {
       open_questions: JSON.stringify(input.open_questions ?? []),
       next_steps: JSON.stringify(input.next_steps ?? []),
       files_touched: JSON.stringify(input.files_touched ?? []),
+      to_agent: input.to_agent ? sanitize(input.to_agent) : null,
       state: "open",
       accepted_by: null,
       accepted_at: null,
@@ -121,8 +145,10 @@ export class StoreRoot {
       handoff_id: id,
       state: "open",
       from_agent: fromAgent,
-    }));
-    appendLedger(this.projectDir(project), "handoff_begin", `from ${fromAgent}`);
+      ...(row.to_agent ? { to_agent: row.to_agent } : {}),
+    }), audit);
+    if (audit) this.audit(audit, `${project}/handoffs/${id}.md`, "handoff_begin");
+    appendLedger(this.projectDir(project), "handoff_begin", `from ${fromAgent}${row.to_agent ? ` to ${row.to_agent}` : ""}`);
     return row;
   }
 
@@ -130,6 +156,7 @@ export class StoreRoot {
     const lines = (title: string, arr: string[]) => (arr.length ? `\n## ${title}\n` + arr.map((s) => `- ${s}`).join("\n") : "");
     return (
       `## Summary\n${h.summary}` +
+      (h.to_agent ? `\n\n（定向交接：${h.to_agent}）` : "") +
       lines("Open questions", JSON.parse(h.open_questions || "[]")) +
       lines("Next steps", JSON.parse(h.next_steps || "[]")) +
       lines("Files touched", JSON.parse(h.files_touched || "[]"))
@@ -138,7 +165,7 @@ export class StoreRoot {
 
   // Claim-once: two independent state guards (SELECT then conditional UPDATE),
   // mirroring the upstream protocol semantics.
-  acceptHandoff(id: string, byAgent: string): { claimed: boolean; handoff?: HandoffRow; already?: string } {
+  acceptHandoff(id: string, byAgent: string, audit?: AuditIdentity): { claimed: boolean; handoff?: HandoffRow; already?: string } {
     const first = this.db.getHandoff(id);
     if (!first) return { claimed: false };
     if (first.state !== "open") return { claimed: false, already: first.accepted_by ?? first.state };
@@ -158,12 +185,13 @@ export class StoreRoot {
       page.frontmatter.accepted_by = byAgent;
       writePageFile(join(this.wikiDir, rel), page);
     }
+    if (audit) this.audit(audit, rel, "handoff_accept");
     appendLedger(this.projectDir(row.project), "handoff_accept", `by ${byAgent}`);
     this.snapshotSoon(`handoff claim: ${id}`);
     return { claimed: true, handoff: row };
   }
 
-  cancelHandoff(id: string): boolean {
+  cancelHandoff(id: string, audit?: AuditIdentity): boolean {
     const row = this.db.getHandoff(id);
     if (!row || row.state !== "open") return false;
     this.db.db.prepare("UPDATE handoffs SET state='cancelled' WHERE id=? AND state='open'").run(id);
@@ -173,6 +201,7 @@ export class StoreRoot {
       page.frontmatter.state = "cancelled";
       writePageFile(join(this.wikiDir, rel), page);
     }
+    if (audit) this.audit(audit, rel, "handoff_cancel");
     return true;
   }
 }
