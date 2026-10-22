@@ -56,7 +56,34 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[fd-memory-distiller] {self.address_string()} {fmt % args}", flush=True)
 
 
+def load_provider_env():
+    """Resolve the 词元 lane credentials from the shared llm-providers store
+    (mounted from the runner's secret) when MEMORY_LLM_* is not set directly —
+    one key, one rotation point. Never printed."""
+    if os.environ.get("MEMORY_LLM_API_KEY"):
+        return
+    path = os.environ.get("LLM_PROVIDERS_FILE", "")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        import json as _json
+        doc = _json.load(open(path))
+        providers = doc.get("providers", doc)
+        wanted = os.environ.get("MEMORY_LLM_PROVIDER", "finddata")
+        for p in providers:
+            if isinstance(p, dict) and p.get("id") == wanted:
+                if p.get("baseUrl"):
+                    os.environ.setdefault("MEMORY_LLM_BASE_URL", str(p["baseUrl"]))
+                key = p.get("apiKey") or p.get("key")
+                if key:
+                    os.environ.setdefault("MEMORY_LLM_API_KEY", str(key))
+                return
+    except Exception as e:
+        print(f"[fd-memory-distiller] provider store parse failed: {e}", flush=True)
+
+
 def main():
+    load_provider_env()
     port = int(os.environ.get("DISTILLER_PORT", "8100"))
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     print(f"[fd-memory-distiller] listening on 0.0.0.0:{port} engine={engine.ENGINE}", flush=True)
