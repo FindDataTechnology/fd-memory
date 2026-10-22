@@ -48,8 +48,10 @@ function carryOver(oldDbPath: string, root: StoreRoot, project: string): { obs: 
     for (const row of obs) {
       root.db.addObservation({ ...row, project });
     }
+    // SELECT *: a v1 database predates to_agent (and any later column) —
+    // the fixed column list would crash against the real v1 schema.
     const handoffs = old
-      .prepare("SELECT id, project, from_agent, summary, open_questions, next_steps, files_touched, to_agent, state, accepted_by, accepted_at, created_at FROM handoffs ORDER BY created_at")
+      .prepare("SELECT * FROM handoffs ORDER BY created_at")
       .all() as Array<Record<string, string | null>>;
     for (const h of handoffs) {
       root.db.upsertHandoff({
@@ -84,26 +86,29 @@ function migrateNamespace(dataDir: string, dryRun: boolean, plan: Plan): void {
     console.log(`skip (already migrated or empty): ${plan.namespace}`);
     return;
   }
-  if (!existsSync(oldWikiDefault)) {
-    console.log(`skip (no default project): ${plan.namespace}`);
-    return;
-  }
-  const targetProjectDir = join(plan.newRoot, "wiki", plan.project);
-  if (existsSync(targetProjectDir)) {
-    // merge file-by-file; a name collision is a hard stop (manual call)
-    for (const entry of readdirSync(oldWikiDefault)) {
-      const dst = join(targetProjectDir, entry);
-      if (existsSync(dst)) throw new Error(`collision merging ${plan.namespace}: ${dst} already exists`);
-      if (dryRun) continue;
-      renameSync(join(oldWikiDefault, entry), dst);
+  // A v1 root may arrive PARTIALLY migrated (a prior run moved the wiki but
+  // crashed before carry-over) — everything below still runs; only the wiki
+  // move is conditional on wiki/default existing.
+  if (existsSync(oldWikiDefault)) {
+    const targetProjectDir = join(plan.newRoot, "wiki", plan.project);
+    if (existsSync(targetProjectDir)) {
+      // merge file-by-file; a name collision is a hard stop (manual call)
+      for (const entry of readdirSync(oldWikiDefault)) {
+        const dst = join(targetProjectDir, entry);
+        // _meta.md is the idempotent project manifest (a twin skeleton dir
+        // re-derives the same namespace); content files still hard-stop.
+        if (existsSync(dst) && entry !== "_meta.md") throw new Error(`collision merging ${plan.namespace}: ${dst} already exists`);
+        if (dryRun || (existsSync(dst) && entry === "_meta.md")) continue;
+        renameSync(join(oldWikiDefault, entry), dst);
+      }
+    } else {
+      if (!dryRun) {
+        mkdirSync(join(plan.newRoot, "wiki"), { recursive: true });
+        renameSync(oldWikiDefault, targetProjectDir);
+      }
     }
-  } else {
-    if (!dryRun) {
-      mkdirSync(join(plan.newRoot, "wiki"), { recursive: true });
-      renameSync(oldWikiDefault, targetProjectDir);
-    }
+    console.log(`${dryRun ? "[dry-run] " : ""}moved ${plan.namespace}: wiki/default -> ${plan.project}`);
   }
-  console.log(`${dryRun ? "[dry-run] " : ""}moved ${plan.namespace}: wiki/default -> ${plan.project}`);
   if (dryRun) return;
   const root = new StoreRoot(dataDir, plan.rootKey);
   const count = root.db.reindexFromWiki(root.wikiDir);
@@ -137,7 +142,11 @@ export function runMigration(dataDir: string, dryRun: boolean): void {
     });
   }
   console.log(`migrate-v2: data=${dataDir} namespaces=${plans.length}${dryRun ? " (dry-run)" : ""}`);
-  for (const plan of plans) migrateNamespace(dataDir, dryRun, plan);
+  const processed = new Set<string>();
+  for (const plan of plans) {
+    processed.add(plan.oldRoot);
+    migrateNamespace(dataDir, dryRun, plan);
+  }
 
   // Orphan v1 d- roots with no token: best-effort split (packIds may contain
   // "--"; we try every split and prefer the one whose pack side is non-empty).
@@ -145,6 +154,7 @@ export function runMigration(dataDir: string, dryRun: boolean): void {
     for (const entry of readdirSync(ownersDir)) {
       if (!entry.startsWith("d-") || entry.endsWith(".v1-backup")) continue;
       if (plans.some((p) => p.newRoot.endsWith(entry))) continue;
+      if (processed.has(join(ownersDir, entry))) continue; // already migrated by its plan
       const body = entry.slice(2);
       const splits = body.split("--");
       if (splits.length < 2) continue;
@@ -157,6 +167,7 @@ export function runMigration(dataDir: string, dryRun: boolean): void {
           newRoot: join(ownersDir, "d-" + splits[0]),
           project: splits.slice(1).join("--"),
         });
+        processed.add(join(ownersDir, entry));
       }
     }
   }

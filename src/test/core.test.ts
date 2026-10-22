@@ -646,12 +646,16 @@ test("federation: /hook person face + platform minting matrix + idempotency", as
 test("migrate-v2: moves wiki verbatim, carries observations/handoffs, keeps backup, idempotent", () => {
   const data = tmpData();
   try {
-    // Build a v1 world: token + old-layout root with content
+    // Build a v1 world: token + old-layout root with content. The old db is
+    // downgraded to the REAL v1 schema (no to_agent in handoffs, no project
+    // in observations) — a fixed-column carry-over crashed on prod exactly
+    // here; this test pins the regression.
     const store = new TokenStore(join(data, "tokens.db"), "pepper");
     store.mint("deployment", "d/packM/爬虫自愈修复 Agent");
     const oldRoot = new StoreRoot(data, "d-packM--爬虫自愈修复 Agent");
     oldRoot.beginHandoff("default", "spider-heal", { summary: "首轮排障结论 heal-x" });
     oldRoot.db.addObservation({ session_id: "s-old", agent: "spider-heal", event: "stop", tool: null, summary: "旧观测 legacy obs", created_at: new Date().toISOString(), project: "default" });
+    oldRoot.db.db.exec("ALTER TABLE handoffs DROP COLUMN to_agent; ALTER TABLE observations DROP COLUMN project;");
     const oldWikiPath = join(oldRoot.wikiDir, "default", "handoffs");
     const [handoffFile] = readdirSync(oldWikiPath).filter((f) => f.endsWith(".md"));
     const before = readFileSync(join(oldWikiPath, handoffFile), "utf8");
