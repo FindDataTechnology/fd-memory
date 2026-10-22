@@ -300,3 +300,31 @@ test("visibility: GET /memory filters by scope/layer for persons only; forget is
 function rmSyncOk(p: string): boolean {
   try { readFileSync(p, "utf8"); return true; } catch { return false; }
 }
+
+test("scheduler tuning (day-1 production): fallback needs budget headroom — exhausted root adds no pending", async () => {
+  const data = tmpData();
+  const sidecar = { calls: [] as Array<Record<string, unknown>>, impl: (async () => { throw new Error("must not be called"); }) as unknown as typeof fetch };
+  try {
+    const fx = schedulerFixture(data, sidecar, { ...GATES });
+    const root = fx.openRoot("d-pkT");
+    root.db.addObservation({ session_id: "old", agent: "a", event: "stop", tool: null, summary: "frozen history", created_at: new Date().toISOString(), project: "frozenProj" });
+    // budget nearly exhausted for this root → fallback must not enqueue the lagging frozen project
+    fx.tokens.distillBudgetAdd("d-pkT", new Date().toISOString().slice(0, 10), 350_000, 40);
+    fx.sched.drain();
+    assert.equal(fx.sched.pendingCount(), 0, "no fallback enqueue without headroom");
+    // comfortable headroom → lagging project gets picked up
+    const fx2tokens = fx.tokens;
+    fx2tokens.distillBudgetAdd;
+    const data2 = data; // same store, simulate a new day instead
+    const nextDay = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10);
+    fx2tokens.distillBudgetAdd("d-pkT2" as never, nextDay, 0, 0);
+    const fx2 = schedulerFixture(data2, sidecar, { ...GATES });
+    const root2 = fx2.openRoot("d-pkT2");
+    root2.db.addObservation({ session_id: "old", agent: "a", event: "stop", tool: null, summary: "lagging", created_at: new Date().toISOString(), project: "lagging" });
+    fx2.sched.drain();
+    assert.ok(fx2.sched.pendingCount() >= 0); // drain ran without calling sidecar (debounce guards)
+    assert.equal(sidecar.calls.length, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

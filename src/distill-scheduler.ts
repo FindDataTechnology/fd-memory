@@ -39,7 +39,13 @@ const FALLBACK_INTERVAL_MS = 10 * 60_000;
 const DRAIN_TICK_MS = 60_000;
 const MAX_BACKOFF_MS = 60 * 60_000;
 const FALLBACK_CURSOR_LAG = 200;
-const MAX_ITEMS = 500;
+// Day-1 production finding: fallback backfill of FROZEN projects (pre-
+// agentId-coordinate archives whose pages the current member cannot even
+// read) burned the daily budget before live projects caught up. Fallback now
+// only runs while comfortable budget headroom remains — session-triggered
+// (active) projects keep their claim on the limit up to the hard stop.
+const FALLBACK_BUDGET_RESERVE = 100_000;
+const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
 export class DistillScheduler {
@@ -120,6 +126,9 @@ export class DistillScheduler {
     this.lastFallback = this.now();
     for (const [rootKey, root] of this.opts.roots) {
       if (!rootKey.startsWith("d-")) continue;
+      const day = new Date().toISOString().slice(0, 10);
+      const remaining = this.dailyLimit() - this.opts.tokens.distillBudgetUsed(rootKey, day).tokens;
+      if (remaining < FALLBACK_BUDGET_RESERVE) continue; // active projects first
       const projects = new Set<string>();
       for (const row of root.db.recentObservations(2000) as unknown as Array<{ project: string }>) projects.add(row.project);
       for (const project of projects) {
