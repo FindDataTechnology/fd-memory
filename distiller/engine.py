@@ -28,7 +28,8 @@ from hy_memory.coding.reconciler import (
     build_experience_reconcile_prompt,
     CodingMemoryReconciler,
 )
-from hy_memory.coding.types import CodingMemory
+from hy_memory.coding.types import CodingMemory, WorkingFact
+from hy_memory.coding.fact_reconciler import build_fact_reconcile_prompt, WorkingFactReconciler
 from hy_memory.pipelines.base import ChatMessage, ToolCall
 from json_repair import repair_json
 
@@ -143,6 +144,47 @@ def sanitize(text):
 
 CJK = re.compile(r"[\u4e00-\u9fff]")
 
+SUBJECT_EDGE_PUNCT = " \t\r\n,.;:、。，；：！？\"'`()[]（）「」【】《》-_/\\|"
+
+
+def subject_equal(a, b):
+    """Path-1 gate: squeezed-form OR whitespace-stripped equality — the spec
+    scenario is 'case or whitespace differences only (paths/domains/emails)'."""
+    na, nb = normalize_subject(a), normalize_subject(b)
+    return bool(na) and bool(nb) and (na == nb or re.sub(r"\s", "", na) == re.sub(r"\s", "", nb))
+
+
+def normalize_subject(s):
+    """D2 path 1: NFKC (full→half width), lowercase, squeezed whitespace,
+    edge punctuation stripped. Machine identifiers (paths/domains/emails)
+    become equal here; drifted CJK noun phrases do not (path 2 judges them)."""
+    if not s:
+        return ""
+    out = unicodedata.normalize("NFKC", str(s)).lower()
+    out = re.sub(r"\s+", " ", out).strip()
+    return out.strip(SUBJECT_EDGE_PUNCT)
+
+
+import unicodedata  # noqa: E402  (kept next to its single consumer)
+
+
+FACT_MAX_PER_DISTILL = int(os.environ.get("DISTILLER_FACT_MAX", "2"))
+
+SUBJECT_JUDGE_PROMPT = """You are a subject-equivalence judge for a memory system.
+Decide whether each DRAFT subject refers to the SAME real-world entity/topic as a CANDIDATE subject.
+Drifted phrasing of one entity (added location words, parentheses, suffixes, word order) is the SAME subject.
+Genuinely different entities (different host/path/account/task) are DIFFERENT.
+Answer ONLY with JSON:
+{{"matches": [{{"i": <draft index>, "j": <candidate index>, "same": true|false, "reason": "<short>"}}]}}
+One entry per PAIR listed below.
+
+DRAFTS:
+{drafts_block}
+
+CANDIDATES:
+{candidates_block}
+"""
+
 
 def is_cjk(text):
     return bool(text) and bool(CJK.search(text))
@@ -227,6 +269,71 @@ def entry_from_draft(draft, kind, supersedes, sources):
     }
 
 
+async def reconcile_facts(provider, recorder, fact_drafts, fact_candidates, sources, scope):
+    """v2.1 fact layer: engine reconcile mapping → subject dual-path → cap.
+    Returns the fact entries to emit."""
+    out: list = []
+    if fact_drafts:
+        related: dict[int, list[str]] = {}
+        if fact_candidates:
+            fact_objs = [
+                WorkingFact(
+                    fact_id=str(c.get("id")),
+                    user_id=scope,
+                    statement=str(c.get("task", "")),
+                    subject=str(c.get("task", ""))[:200],
+                )
+                for c in fact_candidates
+            ]
+            fprompt, _flang = build_fact_reconcile_prompt(fact_drafts, [fact_objs for _ in fact_drafts])
+            fresp = await provider.complete(prompt=fprompt, max_tokens=2000, audit_stage="distill_fact_reconcile")
+            related = WorkingFactReconciler._parse_ops(fresp.content) or {}
+
+            # D2 path 2: subjects that normalization cannot equate go to ONE
+            # structured LLM judgment; judged-same pairs count as related.
+            judge_pairs = []
+            for i in range(len(fact_drafts)):
+                d_sub = getattr(fact_drafts[i], "subject", "") or ""
+                for j, c in enumerate(fact_candidates):
+                    if str(c.get("id")) in [str(x) for x in related.get(i, [])]:
+                        continue
+                    if subject_equal(d_sub, str(c.get("task", ""))):
+                        related.setdefault(i, []).append(str(c.get("id")))  # path 1: equality
+                        continue
+                    judge_pairs.append((i, j, d_sub, str(c.get("task", ""))))
+            if judge_pairs:
+                drafts_block = "\n".join(f"{i}. {sub}" for i, _j, sub, _c in judge_pairs)
+                cands_block = "\n".join(f"{j}. {csub}" for _i, j, _s, csub in judge_pairs)
+                jresp = await provider.complete(
+                    prompt=SUBJECT_JUDGE_PROMPT.format(drafts_block=drafts_block, candidates_block=cands_block),
+                    max_tokens=1000,
+                    audit_stage="distill_subject_judge",
+                )
+                try:
+                    jm = json.loads(repair_json(jresp.content))
+                    for m in jm.get("matches", []):
+                        if not m.get("same"):
+                            continue
+                        pair = judge_pairs[int(m.get("i", -1))]
+                        if int(m.get("j", -1)) == pair[1]:
+                            related.setdefault(pair[0], []).append(str(fact_candidates[pair[1]].get("id")))
+                            recorder.calls.append({"stage": "distill_subject_judge", "ok": True, "merged": f"{pair[2][:40]} == {pair[3][:40]}", "reason": str(m.get("reason", ""))[:120]})
+                except Exception as e:
+                    recorder.calls.append({"stage": "distill_subject_judge", "ok": True, "warning": f"judge parse failed, pairs left unrelated: {type(e).__name__}"})
+
+        # cap: merges (supersedes) keep their slots first, then plain adds
+        merged = [(i, sup) for i, sup in related.items() if sup]
+        plain = [i for i in range(len(fact_drafts)) if not related.get(i)]
+        keep = [i for i, _ in merged] + plain
+        dropped = keep[FACT_MAX_PER_DISTILL:]
+        keep = keep[:FACT_MAX_PER_DISTILL]
+        if dropped:
+            recorder.calls.append({"stage": "fact_cap", "ok": True, "warning": f"dropped {len(dropped)} fact draft(s) (DISTILLER_FACT_MAX={FACT_MAX_PER_DISTILL})"})
+        for i in keep:
+            out.append(entry_from_draft(fact_drafts[i], "fact", [str(x) for x in related.get(i, [])], sources))
+    return out
+
+
 async def distill(request):
     scope = str(request.get("scope", ""))
     project = scope.split("/")[-1] if "/" in scope else "default"
@@ -244,6 +351,9 @@ async def distill(request):
     facts_out = []
     experiences_out = []
 
+    exp_candidates = [c for c in candidates_in if c.get("kind") != "fact"]
+    fact_candidates = [c for c in candidates_in if c.get("kind") == "fact"]
+
     if messages:
         drafts, fact_drafts = await extractor.extract(
             messages=messages,
@@ -252,10 +362,6 @@ async def distill(request):
             agent_id=project,
             session_id=session_ids[0] if session_ids else "",
         )
-        # fact layer: extract-only at v1 (subject normalization lands with the
-        # fact reconciler in a later slice)
-        for fd in fact_drafts:
-            facts_out.append(entry_from_draft(fd, "fact", [], sources))
 
         if drafts:
             cand_objs = [
@@ -267,14 +373,14 @@ async def distill(request):
                     solution=str(c.get("solution", "")),
                     boundary_envs=str(c.get("boundary_envs", "")),
                 )
-                for c in candidates_in
+                for c in exp_candidates
             ]
             ops = []
             if cand_objs:
                 prompt, _lang = build_experience_reconcile_prompt(drafts, [cand_objs for _ in drafts])
                 resp = await provider.complete(prompt=prompt, max_tokens=2000, audit_stage="distill_reconcile")
                 ops = CodingMemoryReconciler._parse_ops(resp.content)
-            cand_ids = {str(c.get("id")) for c in candidates_in}
+            cand_ids = {str(c.get("id")) for c in exp_candidates}
             decided = set()
             for op in ops or []:
                 idx = getattr(op, "draft_idx", None)
@@ -290,6 +396,9 @@ async def distill(request):
             for i, d in enumerate(drafts):
                 if i not in decided:
                     experiences_out.append(entry_from_draft(d, "experience", [], sources))
+
+        if fact_drafts:
+            facts_out.extend(await reconcile_facts(provider, recorder, fact_drafts, fact_candidates, sources, scope))
 
         # C2 post-check: a CJK conversation must not produce non-CJK tasks
         conv_text = " ".join(m.content or "" for m in messages if getattr(m, "content", None))

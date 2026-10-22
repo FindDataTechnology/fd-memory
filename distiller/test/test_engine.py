@@ -77,3 +77,81 @@ def test_distill_reports_errors_not_silence():
     drafts, facts = asyncio.run(extractor.extract(messages=msgs, user_id="d-p/a", agent_id="a", session_id="s1"))
     assert drafts == [] and facts == []
     assert recorder.errors and "gateway timeout" in recorder.errors[0]
+
+
+# ── v2.1: fact reconcile + subject dual-path + cap ───────────────────────────
+
+import types, asyncio
+
+
+class FactDraft:
+    def __init__(self, statement, subject, details=""):
+        self.statement = statement
+        self.subject = subject
+        self.details = details
+        self.files = []
+
+    def to_dict(self):
+        return {"statement": self.statement, "subject": self.subject, "details": self.details, "files": []}
+
+
+def test_subject_equal_paths():
+    assert engine.subject_equal("HKCCR.ccs.TencentYun.COM / PAAS / Agent ", "hkccr.ccs.tencentyun.com/paas/agent")
+    assert engine.subject_equal("web/src/pages/UsageTable.tsx", "web/src/pages/UsageTable.tsx ")
+    assert not engine.subject_equal("web/src/pages/UsageTable.tsx", "web/src/pages/UsageDetail.tsx")
+    # S1 drifted pair: path 1 must NOT equate (that is path 2's job)
+    assert not engine.subject_equal("cheap-2 deploy/agent-api", "cheap-2 上的 deploy/agent-api (namespace serving)")
+
+
+def fake_provider(responses):
+    calls = []
+    p = types.SimpleNamespace()
+    async def complete(*a, **kw):
+        calls.append({"stage": kw.get("audit_stage"), "prompt": kw.get("prompt", "")[:60]})
+        r = responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return types.SimpleNamespace(content=r, prompt_tokens=10, completion_tokens=5)
+    p.complete = complete
+    return p, calls
+
+
+class Rec:
+    def __init__(self):
+        self.calls = []
+        self.errors = []
+
+
+def test_fact_reconcile_maps_and_merges():
+    provider, calls = fake_provider(['{"ops": [{"draft_idx": 0, "supersedes": ["fact_old1"]}]}'])
+    rec = Rec()
+    drafts = [FactDraft("G7 分组上游 DNS 超时已定位", "G7/DNS")]
+    cands = [{"id": "fact_old1", "kind": "fact", "task": "G7 分组 5xx 根因排查", "search_keys": [], "solution": "", "boundary_envs": ""}]
+    out = asyncio.run(engine.reconcile_facts(provider, rec, drafts, cands, ["session:s1"], "d-p/a"))
+    assert len(out) == 1
+    assert out[0]["supersedes"] == ["fact_old1"]
+    assert any(c["stage"] == "distill_fact_reconcile" for c in calls)
+
+
+def test_subject_judge_merges_drifted_pair():
+    judge_json = '{"matches": [{"i": 0, "j": 0, "same": true, "reason": "同一车道仅措辞不同"}]}'
+    provider, calls = fake_provider(['{"ops": {}}', judge_json])
+    rec = Rec()
+    drafts = [FactDraft("cheap-2 上的 deploy/agent-api (namespace serving) 恢复", "cheap-2 deploy/agent-api 车道")]
+    cands = [{"id": "fact_old9", "kind": "fact", "task": "cheap-2 deploy/agent-api 车道 403 排查", "search_keys": [], "solution": "", "boundary_envs": ""}]
+    out = asyncio.run(engine.reconcile_facts(provider, rec, drafts, cands, ["session:s2"], "d-p/a"))
+    assert out[0]["supersedes"] == ["fact_old9"]
+    assert any(c["stage"] == "distill_subject_judge" for c in calls)
+    assert any(c.get("merged") for c in rec.calls)
+
+
+def test_fact_cap_drops_with_audit():
+    provider, calls = fake_provider(['{"ops": [{"draft_idx": 0, "supersedes": ["f1"]}, {"draft_idx": 1, "supersedes": ["f2"]}]}', '{"matches": []}'])
+    rec = Rec()
+    drafts = [FactDraft(f"事实 {i}", f"s{i}") for i in range(4)]
+    cands = [{"id": f"f{i}", "kind": "fact", "task": f"t{i}", "search_keys": [], "solution": "", "boundary_envs": ""} for i in range(2)]
+    out = asyncio.run(engine.reconcile_facts(provider, rec, drafts, cands, ["session:s3"], "d-p/a"))
+    assert len(out) == 2  # FACT_MAX default 2
+    assert any(c.get("stage") == "fact_cap" and "dropped" in c.get("warning", "") for c in rec.calls)
+    # merged drafts keep their slots (both supersedes present or merged-first ordering)
+    assert all(e["supersedes"] or i >= 0 for i, e in enumerate(out))

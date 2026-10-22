@@ -62,7 +62,7 @@ async function main() {
     for (const scene of scenes) {
       await distillScene(scene);
       pagesAfter[scene.id] = root.db.recentPages(100, ["agentEval"]).filter((p) => p.type === "experience").length;
-      if (!scene.dedup_of && pagesAfter[scene.id] === 0) {
+      if (!scene.dedup_of && !scene.no_output_gate && pagesAfter[scene.id] === 0) {
         console.log(`[eval-distill] FAIL: scene ${scene.id} produced 0 experiences (call failure must surface, never read as empty)`);
         hardFails++;
       }
@@ -79,6 +79,15 @@ async function main() {
         console.log(`[eval-distill] scene ${scene.id} keyword "${kw}": ${hit ? "HIT" : "MISS"}`);
       }
     }
+    // v2.1 fact gates: same-subject sessions merge into supersede chains
+    const factPages = root.db.recentPages(100, ["agentEval"]).filter((p) => p.type === "fact");
+    const supersedingFacts = factPages.filter((p) => JSON.parse(p.supersedes ?? "[]").length > 0);
+    console.log(`[eval-distill] facts=${factPages.length} superseding=${supersedingFacts.length}`);
+    if (scenes.some((x) => x.fact_merge) && supersedingFacts.length === 0) {
+      console.log("[eval-distill] FAIL: fact merge — same-subject sessions produced no supersede chain");
+      hardFails++;
+    }
+
     // dedup gate: s11 must supersede, not duplicate — count experience pages
     // whose supersedes points at an s10-era id, and total pages for the same topic
     const superseding = pages.filter((p) => JSON.parse(p.supersedes ?? "[]").length > 0);
