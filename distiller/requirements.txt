@@ -1,0 +1,4 @@
+# Engine #1: pinned Hy-Memory (boundary patches in engine.py — no vendoring,
+# no code-level coupling; upgrade requires an eval-gate run by design).
+hy-memory @ git+https://github.com/Tencent-Hunyuan/Hy-Memory.git@0244ebe
+json-repair>=0.30

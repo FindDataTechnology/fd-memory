@@ -10,6 +10,7 @@ import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot } from "./store.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
+import { DistillScheduler } from "./distill-scheduler.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -21,11 +22,18 @@ export interface ServiceOptions {
 export class Service {
   readonly tokens: TokenStore;
   readonly ingest: CaptureIngest;
+  readonly distill: DistillScheduler;
   private roots = new Map<string, StoreRoot>();
 
   constructor(readonly opts: ServiceOptions) {
     this.tokens = new TokenStore(opts.dataDir + "/tokens.db", opts.pepper);
     this.ingest = new CaptureIngest(this.roots, (key) => new StoreRoot(opts.dataDir, key));
+    this.distill = new DistillScheduler({
+      roots: this.roots,
+      openRoot: (key) => this.rootForKey(key),
+      tokens: this.tokens,
+      env: process.env,
+    });
   }
 
   rootFor(scope: Scope): StoreRoot {
@@ -52,6 +60,7 @@ export class Service {
     });
     const host = this.opts.host ?? "127.0.0.1";
     server.listen(this.opts.port, host);
+    this.distill.start();
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
   }
 
@@ -112,6 +121,7 @@ export class Service {
       }
       const { rootKey, project } = namespaceParts(ns);
       const out = this.ingest.ingest(rootKey, project, events, { principal: `${scope.kind}:${scope.tokenId}`, scope: ns });
+      this.distill.notifyCapture(rootKey, project, events as Array<{ event?: string }>);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
@@ -165,6 +175,7 @@ export class Service {
         at,
       };
       const out = this.ingest.ingest(rootKey, project, [ev], { principal: `person:${scope.tokenId}`, scope: `${scope.namespace}/p/${project}` });
+      this.distill.notifyCapture(rootKey, project, [ev]);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out));
     }
@@ -227,6 +238,62 @@ export class Service {
       this.auditRoot(root, auditOf(project), rel, "page_write");
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, path: rel }));
+    }
+
+    // ── /memory + /forget (add-memory-distiller, memory-visibility): the
+    // owner's read face. Person tokens only — agents keep their MCP face and
+    // gain no owner-level enumeration. forget is a logical delete: the page
+    // leaves every derived read face, its markdown truth and audit row stay.
+    if (path === "/memory" && req.method === "GET") {
+      if (scope.kind !== "person") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const root = this.rootFor(scope);
+      const projectFilter = url.searchParams.get("scope");
+      const layer = url.searchParams.get("layer"); // L0 | L1 | L2
+      const since = url.searchParams.get("since");
+      const until = url.searchParams.get("until");
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50)));
+      const offset = Math.max(0, Number(url.searchParams.get("offset") ?? 0));
+      const projects = projectFilter ? [projectFilter] : null;
+      const layerOf = (type: string) => (type === "observation" ? "L0" : type === "fact" || type === "experience" ? "L2" : "L1");
+      const inWindow = (ts: string) => (!since || ts >= since) && (!until || ts <= until);
+      const pages = root.db
+        .recentPages(500, projects)
+        .filter((p) => (!layer || layerOf(p.type) === layer) && inWindow(p.updated_at))
+        .map((p) => ({ path: p.path, title: p.title, project: p.project, layer: layerOf(p.type), sources: JSON.parse(p.sources || "[]"), ts: p.updated_at }));
+      const obs = root.db
+        .recentObservations(500, projects)
+        .filter((o) => (!layer || layer === "L0") && inWindow(o.created_at))
+        .map((o) => ({ path: `${o.project}/${o.session_id}/${o.event}`, title: `${o.event}${o.tool ? " " + o.tool : ""}`, project: o.project, layer: "L0", sources: [], ts: o.created_at }));
+      const items = [...pages, ...obs].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(offset, offset + limit);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ items, offset, limit }));
+    }
+
+    if (path === "/forget" && req.method === "POST") {
+      if (scope.kind !== "person") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const body = await this.body<{ path?: string; confirm?: boolean }>(req);
+      const rel = String(body.path ?? "");
+      if (body.confirm !== true) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "confirm_required" }));
+      }
+      const root = this.rootFor(scope);
+      // paths resolve inside the caller's own root only (join is guarded by
+      // the wiki root)
+      const page = root.readPageByRel(rel);
+      if (!page) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "not_found" }));
+      }
+      const ok = root.forgetPage(rel, { principal: `person:${scope.tokenId}`, scope: scope.namespace });
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ forgotten: ok ? rel : null, already: !ok }));
     }
 
     // namespace overrides never apply: the wire protocol has no namespace
@@ -400,6 +467,7 @@ export class Service {
         rootKey,
         grants: this.tokens.grantsForRoot(rootKey),
         recent_writes: root.db.recentWrites(50),
+        distill: this.tokens.distillBudgetRows(rootKey),
       }));
     }
     res.writeHead(404, { "content-type": "application/json" });

@@ -65,7 +65,8 @@ export class RootDb {
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pages (
-        path TEXT PRIMARY KEY, project TEXT, type TEXT, title TEXT, body TEXT, updated_at TEXT
+        path TEXT PRIMARY KEY, project TEXT, type TEXT, title TEXT, body TEXT, updated_at TEXT,
+        sources TEXT NOT NULL DEFAULT '[]', supersedes TEXT NOT NULL DEFAULT '[]'
       );
       CREATE VIRTUAL TABLE IF NOT EXISTS pages_fts USING fts5(title, body, path UNINDEXED, project UNINDEXED, updated_at UNINDEXED, tokenize='trigram');
       CREATE TABLE IF NOT EXISTS observations (
@@ -89,11 +90,19 @@ export class RootDb {
         ts TEXT, principal TEXT, scope TEXT, page_rel TEXT, op TEXT
       );
       CREATE INDEX IF NOT EXISTS writes_ts ON writes(ts);
+      CREATE TABLE IF NOT EXISTS distill_state (
+        project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
+        handoff_cursor TEXT NOT NULL DEFAULT '', updated_at TEXT,
+        last_error TEXT, last_tokens INTEGER NOT NULL DEFAULT 0,
+        gaps INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        pending_since INTEGER
+      );
     `);
     // Pre-v2 databases: observations had no project column (the root was one
     // agent's), handoffs had no to_agent. Those rows belong to the agent's own
     // project as resolved at migration time; 'default' matches the v1 wiki
-    // layout the migration script moves.
+    // layout the migration script moves. Distiller (add-memory-distiller)
+    // adds sources/supersedes to the pages index for layer/sources reads.
     const obsCols = this.columnsOf("observations");
     if (!obsCols.has("project")) {
       this.db.exec("ALTER TABLE observations ADD COLUMN project TEXT NOT NULL DEFAULT 'default'");
@@ -101,6 +110,13 @@ export class RootDb {
     const handoffCols = this.columnsOf("handoffs");
     if (!handoffCols.has("to_agent")) {
       this.db.exec("ALTER TABLE handoffs ADD COLUMN to_agent TEXT");
+    }
+    const pageCols = this.columnsOf("pages");
+    if (!pageCols.has("sources")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN sources TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!pageCols.has("supersedes")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN supersedes TEXT NOT NULL DEFAULT '[]'");
     }
   }
 
@@ -110,12 +126,15 @@ export class RootDb {
 
   // -- pages / FTS -----------------------------------------------------------
 
-  indexPage(project: string, relPath: string, type: string, title: string, body: string): void {
+  indexPage(project: string, relPath: string, type: string, title: string, body: string, meta?: { sources?: string[]; supersedes?: string[] }): void {
+    const sources = JSON.stringify(meta?.sources ?? []);
+    const supersedes = JSON.stringify(meta?.supersedes ?? []);
     this.db.prepare(
-      `INSERT INTO pages (path, project, type, title, body, updated_at) VALUES (?,?,?,?,?,?)
+      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes) VALUES (?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
-         title=excluded.title, body=excluded.body, updated_at=excluded.updated_at`,
-    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString());
+         title=excluded.title, body=excluded.body, updated_at=excluded.updated_at,
+         sources=excluded.sources, supersedes=excluded.supersedes`,
+    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes);
     this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
@@ -126,32 +145,32 @@ export class RootDb {
     this.db.prepare("DELETE FROM pages WHERE path=?").run(relPath);
   }
 
-  searchPages(query: string, limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; snippet: string; project: string }> {
+  searchPages(query: string, limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string }> {
     const pf = projectFilterSql(projects, "p.project");
     const fts = (() => {
       try {
         return this.db
           .prepare(
-            `SELECT p.path AS path, p.title AS title, p.project AS project, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip
+            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
              WHERE pages_fts MATCH ?${pf.clause} ORDER BY rank LIMIT ?`,
           )
-          .all(this.ftsQuery(query), ...pf.args, limit) as Array<{ path: string; title: string; project: string; snippet: string }>;
+          .all(this.ftsQuery(query), ...pf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>;
       } catch {
         return [];
       }
     })();
-    let rows: Array<{ path: string; title: string; project: string; snippet: string }> = fts;
+    let rows: Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }> = fts;
     if (rows.length === 0) {
       // trigram needs >=3 chars; fall back to LIKE for shorter queries
       const pfq = projectFilterSql(projects, "project");
       rows = (
         this.db
           .prepare(
-            `SELECT path, title, project, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
+            `SELECT path, title, project, type, sources, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
              FROM pages WHERE title LIKE ? OR body LIKE ?${pfq.clause} LIMIT ${Math.max(1, limit | 0)}`,
           )
-          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; snippet: string }>
+          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>
       );
     }
     // observations join the search face (spec: manager-captured observations
@@ -162,11 +181,11 @@ export class RootDb {
     const obs = (
       this.db
         .prepare(
-          `SELECT project || '/' || session_id || '/' || event AS path, coalesce(tool, event) AS title, project,
+          `SELECT project || '/' || session_id || '/' || event AS path, coalesce(tool, event) AS title, project, 'observation' AS type, '[]' AS sources,
              substr(summary, max(1, instr(lower(summary), lower(?)) - 40), 120) AS snippet
            FROM observations WHERE (summary LIKE ? OR tool LIKE ?)${pfo.clause} LIMIT ${Math.max(1, limit | 0)}`,
         )
-        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; snippet: string }>
+        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>
     );
     return [...rows, ...obs].slice(0, limit);
   }
@@ -175,11 +194,11 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; updated_at: string; project: string }> {
-    const pf = projectFilterSql(projects, "project");
+  recentPages(limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string }> {
+    const pf = projectFilterSql(projects, "f.project");
     return this.db
-      .prepare(`SELECT path, title, updated_at, project FROM pages_fts${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY updated_at DESC LIMIT ?`)
-      .all(...pf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string }>;
+      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes FROM pages_fts f JOIN pages p ON p.path = f.path${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY f.updated_at DESC LIMIT ?`)
+      .all(...pf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string }>;
   }
 
   // -- observations ----------------------------------------------------------
@@ -226,6 +245,40 @@ export class RootDb {
       .all(...pf.args) as unknown as HandoffRow[];
   }
 
+  // -- distill state (add-memory-distiller) -----------------------------------
+
+  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
+    return this.db.prepare("SELECT * FROM distill_state WHERE project=?").get(project) as never;
+  }
+
+  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
+    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
+    const next = {
+      ...cur,
+      ...patch,
+      project,
+      updated_at: new Date().toISOString(),
+    };
+    this.db.prepare(
+      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
+       VALUES (?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(project) DO UPDATE SET obs_cursor=excluded.obs_cursor, handoff_cursor=excluded.handoff_cursor,
+         updated_at=excluded.updated_at, last_error=excluded.last_error, last_tokens=excluded.last_tokens,
+         gaps=excluded.gaps, next_attempt_at=excluded.next_attempt_at, pending_since=excluded.pending_since`,
+    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
+  }
+
+  observationsAfter(project: string, cursor: number, limit = 500): ObservationRow[] {
+    return this.db
+      .prepare("SELECT session_id, agent, event, tool, summary, created_at, project, rowid AS rid FROM observations WHERE project=? AND rowid>? ORDER BY rowid LIMIT ?")
+      .all(project, cursor, limit) as unknown as Array<ObservationRow & { rid: number }> as never;
+  }
+
+  maxObservationRowid(project: string): number {
+    const r = this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS m FROM observations WHERE project=?").get(project) as { m: number };
+    return Number(r.m);
+  }
+
   // -- audit (add-memory-scopes-and-cluster-sharing) --------------------------
 
   // Companion record, never load-bearing: a failed audit write must not fail
@@ -259,6 +312,7 @@ export class RootDb {
     this.db.exec("DELETE FROM pages");
     this.db.exec("DELETE FROM pages_fts");
     let count = 0;
+    let forgotten = 0;
     const walk = (dir: string) => {
       for (const entry of readdirSync(dir)) {
         const full = join(dir, entry);
@@ -269,12 +323,20 @@ export class RootDb {
           if (entry === "_meta.md" || rel.includes("/_slots/")) continue;
           const project = rel.split(/[\\/]/)[0];
           const page = readPageFile(full);
-          this.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? entry), page.body);
+          // forgotten pages stay out of every derived read face (their markdown
+          // truth and audit rows remain) — reindex must respect that.
+          if (page.frontmatter.forgotten_at) { forgotten++; continue; }
+          const meta = {
+            sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
+            supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
+          };
+          this.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? entry), page.body, meta);
           count++;
         }
       }
     };
     walk(wikiDir);
+    if (forgotten > 0) console.log(`[fd-memory] reindex: skipped ${forgotten} forgotten page(s)`);
     return count;
   }
 }

@@ -110,6 +110,10 @@ export class TokenStore {
       CREATE TABLE IF NOT EXISTS grants (
         token_id TEXT, scope_kind TEXT, scope_ref TEXT, mode TEXT, granted_at TEXT,
         PRIMARY KEY (token_id, scope_kind, scope_ref)
+      );
+      CREATE TABLE IF NOT EXISTS distill_budget (
+        owner_key TEXT, day TEXT, tokens INTEGER NOT NULL DEFAULT 0, llm_calls INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (owner_key, day)
       )`,
     );
     this.backfillDefaultGrants();
@@ -172,6 +176,34 @@ export class TokenStore {
       if (m && (m === "rw" || mode === "r")) return true;
     }
     return false;
+  }
+
+  // -- distill budget (add-memory-distiller) ----------------------------------
+  // owner_key = store rootKey: u-<user> for persons, d-<packId> per deployed
+  // pack (packIds are unique per deployer by the serving plane's singleton
+  // deployment key, so per-root == per-owner at v1 scale). A guardrail for
+  // visibility, not a billing ledger (sub2api stays the billing truth).
+
+  distillBudgetUsed(ownerKey: string, day: string): { tokens: number; llm_calls: number } {
+    const row = this.db
+      .prepare("SELECT tokens, llm_calls FROM distill_budget WHERE owner_key=? AND day=?")
+      .get(ownerKey, day) as { tokens: number; llm_calls: number } | undefined;
+    return { tokens: Number(row?.tokens ?? 0), llm_calls: Number(row?.llm_calls ?? 0) };
+  }
+
+  distillBudgetRows(ownerKey: string, limitDays = 7): Array<{ owner_key: string; day: string; tokens: number; llm_calls: number }> {
+    return this.db
+      .prepare("SELECT owner_key, day, tokens, llm_calls FROM distill_budget WHERE owner_key=? ORDER BY day DESC LIMIT ?")
+      .all(ownerKey, limitDays) as unknown as Array<{ owner_key: string; day: string; tokens: number; llm_calls: number }>;
+  }
+
+  distillBudgetAdd(ownerKey: string, day: string, tokens: number, llmCalls: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO distill_budget (owner_key, day, tokens, llm_calls) VALUES (?,?,?,?)
+         ON CONFLICT(owner_key, day) DO UPDATE SET tokens = tokens + excluded.tokens, llm_calls = llm_calls + excluded.llm_calls`,
+      )
+      .run(ownerKey, day, Math.max(0, tokens | 0), Math.max(0, llmCalls | 0));
   }
 
   mint(kind: TokenKind, namespace: string, label?: string): { token: string; id: string } {

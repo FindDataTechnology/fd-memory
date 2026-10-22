@@ -23,6 +23,23 @@ export interface GrantCheck {
   allows(ns: string, mode: "r" | "rw"): boolean;
 }
 
+// Layer is derived, never stored: observation→L0, fact/experience→L2, the
+// rest (handoff/note/session) →L1. sources ride L2 rows only.
+function layerOf(type: string): "L0" | "L1" | "L2" {
+  if (type === "observation") return "L0";
+  if (type === "fact" || type === "experience") return "L2";
+  return "L1";
+}
+
+function parseSources(raw: unknown): string[] {
+  try {
+    const v = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(v) ? v.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
 const TARGET_SCHEMA = { type: "string", enum: ["own", "shared"], description: 'Relative partition selector: "own" (this member\'s private area) or "shared" (the pack\'s shared area). Reads default to the union; writes default to own (pod tokens default to shared).' };
 
 function text(content: unknown): ToolResult {
@@ -168,7 +185,12 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): M
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
-        const results = root.db.searchPages(String(args.q), Number(args.limit ?? 20), r.projects).map((row) => ({ ...row, source: sourceOf(row.project) }));
+        const results = root.db.searchPages(String(args.q), Number(args.limit ?? 20), r.projects).map((row) => ({
+          ...row,
+          source: sourceOf(row.project),
+          layer: layerOf(row.type),
+          ...(layerOf(row.type) === "L2" ? { sources: parseSources(row.sources) } : {}),
+        }));
         return text({ results });
       },
     },
@@ -181,8 +203,13 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): M
         if (r.error) return r.error;
         const limit = Number(args.limit ?? 20);
         return text({
-          pages: root.db.recentPages(limit, r.projects).map((p) => ({ ...p, source: sourceOf(p.project) })),
-          observations: root.db.recentObservations(limit, r.projects).map((o) => ({ ...o, source: sourceOf(o.project) })),
+          pages: root.db.recentPages(limit, r.projects).map((p) => ({
+            ...p,
+            source: sourceOf(p.project),
+            layer: layerOf(p.type),
+            ...(layerOf(p.type) === "L2" ? { sources: parseSources(p.sources) } : {}),
+          })),
+          observations: root.db.recentObservations(limit, r.projects).map((o) => ({ ...o, source: sourceOf(o.project), layer: "L0" })),
         });
       },
     },

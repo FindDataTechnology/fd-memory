@@ -102,7 +102,10 @@ export class StoreRoot {
     const dir = this.ensureProject(project);
     const rel = `${project}/${typeDir}/${slug}.md`;
     writePageFile(join(this.wikiDir, rel), page);
-    this.db.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? slug), page.body);
+    this.db.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? slug), page.body, {
+      sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
+      supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
+    });
     if (audit) this.audit(audit, rel, "page_write");
     this.snapshotSoon(`page: ${rel}`);
     return rel;
@@ -189,6 +192,71 @@ export class StoreRoot {
     appendLedger(this.projectDir(row.project), "handoff_accept", `by ${byAgent}`);
     this.snapshotSoon(`handoff claim: ${id}`);
     return { claimed: true, handoff: row };
+  }
+
+  // -- distiller products (add-memory-distiller) --------------------------------
+
+  writeDistillPage(
+    project: string,
+    kind: "fact" | "experience",
+    payload: {
+      id: string;
+      engine: string;
+      confidence?: number;
+      sources: string[];
+      supersedes: string[];
+      statement?: string; // fact
+      subject?: string; // fact
+      files?: string[];
+      details?: string; // fact
+      task?: string; // experience
+      search_keys?: string[];
+      solution?: string; // experience
+      boundary_envs?: string; // experience
+    },
+    audit?: AuditIdentity,
+  ): string {
+    const title = String(payload.statement ?? payload.task ?? payload.id).slice(0, 120);
+    const body =
+      kind === "fact"
+        ? `## Statement\n${sanitize(String(payload.statement ?? ""))}` +
+          (payload.subject ? `\n\nsubject: ${sanitize(String(payload.subject))}` : "") +
+          ((payload.files ?? []).length ? `\n\nfiles: ${payload.files!.map((f) => sanitize(String(f))).join(", ")}` : "") +
+          (payload.details ? `\n\n## Details\n${sanitize(String(payload.details)).slice(0, 4000)}` : "")
+        : `## Task\n${sanitize(String(payload.task ?? ""))}` +
+          `\n\n## Solution\n${sanitize(String(payload.solution ?? ""))}` +
+          (payload.boundary_envs ? `\n\nboundary_envs: ${sanitize(String(payload.boundary_envs))}` : "") +
+          ((payload.search_keys ?? []).length ? `\n\nsearch_keys: ${payload.search_keys!.map((k) => sanitize(String(k))).join(", ")}` : "");
+    const rel = this.writePage(
+      project,
+      kind === "fact" ? "facts" : "experiences",
+      payload.id,
+      newPage(kind, title, body, {
+        sources: payload.sources,
+        supersedes: payload.supersedes,
+        ...(payload.confidence != null ? { confidence: payload.confidence } : {}),
+      }),
+      audit,
+    );
+    // generated.by rides the frontmatter via a rewrite (newPage already wrote
+    // generated.process meta; the engine tag goes beside it)
+    const page = this.readPageByRel(rel)!;
+    page.frontmatter.generated = { ...(page.frontmatter.generated as Record<string, unknown> ?? {}), by: payload.engine };
+    writePageFile(join(this.wikiDir, rel), page);
+    return rel;
+  }
+
+  // Logical delete (memory-visibility): frontmark the truth, drop from every
+  // derived read face; file and audit rows stay.
+  forgetPage(rel: string, audit?: AuditIdentity): boolean {
+    const page = this.readPageByRel(rel);
+    if (!page || page.frontmatter.forgotten_at) return false;
+    page.frontmatter.forgotten_at = new Date().toISOString();
+    writePageFile(join(this.wikiDir, rel), page);
+    this.db.deletePageIndex(rel);
+    if (audit) this.audit(audit, rel, "forget");
+    this.snapshotSoon(`forget: ${rel}`);
+    return true;
   }
 
   cancelHandoff(id: string, audit?: AuditIdentity): boolean {
