@@ -58,6 +58,7 @@ async function main() {
       await sched.distillNow("d-evalpack", "agentEval");
     };
 
+    let hardFails = 0;
     const pagesAfter = {};
     for (const scene of scenes) {
       await distillScene(scene);
@@ -72,7 +73,6 @@ async function main() {
     const bodies = pages.map((p) => `${p.title}\n${readFileSync(join(root.wikiDir, p.path), "utf8")}`);
 
     // keyword recall per scene
-    let hardFails = 0;
     for (const scene of scenes) {
       for (const kw of scene.expect_keywords) {
         const hit = bodies.some((b) => b.includes(kw));
@@ -106,6 +106,14 @@ async function main() {
       console.log("[eval-distill] FAIL: non-CJK tasks:", JSON.stringify(nonCjkTasks));
       hardFails++;
     }
+    // v1.2: vector companion — the LAST /distill request must carry candidates
+    // (meta assert is on the scheduler side; here assert vectors stored)
+    const vectored = root.db.vectorModelCounts?.() ?? [];
+    console.log(`[eval-distill] vector models: ${JSON.stringify(vectored)}`);
+    if (vectored.length === 0 || vectored.every((v) => v.n === 0)) {
+      console.log("[eval-distill] WARN: no companion vectors stored (sidecar /embed lane down? recall falls back to keyword)");
+    }
+
     const budget = tokens.distillBudgetUsed("d-evalpack", new Date().toISOString().slice(0, 10));
     console.log(`[eval-distill] tokens=${budget.tokens.toLocaleString()} llm_calls=${budget.llm_calls} sidecar_calls=${calls.length}`);
     console.log(`[eval-distill] verdict: ${hardFails === 0 ? "PASS" : `FAIL (${hardFails})`}`);

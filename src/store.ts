@@ -254,6 +254,7 @@ export class StoreRoot {
     page.frontmatter.forgotten_at = new Date().toISOString();
     writePageFile(join(this.wikiDir, rel), page);
     this.db.deletePageIndex(rel);
+    this.db.dropPageVector(rel);
     if (audit) this.audit(audit, rel, "forget");
     this.snapshotSoon(`forget: ${rel}`);
     return true;

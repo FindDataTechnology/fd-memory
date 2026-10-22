@@ -154,13 +154,16 @@ test("scheduler: success writes pages, advances cursor, bills budget; second run
   const data = tmpData();
   const sidecar = {
     calls: [] as Array<Record<string, unknown>>,
-    impl: (async () => ({
-      ok: true, status: 200, json: async () => ({
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({
         facts: [{ id: "fact_a", engine: "engine:test/1", statement: "G7 DNS 超时", subject: "G7", sources: ["session:s1"], supersedes: [] }],
         experiences: [{ id: "exp_a", engine: "engine:test/1", task: "5xx 排障", search_keys: ["5xx"], solution: "切 DNS", sources: ["session:s1"], supersedes: [] }],
         cursor_next: {}, llm_calls: [{ stage: "distill_extract", ok: true, prompt_tokens: 5000, completion_tokens: 2500 }], tokens: 7500, errors: [],
-      }),
-    })) as unknown as typeof fetch,
+      }) };
+    }) as unknown as typeof fetch,
   };
   try {
     const fx = schedulerFixture(data, sidecar, { ...GATES });
@@ -175,8 +178,11 @@ test("scheduler: success writes pages, advances cursor, bills budget; second run
       root.db.addObservation({ session_id: "s1", agent: "a", event: e.event, summary: e.summary, tool: e.tool ?? null, created_at: at, project: "agentA" });
     }
     await fx.sched.distillNow("d-pkS", "agentA");
-    assert.equal(sidecar.calls.length, 1);
-    const req = sidecar.calls[0].body as { items: unknown[]; candidates: unknown[] };
+    const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    const embedCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/embed"));
+    assert.equal(distillCalls().length, 1);
+    assert.equal(embedCalls().length, 1, "query embedded once per distill");
+    const req = distillCalls()[0].body as { items: unknown[]; candidates: unknown[] };
     assert.equal(req.items.length, 3);
     const st = root.db.getDistillState("agentA")!;
     assert.ok(st.obs_cursor > 0, "cursor advanced");
@@ -186,7 +192,8 @@ test("scheduler: success writes pages, advances cursor, bills budget; second run
 
     // nothing new → no second sidecar call
     await fx.sched.distillNow("d-pkS", "agentA");
-    assert.equal(sidecar.calls.length, 1, "idempotent cursor: no new items, no call");
+    assert.equal(distillCalls().length, 1, "idempotent cursor: no new items, no call");
+    assert.equal(embedCalls().length, 1);
   } finally {
     rmSync(data, { recursive: true, force: true });
   }
@@ -203,7 +210,8 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
     const root = fx.openRoot("d-pkF");
     root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", tool: null, summary: "x", created_at: new Date().toISOString(), project: "agentA" });
     await fx.sched.distillNow("d-pkF", "agentA");
-    assert.equal(sidecar.calls.length, 1);
+    const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    assert.equal(distillCalls().length, 1);
     const st = root.db.getDistillState("agentA")!;
     assert.equal(st.obs_cursor, 0, "cursor kept on failure");
     assert.ok(st.last_error?.includes("503"));
@@ -211,10 +219,10 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
 
     // budget exhausted for today → gap, no sidecar call
     fx.tokens.distillBudgetAdd("d-pkF", new Date().toISOString().slice(0, 10), 400_000, 10);
-    const before = sidecar.calls.length;
+    const before = distillCalls().length;
     root.db.upsertDistillState("agentA", { next_attempt_at: 0 });
     await fx.sched.distillNow("d-pkF", "agentA");
-    assert.equal(sidecar.calls.length, before, "no call when budget exhausted");
+    assert.equal(distillCalls().length, before, "no call when budget exhausted");
     assert.ok((root.db.getDistillState("agentA")?.gaps ?? 0) >= 1, "gap recorded");
   } finally {
     rmSync(data, { recursive: true, force: true });
@@ -325,6 +333,53 @@ test("scheduler tuning (day-1 production): fallback needs budget headroom — ex
     assert.ok(fx2.sched.pendingCount() >= 0); // drain ran without calling sidecar (debounce guards)
     assert.equal(sidecar.calls.length, 0);
   } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("platform-seam lane: platform token reads/forgets a named rootKey; agents refused; person rootKey rejected", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const platform = svc.tokens.mint("platform", "*").token;
+    const runner = svc.tokens.mint("runner", "*").token;
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const dep = svc.tokens.mint("deployment", "d/pk/agentA").token;
+    // content lives in a d/ root the person does NOT own
+    const root = svc.rootForKey("d-pk");
+    root.writeDistillPage("agentA", "experience", { id: "exp_p", engine: "e", task: "G7 DNS 排障", search_keys: ["dns"], solution: "切备用", sources: [], supersedes: [] });
+
+    server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const H = { "content-type": "application/json" };
+
+    // platform with rootKey: read hits the d/ root
+    const rd = await fetch(base + `/memory?rootKey=d-pk&scope=agentA&layer=L2`, { headers: { ...H, authorization: `Bearer ${platform}` } });
+    assert.equal(rd.status, 200);
+    const items = ((await rd.json()) as { items: Array<{ path: string }> }).items;
+    assert.equal(items.length, 1);
+    // platform without rootKey: 400
+    assert.equal((await fetch(base + "/memory", { headers: { authorization: `Bearer ${platform}` } })).status, 400);
+    // runner with rootKey works too
+    assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${runner}` } })).status, 200);
+    // agents refused even with rootKey
+    assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${dep}` } })).status, 403);
+    // person with rootKey: rejected (platform-seam only)
+    assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${person}` } })).status, 400);
+
+    // forget via platform seam: confirm required, then logical delete with audited principal
+    const rel = items[0].path;
+    const nf = await fetch(base + "/forget", { method: "POST", headers: { ...H, authorization: `Bearer ${platform}` }, body: JSON.stringify({ rootKey: "d-pk", path: rel }) });
+    assert.equal(nf.status, 400); // no confirm
+    const ok = await fetch(base + "/forget", { method: "POST", headers: { ...H, authorization: `Bearer ${platform}` }, body: JSON.stringify({ rootKey: "d-pk", path: rel, confirm: true }) });
+    assert.equal(((await ok.json()) as { forgotten: string }).forgotten, rel);
+    const after = await fetch(base + `/memory?rootKey=d-pk&scope=agentA&layer=L2`, { headers: { authorization: `Bearer ${platform}` } });
+    assert.equal(((await after.json()) as { items: unknown[] }).items.length, 0);
+    assert.ok(root.db.recentWrites(10).some((w) => w.op === "forget" && w.principal.startsWith("platform:")));
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
   }
 });

@@ -90,6 +90,9 @@ export class RootDb {
         ts TEXT, principal TEXT, scope TEXT, page_rel TEXT, op TEXT
       );
       CREATE INDEX IF NOT EXISTS writes_ts ON writes(ts);
+      CREATE TABLE IF NOT EXISTS page_vectors (
+        page_rel TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
         handoff_cursor TEXT NOT NULL DEFAULT '', updated_at TEXT,
@@ -277,6 +280,32 @@ export class RootDb {
   maxObservationRowid(project: string): number {
     const r = this.db.prepare("SELECT COALESCE(MAX(rowid), 0) AS m FROM observations WHERE project=?").get(project) as { m: number };
     return Number(r.m);
+  }
+
+  // -- page vectors (add-embedding-recall) ------------------------------------
+  // Companion store like FTS: derived, droppable, never part of the markdown
+  // truth. Written with distill pages, deleted with them (forget/drop).
+
+  setPageVector(pageRel: string, model: string, vector: Float32Array): void {
+    this.db.prepare(
+      `INSERT INTO page_vectors (page_rel, model, dim, vector) VALUES (?,?,?,?)
+       ON CONFLICT(page_rel) DO UPDATE SET model=excluded.model, dim=excluded.dim, vector=excluded.vector`,
+    ).run(pageRel, model, vector.length, Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength));
+  }
+
+  getPageVector(pageRel: string): { model: string; vector: Float32Array } | undefined {
+    const row = this.db.prepare("SELECT model, dim, vector FROM page_vectors WHERE page_rel=?").get(pageRel) as { model: string; dim: number; vector: Buffer } | undefined;
+    if (!row) return undefined;
+    const buf = new Float32Array(row.vector.buffer, row.vector.byteOffset, row.dim);
+    return { model: row.model, vector: new Float32Array(buf) };
+  }
+
+  dropPageVector(pageRel: string): void {
+    this.db.prepare("DELETE FROM page_vectors WHERE page_rel=?").run(pageRel);
+  }
+
+  vectorModelCounts(): Array<{ model: string; n: number }> {
+    return this.db.prepare("SELECT model, COUNT(*) AS n FROM page_vectors GROUP BY model").all() as Array<{ model: string; n: number }>;
   }
 
   // -- audit (add-memory-scopes-and-cluster-sharing) --------------------------

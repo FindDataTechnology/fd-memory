@@ -245,11 +245,32 @@ export class Service {
     // gain no owner-level enumeration. forget is a logical delete: the page
     // leaves every derived read face, its markdown truth and audit row stay.
     if (path === "/memory" && req.method === "GET") {
-      if (scope.kind !== "person") {
+      // Platform-seam variant (add-facade-memory-read-lane): platform/runner
+      // tokens reach a named root via explicit rootKey (same trust tier as
+      // /admin/report — the deployer mapping is the CALLER's job); agents are
+      // refused outright; persons always resolve their own root.
+      const rootKeyParam = url.searchParams.get("rootKey");
+      let memRoot: StoreRoot;
+      let auditScopeBase: string;
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        if (!rootKeyParam) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_required" }));
+        }
+        memRoot = this.rootForKey(rootKeyParam);
+        auditScopeBase = rootKeyParam;
+      } else if (scope.kind === "person") {
+        if (rootKeyParam) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+        }
+        memRoot = this.rootFor(scope);
+        auditScopeBase = memRoot.rootDir.split("/").pop()!;
+      } else {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "person_token_required" }));
       }
-      const root = this.rootFor(scope);
+      const root = memRoot;
       const projectFilter = url.searchParams.get("scope");
       const layer = url.searchParams.get("layer"); // L0 | L1 | L2
       const since = url.searchParams.get("since");
@@ -273,17 +294,37 @@ export class Service {
     }
 
     if (path === "/forget" && req.method === "POST") {
-      if (scope.kind !== "person") {
+      const body = await this.body<{ path?: string; confirm?: boolean; rootKey?: string }>(req);
+      let fRoot: StoreRoot;
+      let principal: string;
+      let fScope: string;
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        const rk = String(body.rootKey ?? url.searchParams.get("rootKey") ?? "");
+        if (!rk) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_required" }));
+        }
+        fRoot = this.rootForKey(rk);
+        principal = `${scope.kind}:${scope.tokenId}`;
+        fScope = rk;
+      } else if (scope.kind === "person") {
+        if (body.rootKey || url.searchParams.get("rootKey")) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+        }
+        fRoot = this.rootFor(scope);
+        principal = `person:${scope.tokenId}`;
+        fScope = scope.namespace;
+      } else {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "person_token_required" }));
       }
-      const body = await this.body<{ path?: string; confirm?: boolean }>(req);
       const rel = String(body.path ?? "");
       if (body.confirm !== true) {
         res.writeHead(400, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "confirm_required" }));
       }
-      const root = this.rootFor(scope);
+      const root = fRoot;
       // paths resolve inside the caller's own root only (join is guarded by
       // the wiki root)
       const page = root.readPageByRel(rel);
@@ -291,7 +332,7 @@ export class Service {
         res.writeHead(404, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "not_found" }));
       }
-      const ok = root.forgetPage(rel, { principal: `person:${scope.tokenId}`, scope: scope.namespace });
+      const ok = root.forgetPage(rel, { principal, scope: fScope });
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ forgotten: ok ? rel : null, already: !ok }));
     }

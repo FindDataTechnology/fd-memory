@@ -21,6 +21,8 @@ import re
 import time
 import uuid
 
+import openai
+
 from hy_memory.agent.llm_provider import LLMProvider
 from hy_memory.config import MemoryConfig
 from hy_memory.coding.extractor import CodingMemoryExtractor
@@ -34,6 +36,37 @@ from hy_memory.pipelines.base import ChatMessage, ToolCall
 from json_repair import repair_json
 
 ENGINE = "engine:hy-memory/0244ebe"
+
+EMBED_MODEL = os.environ.get("MEMORY_EMBED_MODEL", "Qwen/Qwen3-Embedding-8B")
+EMBED_BATCH_MAX = 64
+
+
+def embed_credentials():
+    """Lane key with the same fallback chain hy's provider config uses."""
+    return (
+        os.environ.get("MEMORY_EMBED_API_KEY") or os.environ.get("MEMORY_LLM_API_KEY") or os.environ.get("LLM_API_KEY") or "",
+        os.environ.get("MEMORY_EMBED_BASE_URL") or os.environ.get("MEMORY_LLM_BASE_URL") or os.environ.get("LLM_BASE_URL") or "",
+    )
+
+
+async def embed_texts(provider_factory, texts):
+    """Embed via the 词元 lane through a bare OpenAI-compatible call on the
+    SAME provider env the engine uses. Returns (vectors, model, tokens, errors)."""
+    errors = []
+    vectors = []
+    # Lane credentials resolved HERE (same chain as hy's provider config:
+    # MEMORY_EMBED_* → MEMORY_LLM_* → LLM_*) — a construction-time empty key
+    # raises outside the try below, so resolve before touching openai.
+    k, b = embed_credentials()
+    client = openai.AsyncOpenAI(api_key=k, base_url=b or None)
+    try:
+        resp = await client.embeddings.create(model=EMBED_MODEL, input=list(texts)[:EMBED_BATCH_MAX])
+        vectors = [d.embedding for d in resp.data]
+        tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        return vectors, EMBED_MODEL, tokens, errors
+    except Exception as e:
+        errors.append(f"embed {type(e).__name__}: {str(e)[:160]}")
+        return [], EMBED_MODEL, 0, errors
 
 LANG_PIN_ZH = "\n\n硬性要求（MUST）：task 与 search_keys 必须使用与会话相同的语言（本次会话为中文，就必须用中文书写 task 与 search_keys）。\n"
 LANG_PIN_EN = "\n\nHARD REQUIREMENT: task and search_keys MUST be written in the same language as the conversation.\n"
@@ -408,6 +441,30 @@ async def distill(request):
                     recorder.calls.append({"stage": "lang_check", "ok": True, "warning": f"non-CJK task for CJK session: {e['task'][:60]}"})
 
     tokens = sum(int(c.get("prompt_tokens", 0) or 0) + int(c.get("completion_tokens", 0) or 0) for c in recorder.calls if c.get("ok"))
+
+    # v2.2: embed emitted entries (task/statement + solution) so fd-memory can
+    # store companion vectors — recall no longer depends on keyword overlap.
+    embeddable = [(e, f"{e.get('task', e.get('statement', ''))} {e.get('solution', '')}".strip()) for e in experiences_out + facts_out]
+    if embeddable:
+        t0 = time.time()
+        vecs, model, etokens, eerrors = await embed_texts(
+            lambda: openai.AsyncOpenAI(
+                api_key=os.environ.get("MEMORY_LLM_API_KEY", ""),
+                base_url=os.environ.get("MEMORY_LLM_BASE_URL", ""),
+            ),
+            [t for _e, t in embeddable],
+        )
+        # vectors are companion data: an embed outage must NOT fail the
+        # distillation — entries ship without vectors, recall falls back to
+        # keywords (the warning row keeps it visible in llm_calls).
+        recorder.calls.append({"stage": "embed", "ok": not eerrors, "count": len(vecs), "model": model,
+                               "tokens": etokens, "elapsed": round(time.time() - t0, 2),
+                               **({"warning": eerrors[0]} if eerrors else {})})
+        for (entry, _t), v in zip(embeddable, vecs):
+            entry["vector"] = v
+            entry["vector_model"] = model
+        tokens += etokens
+
     return {
         "facts": facts_out,
         "experiences": experiences_out,

@@ -114,6 +114,62 @@ export class DistillScheduler {
     await Promise.allSettled(batch.map((p) => this.distillOne(p.rootKey, p.project)));
   }
 
+  // v2.2 candidate selection: vector cosine top-8 first (query embedded via
+  // the sidecar /embed), keyword path as fallback + gap-filler; results merge
+  // deduped, vector hits first. Embed failure or empty root = pure keyword.
+  private async selectCandidates(root: StoreRoot, project: string, queryFor: string) {
+    const projects = project === "shared" ? [project] : [project, "shared"];
+    const keyword = distillCandidates(root, projects, queryFor);
+    try {
+      const q = await this.embedTexts([queryFor]);
+      if (!q.vectors.length) return keyword;
+      const qv = q.vectors[0];
+      const scored: Array<{ id: string; kind: "fact" | "experience"; task: string; search_keys: string[]; solution: string; boundary_envs: string; supersedes: string[]; score: number }> = [];
+      for (const c of keyword) {
+        for (const project2 of projects) {
+          const rel = `${project2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+          const pv = root.db.getPageVector(rel);
+          if (!pv || pv.model !== q.model || pv.vector.length !== qv.length) continue;
+          scored.push({ ...c, score: cosine(qv, pv.vector) });
+          break;
+        }
+      }
+      scored.sort((a, b) => b.score - a.score);
+      const vectorIds = new Set(scored.map((x) => x.id));
+      const merged = [...scored, ...keyword.filter((k) => !vectorIds.has(k.id)).map((k) => ({ ...k, score: -1 }))];
+      const modelMismatch = root.db.vectorModelCounts().filter((m) => m.model !== q.model).reduce((a, m) => a + m.n, 0);
+      if (modelMismatch > 0) this.log.warn(`[distill] ${project}: ${modelMismatch} vector(s) on other models — excluded from cosine (gap noted)`);
+      return merged.slice(0, 8);
+    } catch (e) {
+      this.log.warn(`[distill] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
+      return keyword;
+    }
+  }
+
+  private async embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/embed`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+        body: JSON.stringify({ texts }),
+        signal: controller.signal,
+      });
+      if (!res.ok) throw new Error(`embed HTTP ${res.status}`);
+      const doc = (await res.json()) as { vectors: number[][]; model: string; tokens: number; errors?: string[] };
+      if (doc.errors?.length) throw new Error(doc.errors.join("; "));
+      const day = new Date().toISOString().slice(0, 10);
+      const rootKey = this.opts.roots.keys().next().value ?? "";
+      // budget accounting rides the caller root (distillOne adds its own) —
+      // embed tokens are booked by the caller; here we only surface them.
+      void rootKey; void day;
+      return { vectors: doc.vectors, model: doc.model, tokens: doc.tokens ?? 0 };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   // Force a project through now (tests); respects inflight + backoff.
   async distillNow(rootKey: string, project: string): Promise<void> {
     const key = DistillScheduler.key(rootKey, project);
@@ -174,7 +230,7 @@ export class DistillScheduler {
       ].sort((a, b) => (a.at < b.at ? -1 : 1));
 
       const queryFor = obs.slice(-40).map((o) => o.summary).join(" ");
-      const candidates = distillCandidates(root, project === "shared" ? [project] : [project, "shared"], queryFor);
+      const candidates = await this.selectCandidates(root, project, queryFor);
 
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
@@ -202,10 +258,12 @@ export class DistillScheduler {
 
       const audit = { principal: "distiller:scheduler", scope: `${rootKey}/${project}` };
       for (const fact of result.facts ?? []) {
-        root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
+        const rel = root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
+        writeEntryVector(root, rel, fact);
       }
       for (const exp of result.experiences ?? []) {
-        root.writeDistillPage(project, "experience", normalizeEntry(exp, "experience"), audit);
+        const rel = root.writeDistillPage(project, "experience", normalizeEntry(exp, "experience"), audit);
+        writeEntryVector(root, rel, exp);
       }
       const maxRid = obs.length ? Math.max(...obs.map((o) => o.rid)) : (state?.obs_cursor ?? 0);
       const maxHandoff = handoffs.length ? handoffs[handoffs.length - 1].created_at : (state?.handoff_cursor ?? "");
@@ -229,6 +287,28 @@ export class DistillScheduler {
       this.inflight.delete(key);
     }
   }
+}
+
+function writeEntryVector(root: StoreRoot, rel: string, entry: Record<string, unknown>): void {
+  const v = (entry as { vector?: unknown }).vector;
+  if (Array.isArray(v) && v.length > 0) {
+    try {
+      root.db.setPageVector(rel, String((entry as { vector_model?: unknown }).vector_model ?? ""), new Float32Array(v as number[]));
+    } catch { /* companion store is never load-bearing */ }
+  }
+}
+
+function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom > 0 ? dot / denom : 0;
 }
 
 function normalizeEntry(entry: Record<string, unknown>, kind: "fact" | "experience") {

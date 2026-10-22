@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import sys
+
+import openai
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,6 +30,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.path == "/embed":
+            self.handle_embed()
+            return
         if self.path != "/distill":
             self._json(404, {"error": "not_found"})
             return
@@ -46,11 +51,41 @@ class Handler(BaseHTTPRequestHandler):
             result = asyncio.run(engine.distill(request))
             self._json(200, result)
         except Exception as e:  # engine-level failure: report, keep caller's cursor
+            import traceback; traceback.print_exc()
             self._json(200, {
                 "facts": [], "experiences": [], "cursor_next": {},
                 "llm_calls": [], "tokens": 0,
                 "errors": [f"{type(e).__name__}: {str(e)[:300]}"],
             })
+
+    def handle_embed(self):
+        expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
+        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+            self._json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("content-length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._json(400, {"error": "invalid_body"})
+            return
+        texts = [str(t) for t in (body.get("texts") or []) if str(t).strip()][:engine.EMBED_BATCH_MAX]
+        if not texts:
+            self._json(400, {"error": "texts_required"})
+            return
+
+        async def run():
+            client = openai.AsyncOpenAI(
+                api_key=os.environ.get("MEMORY_LLM_API_KEY", ""),
+                base_url=os.environ.get("MEMORY_LLM_BASE_URL", ""),
+            )
+            return await engine.embed_texts(lambda: client, texts)
+
+        try:
+            vectors, model, tokens, errors = asyncio.run(run())
+            self._json(200, {"vectors": vectors, "model": model, "tokens": tokens, "errors": errors})
+        except Exception as e:
+            self._json(200, {"vectors": [], "model": engine.EMBED_MODEL, "tokens": 0, "errors": [f"{type(e).__name__}: {str(e)[:200]}"]})
 
     def log_message(self, fmt, *args):
         print(f"[fd-memory-distiller] {self.address_string()} {fmt % args}", flush=True)
