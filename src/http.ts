@@ -10,7 +10,8 @@ import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot } from "./store.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
-import { DistillScheduler } from "./distill-scheduler.js";
+import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
+import { renderDigest, DigestItem } from "./digest.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -238,6 +239,80 @@ export class Service {
       this.auditRoot(root, auditOf(project), rel, "page_write");
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, path: rel }));
+    }
+
+    // ── /digest (add-cluster-digest-injection): the platform-seam digest read
+    // face — ONE server-side render per request through the same retrieval
+    // (hybridCandidates) and renderer (src/digest.ts) the continuation eval
+    // validated. Auth mirrors /memory: persons read their own root, platform/
+    // runner reach a named root via explicit rootKey, agents refused. Embed
+    // lane trouble degrades to keyword recall with a model_note — never a
+    // failed request. Server-side clamps: k ≤ 8, budget ≤ 2000.
+    if (path === "/digest" && req.method === "GET") {
+      const rootKeyParam = url.searchParams.get("rootKey");
+      let dRoot: StoreRoot;
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        if (!rootKeyParam) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_required" }));
+        }
+        dRoot = this.rootForKey(rootKeyParam);
+      } else if (scope.kind === "person") {
+        if (rootKeyParam) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+        }
+        dRoot = this.rootFor(scope);
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const project = String(url.searchParams.get("project") ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
+      if (!project) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "project_required" }));
+      }
+      const q = String(url.searchParams.get("q") ?? "");
+      const k = Math.min(8, Math.max(1, Number(url.searchParams.get("k") ?? 5) || 5));
+      const budget = Math.min(2000, Math.max(64, Number(url.searchParams.get("budget") ?? 1500) || 1500));
+      let modelNote: string | undefined;
+      const embed = async (texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> => {
+        try {
+          return await sidecarEmbed(process.env, texts);
+        } catch (e) {
+          modelNote = `vector lane unavailable — keyword-only recall (${(e as Error)?.message ?? e})`;
+          throw e; // hybridCandidates catches and falls back to keyword
+        }
+      };
+      const candidates = await hybridCandidates({ root: dRoot, project, queryFor: q, k, embed });
+      // Enrich candidates with confidence/updated_at from the page index +
+      // frontmatter (render annotations must not depend on the caller).
+      const pageMeta = new Map(dRoot.db.recentPages(1000, [project]).map((p) => [p.path, p.updated_at]));
+      const items: DigestItem[] = candidates.map((c) => {
+        let updated_at: string | null = null;
+        let confidence: number | null = null;
+        for (const p2 of project === "shared" ? ["shared"] : [project, "shared"]) {
+          const rel = `${p2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+          if (!pageMeta.has(rel)) continue;
+          updated_at = pageMeta.get(rel)!;
+          const page = dRoot.readPageByRel(rel);
+          const conf = page?.frontmatter?.confidence;
+          confidence = conf != null ? Number(conf) : null;
+          break;
+        }
+        return {
+          id: c.id, layer: "L2", kind: c.kind, title: c.task,
+          // page bodies carry "## Task/## Solution" section headers — strip
+          // for the excerpt (producer-side hygiene, same as the eval)
+          excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+          confidence, updated_at,
+        };
+      });
+      const handoffs = dRoot.db.openHandoffs([project]).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
+      const digest = renderDigest({ items, handoffs, budgetTokens: budget, now: new Date().toISOString() });
+      const rendered = (digest.match(/〔L/g) ?? []).length;
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ project, digest, items: items.length, truncated: rendered < items.length, ...(modelNote ? { model_note: modelNote } : {}) }));
     }
 
     // ── /memory + /forget (add-memory-distiller, memory-visibility): the
