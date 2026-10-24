@@ -1,0 +1,123 @@
+// Digest renderer (add-continuation-eval design D2): the v4 injection-block
+// prototype. Pure function — no IO, no network. The continuation eval renders
+// it; the future injection lanes (cluster hook upgrade / cell session start /
+// spawn) import this same module so the block shape never drifts between eval
+// and production.
+//
+// Budget discipline is the anti-rot guardrail (zcode-style always-in-context
+// indexes rot — observed at 13.8MB): hard cap, open handoffs first, then items
+// in recall-rank order, whole-item granularity, excerpt truncation only when
+// even the first item would not fit. Forgotten/expired entries are rejected at
+// the door (spec scenario), never silently included.
+
+export interface DigestItem {
+  id: string;
+  layer: "L1" | "L2";
+  kind: string; // fact | experience | note …
+  title: string; // fact: statement; experience: task
+  excerpt: string;
+  confidence?: number | null;
+  updated_at?: string | null;
+  forgotten_at?: string | null;
+  expires_at?: string | null;
+}
+
+export interface DigestHandoff {
+  id: string;
+  summary: string;
+  to_agent?: string | null;
+  created_at?: string | null;
+}
+
+export const DIGEST_DEFAULT_BUDGET_TOKENS = 1500;
+
+const CJK = /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|[\u3000-\u303F\uFF00-\uFFEF]/gu;
+
+// Deterministic CJK-aware token approximation (no tokenizer dependency):
+// 1 token per CJK char, 1 per 4 other characters. Eval and production share
+// it, so budgets mean the same thing on both sides.
+export function estimateTokens(text: string): number {
+  const s = String(text ?? "");
+  const cjk = s.match(CJK)?.length ?? 0;
+  const other = s.length - cjk;
+  return cjk + Math.ceil(other / 4);
+}
+
+function alive(item: DigestItem, now: string): boolean {
+  if (item.forgotten_at) return false;
+  if (item.expires_at && String(item.expires_at) <= now) return false;
+  return true;
+}
+
+function itemLine(item: DigestItem): string {
+  const conf = item.confidence != null ? `｜置信 ${Number(item.confidence).toFixed(2)}` : "";
+  const date = item.updated_at ? `｜${String(item.updated_at).slice(0, 10)}` : "";
+  const excerpt = String(item.excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, 400);
+  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${item.title}${excerpt ? `：${excerpt}` : ""}`;
+}
+
+function handoffLine(h: DigestHandoff): string {
+  const to = h.to_agent ? `（→ ${h.to_agent}，${String(h.created_at ?? "").slice(0, 10)}）` : `（${String(h.created_at ?? "").slice(0, 10)}）`;
+  return `- [${String(h.id).slice(0, 8)}] ${String(h.summary ?? "").replace(/\s+/g, " ").trim()}${to}`;
+}
+
+export function renderDigest(opts: {
+  items: DigestItem[];
+  handoffs?: DigestHandoff[];
+  budgetTokens?: number;
+  now?: string;
+}): string {
+  const budget = Math.max(64, Number(opts.budgetTokens ?? DIGEST_DEFAULT_BUDGET_TOKENS) | 0);
+  const now = String(opts.now ?? new Date().toISOString());
+
+  const header = `## 记忆摘要 / Memory digest（fd-memory，截至 ${now.slice(0, 10)}）`;
+  const lines: string[] = [header];
+  let used = estimateTokens(header);
+
+  const handoffs = opts.handoffs ?? [];
+  if (handoffs.length > 0) {
+    const sectionTitle = "### 待认领交接 / Open handoffs";
+    lines.push("", sectionTitle);
+    used += estimateTokens(sectionTitle);
+    for (const h of handoffs) {
+      const line = handoffLine(h);
+      used += estimateTokens(line);
+      lines.push(line);
+    }
+  }
+
+  const items = opts.items.filter((i) => alive(i, now));
+  if (items.length > 0) {
+    const sectionTitle = "### 相关记忆 / Related memory";
+    lines.push("", sectionTitle);
+    used += estimateTokens(sectionTitle);
+    let opened = false;
+    for (const item of items) {
+      let line = itemLine(item);
+      let cost = estimateTokens(line);
+      if (used + cost > budget) {
+        if (!opened && items.length > 0) {
+          // Even the first entry exceeds the remaining budget: truncate its
+          // excerpt to fit rather than emitting an empty section.
+          const room = Math.max(0, budget - used);
+          const static_ = `${item.title}：`;
+          const staticCost = estimateTokens(static_) + estimateTokens("- 〔〕") + estimateTokens(`${item.layer}·${item.kind}`);
+          const roomChars = Math.max(0, (room - staticCost) * 2); // CJK≈1 token/char
+          line = `- 〔${item.layer}·${item.kind}〕${String(item.title).slice(0, roomChars)}…`;
+          cost = estimateTokens(line);
+          if (cost > budget - used) break;
+          lines.push(line);
+          used += cost;
+          opened = true;
+        }
+        break; // whole-item granularity: later items = lower recall rank
+      }
+      lines.push(line);
+      used += cost;
+      opened = true;
+    }
+  }
+
+  lines.push("", "（fd-memory 生成；认领交接用 memory_handoff_accept，本摘要不自动消费。）");
+  return lines.join("\n");
+}

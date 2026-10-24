@@ -11,7 +11,7 @@
 
 import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
-import { distillCandidates } from "./distill.js";
+import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
 
 export interface DistillItem {
@@ -117,57 +117,15 @@ export class DistillScheduler {
   // v2.2 candidate selection: vector cosine top-8 first (query embedded via
   // the sidecar /embed), keyword path as fallback + gap-filler; results merge
   // deduped, vector hits first. Embed failure or empty root = pure keyword.
+  // (add-continuation-eval: the body now lives in the exported
+  // hybridCandidates below — the eval's digest arm recalls through the exact
+  // same code path so its conclusions extrapolate to production.)
   private async selectCandidates(root: StoreRoot, project: string, queryFor: string) {
-    const projects = project === "shared" ? [project] : [project, "shared"];
-    const keyword = distillCandidates(root, projects, queryFor);
-    try {
-      const q = await this.embedTexts([queryFor]);
-      if (!q.vectors.length) return keyword;
-      const qv = q.vectors[0];
-      const scored: Array<{ id: string; kind: "fact" | "experience"; task: string; search_keys: string[]; solution: string; boundary_envs: string; supersedes: string[]; score: number }> = [];
-      for (const c of keyword) {
-        for (const project2 of projects) {
-          const rel = `${project2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
-          const pv = root.db.getPageVector(rel);
-          if (!pv || pv.model !== q.model || pv.vector.length !== qv.length) continue;
-          scored.push({ ...c, score: cosine(qv, pv.vector) });
-          break;
-        }
-      }
-      scored.sort((a, b) => b.score - a.score);
-      const vectorIds = new Set(scored.map((x) => x.id));
-      const merged = [...scored, ...keyword.filter((k) => !vectorIds.has(k.id)).map((k) => ({ ...k, score: -1 }))];
-      const modelMismatch = root.db.vectorModelCounts().filter((m) => m.model !== q.model).reduce((a, m) => a + m.n, 0);
-      if (modelMismatch > 0) this.log.warn(`[distill] ${project}: ${modelMismatch} vector(s) on other models — excluded from cosine (gap noted)`);
-      return merged.slice(0, 8);
-    } catch (e) {
-      this.log.warn(`[distill] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
-      return keyword;
-    }
+    return hybridCandidates({ root, project, queryFor, k: 8, embed: (t) => this.embedTexts(t), log: this.log });
   }
 
   private async embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 30_000);
-    try {
-      const res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/embed`, {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
-        body: JSON.stringify({ texts }),
-        signal: controller.signal,
-      });
-      if (!res.ok) throw new Error(`embed HTTP ${res.status}`);
-      const doc = (await res.json()) as { vectors: number[][]; model: string; tokens: number; errors?: string[] };
-      if (doc.errors?.length) throw new Error(doc.errors.join("; "));
-      const day = new Date().toISOString().slice(0, 10);
-      const rootKey = this.opts.roots.keys().next().value ?? "";
-      // budget accounting rides the caller root (distillOne adds its own) —
-      // embed tokens are booked by the caller; here we only surface them.
-      void rootKey; void day;
-      return { vectors: doc.vectors, model: doc.model, tokens: doc.tokens ?? 0 };
-    } finally {
-      clearTimeout(timer);
-    }
+    return sidecarEmbed(this.opts.env ?? process.env, texts, this.opts.fetchImpl ?? fetch, this.url());
   }
 
   // Force a project through now (tests); respects inflight + backoff.
@@ -286,6 +244,75 @@ export class DistillScheduler {
     } finally {
       this.inflight.delete(key);
     }
+  }
+}
+
+// Standalone sidecar /embed call (extracted from the scheduler by
+// add-cluster-digest-injection — the /digest platform-seam face shares the
+// exact same wire): POST texts, 30s abort, structured failure.
+export async function sidecarEmbed(
+  env: NodeJS.ProcessEnv | undefined,
+  texts: string[],
+  fetchImpl: typeof fetch = fetch,
+  urlOverride?: string,
+): Promise<{ vectors: number[][]; model: string; tokens: number }> {
+  const url = String(urlOverride ?? env?.FD_MEMORY_DISTILLER_URL ?? "").replace(/\/+$/, "");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 30_000);
+  try {
+    const res = await fetchImpl(`${url}/embed`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+      body: JSON.stringify({ texts }),
+      signal: controller.signal,
+    });
+    if (!res.ok) throw new Error(`embed HTTP ${res.status}`);
+    const doc = (await res.json()) as { vectors: number[][]; model: string; tokens: number; errors?: string[] };
+    if (doc.errors?.length) throw new Error(doc.errors.join("; "));
+    return { vectors: doc.vectors, model: doc.model, tokens: doc.tokens ?? 0 };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Shared hybrid retrieval (extracted verbatim from the scheduler's candidate
+// selection by add-continuation-eval): vector cosine first, keyword fallback +
+// gap-filler, merged deduped, top-k. This is THE production recall path for
+// distiller candidates AND the eval digest arm — one implementation, no drift.
+export async function hybridCandidates(opts: {
+  root: StoreRoot;
+  project: string;
+  queryFor: string;
+  k?: number;
+  embed: (texts: string[]) => Promise<{ vectors: number[][]; model: string; tokens: number }>;
+  log?: { warn: (msg: string) => void };
+}): Promise<Array<DistillCandidate & { score?: number }>> {
+  const { root, project, queryFor, k = 8, embed, log } = opts;
+  const projects = project === "shared" ? [project] : [project, "shared"];
+  const keyword = distillCandidates(root, projects, queryFor);
+  try {
+    const q = await embed([queryFor]);
+    if (!q.vectors.length) return keyword;
+    const qv = q.vectors[0];
+    const scored: Array<DistillCandidate & { score: number }> = [];
+    for (const c of keyword) {
+      for (const project2 of projects) {
+        const rel = `${project2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+        const pv = root.db.getPageVector(rel);
+        if (!pv || pv.model !== q.model || pv.vector.length !== qv.length) continue;
+        scored.push({ ...c, score: cosine(qv, pv.vector) });
+        break;
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const vectorIds = new Set(scored.map((x) => x.id));
+    const merged = [...scored, ...keyword.filter((x) => !vectorIds.has(x.id)).map((x) => ({ ...x, score: -1 }))];
+    const modelMismatch = root.db.vectorModelCounts().filter((m) => m.model !== q.model).reduce((a, m) => a + m.n, 0);
+    if (modelMismatch > 0) log?.warn(`[hybrid] ${project}: ${modelMismatch} vector(s) on other models — excluded from cosine (gap noted)`);
+    return merged.slice(0, k);
+  } catch (e) {
+    log?.warn(`[hybrid] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
+    return keyword;
   }
 }
 
