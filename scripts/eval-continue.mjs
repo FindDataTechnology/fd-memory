@@ -229,7 +229,7 @@ async function digestBlock(root, project, scene) {
 
 // -- judge ----------------------------------------------------------------------
 const JUDGE_SYSTEM = `你是评测裁判。给定：【任务】【期望背景集合】（该会话前史中已沉淀、agent 本可知道的事实）和【agent 首回合响应】。
-只依据期望背景集合判定，不要用自己的猜测补充。输出严格 JSON（无多余文字）：
+只依据期望背景集合判定，不要用自己的猜测补充。注意：agent 处于规划模式（无工具执行环境），响应中的工具调用序列表示其第一步行动计划——按计划是否建立在背景之上评分，不要因为响应包含探索性步骤而扣分，也不要期望响应直接产出最终结果。输出严格 JSON（无多余文字）：
 {"re_derivation": 1-5, "first_step": 1-5, "evidence": ["引用响应原文的依据…"]}
 - re_derivation：5=零重推导，直接建立在背景之上；1=把期望背景当新问题从头重推或向用户索要已知背景。
 - first_step：5=第一步动作与期望背景完全一致且可直接执行；1=首步方向与背景矛盾或空泛无效。`;
@@ -266,29 +266,38 @@ async function prepDistill(root, project, scene) {
     ...(scene.history.handoffs ?? []).filter((h) => h.state === "open").map((h) => ({ kind: "handoff", session_id: h.id, at: h.created_at, summary: `${h.summary}｜next: ${h.next_steps}`, agent: "fixture" })),
   ];
   if (!items.length) return 0;
-  const candidates = await hybridCandidates({ root, project, queryFor: scene.task, k: 8, embed, log: { warn: () => {} } });
-  const res = await fetch(`${url}/distill`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${process.env.DISTILLER_SHARED_TOKEN ?? ""}` },
-    body: JSON.stringify({ scope: `eval/${project}`, cursor: { obs: 0, handoff: "" }, items, candidates }),
-  });
-  if (!res.ok) throw new Error(`distill HTTP ${res.status}`);
-  const result = await res.json();
-  if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
-  const norm = (e, kind) => ({
-    id: String(e.id ?? `${kind}_${Math.random().toString(36).slice(2, 8)}`),
-    engine: String(e.engine ?? "engine:unknown"),
-    confidence: e.confidence != null ? Number(e.confidence) : undefined,
-    sources: Array.isArray(e.sources) ? e.sources : [],
-    supersedes: Array.isArray(e.supersedes) ? e.supersedes : [],
-    ...(kind === "fact"
-      ? { statement: e.statement != null ? String(e.statement) : undefined, subject: e.subject != null ? String(e.subject) : undefined, details: e.details != null ? String(e.details) : undefined }
-      : { task: e.task != null ? String(e.task) : undefined, search_keys: Array.isArray(e.search_keys) ? e.search_keys : undefined, solution: e.solution != null ? String(e.solution) : undefined, boundary_envs: e.boundary_envs != null ? String(e.boundary_envs) : undefined }),
-  });
+  // Mirror the production chunked contract (§15.37 probe): the engine
+  // truncates its extraction output at the completion ceiling on large/long
+  // batches and returns a silent EMPTY result. 2 items × 800-char summaries.
+  const CHUNK = 2, CAP = 800;
+  const cap = (x) => String(x ?? "").replace(/\s+/g, " ").slice(0, CAP);
   const audit = { principal: "eval:prep-distill", scope: `eval/${project}` };
   const newRels = [];
-  for (const f of result.facts ?? []) newRels.push(root.writeDistillPage(project, "fact", norm(f, "fact"), audit));
-  for (const x of result.experiences ?? []) newRels.push(root.writeDistillPage(project, "experience", norm(x, "experience"), audit));
+  for (let i = 0; i < items.length; i += CHUNK) {
+    const batch = items.slice(i, i + CHUNK).map((it) => ({ ...it, summary: cap(it.summary) }));
+    const candidates = await hybridCandidates({ root, project, queryFor: batch.map((b) => b.summary).join(" ").slice(0, 1200), k: 8, embed, log: { warn: () => {} } });
+    const res = await fetch(`${url}/distill`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${process.env.DISTILLER_SHARED_TOKEN ?? ""}` },
+      body: JSON.stringify({ scope: `eval/${project}`, cursor: { obs: 0, handoff: "" }, items: batch, candidates }),
+    });
+    if (!res.ok) throw new Error(`distill HTTP ${res.status}`);
+    const result = await res.json();
+    if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
+    const norm = (e, kind) => ({
+      id: String(e.id ?? `${kind}_${Math.random().toString(36).slice(2, 8)}`),
+      engine: String(e.engine ?? "engine:unknown"),
+      confidence: e.confidence != null ? Number(e.confidence) : undefined,
+      sources: Array.isArray(e.sources) ? e.sources : [],
+      supersedes: Array.isArray(e.supersedes) ? e.supersedes : [],
+      ...(kind === "fact"
+        ? { statement: e.statement != null ? String(e.statement) : undefined, subject: e.subject != null ? String(e.subject) : undefined, details: e.details != null ? String(e.details) : undefined }
+        : { task: e.task != null ? String(e.task) : undefined, search_keys: Array.isArray(e.search_keys) ? e.search_keys : undefined, solution: e.solution != null ? String(e.solution) : undefined, boundary_envs: e.boundary_envs != null ? String(e.boundary_envs) : undefined }),
+    });
+    for (const f of result.facts ?? []) newRels.push(root.writeDistillPage(project, "fact", norm(f, "fact"), audit));
+    for (const x of result.experiences ?? []) newRels.push(root.writeDistillPage(project, "experience", norm(x, "experience"), audit));
+  }
+
   if (embedLane && newRels.length) {
     const texts = [], rels = [];
     for (const rel of newRels) {
