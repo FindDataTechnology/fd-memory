@@ -161,6 +161,23 @@ export class DistillScheduler {
       if (rootKey.startsWith("u-")) for (const p of root.db.distinctProjects()) projects.add(p);
       for (const project of projects) {
         const state = root.db.getDistillState(project);
+        if (rootKey.startsWith("u-")) {
+          // Person roots have no observation stream — the cursor-lag gate below
+          // (maxObservationRowid - obs_cursor) is always 0 for them. Queue on
+          // note/handoff lag instead: any uncursored note or handoff qualifies.
+          const noteLag = root.db.notesAfter(project, state?.note_cursor ?? "", 1).length > 0;
+          let handoffLag = false;
+          try {
+            handoffLag = !!root.db
+              .db.prepare("SELECT id FROM handoffs WHERE project=? AND created_at>? LIMIT 1")
+              .get(project, state?.handoff_cursor ?? "");
+          } catch { /* best-effort */ }
+          if (noteLag || handoffLag) {
+            const key = DistillScheduler.key(rootKey, project);
+            if (!this.pending.has(key)) this.pending.set(key, { rootKey, project, since: 0 });
+          }
+          continue;
+        }
         const lag = root.db.maxObservationRowid(project) - (state?.obs_cursor ?? 0);
         if (lag >= FALLBACK_CURSOR_LAG) {
           const key = DistillScheduler.key(rootKey, project);
