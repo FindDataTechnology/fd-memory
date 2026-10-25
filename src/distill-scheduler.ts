@@ -221,6 +221,72 @@ export class DistillScheduler {
         return;
       }
 
+      const audit = { principal: "distiller:scheduler", scope: `${rootKey}/${project}` };
+
+      if (rootKey.startsWith("u-")) {
+        // Person-root chunked distillation (add-u-root-distillation D2, tuned
+        // by production probe 2026-10-25): the engine's extraction output
+        // truncates at its completion ceiling on large/long batches and the
+        // truncated JSON is swallowed into an EMPTY result (no error, 0 pages)
+        // — 4 real patrol handoffs → completion_tokens 6000 → silent zero. 2
+        // items per call with 800-char summaries stay under the ceiling (4.4k
+        // completion). Handoffs and notes are chunked per-stream so cursors
+        // advance cleanly; the daily budget is billed once for the whole run.
+        const CHUNK = 2;
+        const CAP = 800;
+        const cap = (s: string) => String(s ?? "").replace(/\s+/g, " ").slice(0, CAP);
+        let spentTotal = 0;
+        const callEngine = async (items: DistillItem[]) => {
+          const candidates = await this.selectCandidates(root, project, items.map((i) => i.summary).join(" ").slice(0, 1200));
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+          let res: Response;
+          try {
+            res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+              body: JSON.stringify({ scope: `${rootKey}/${project}`, cursor: { obs: state?.obs_cursor ?? 0, handoff: state?.handoff_cursor ?? "" }, items, candidates }),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+          if (!res.ok) throw new Error(`sidecar HTTP ${res.status}`);
+          const result = (await res.json()) as {
+            facts: Array<Record<string, unknown>>;
+            experiences: Array<Record<string, unknown>>;
+            llm_calls: Array<unknown>;
+            tokens: number;
+            errors: string[];
+          };
+          if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
+          for (const fact of result.facts ?? []) {
+            const rel = root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
+            writeEntryVector(root, rel, fact);
+          }
+          for (const exp of result.experiences ?? []) {
+            const rel = root.writeDistillPage(project, "experience", normalizeEntry(exp, "experience"), audit);
+            writeEntryVector(root, rel, exp);
+          }
+          spentTotal += result.tokens ?? 0;
+          return (result.facts?.length ?? 0) + (result.experiences?.length ?? 0);
+        };
+        let wrote = 0;
+        for (let i = 0; i < handoffs.length; i += CHUNK) {
+          const batch = handoffs.slice(i, i + CHUNK);
+          wrote += await callEngine(batch.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${cap(h.summary)}｜next: ${cap(h.next_steps)}`, agent: h.from_agent })));
+          root.db.upsertDistillState(project, { handoff_cursor: batch[batch.length - 1].created_at, last_tokens: spentTotal });
+        }
+        for (let i = 0; i < notes.length; i += CHUNK) {
+          const batch = notes.slice(i, i + CHUNK);
+          wrote += await callEngine(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "note-write", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
+          root.db.upsertDistillState(project, { note_cursor: batch[batch.length - 1].updated_at, last_tokens: spentTotal });
+        }
+        this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, wrote);
+        this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
+        return;
+      }
+
       const items: DistillItem[] = [
         ...obs.map((o) => ({ kind: "observation" as const, session_id: o.session_id, at: o.created_at, event: o.event, tool: o.tool, summary: o.summary, agent: o.agent })),
         ...handoffs.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${h.summary}｜next: ${h.next_steps}` , agent: h.from_agent })),
@@ -258,7 +324,6 @@ export class DistillScheduler {
       };
       if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
 
-      const audit = { principal: "distiller:scheduler", scope: `${rootKey}/${project}` };
       for (const fact of result.facts ?? []) {
         const rel = root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
         writeEntryVector(root, rel, fact);

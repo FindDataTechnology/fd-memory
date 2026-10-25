@@ -38,15 +38,17 @@ function fixture(data: string, sidecar: { impl: typeof fetch; calls: Array<Recor
 const GATES = { FD_MEMORY_DISTILLER_URL: "http://sidecar.test", FD_MEMORY_DISTILL_ENABLED: "1" };
 
 function okSidecar(calls: Array<Record<string, unknown>>) {
+  let n = 0;
   return {
     calls,
     impl: (async (url: RequestInfo | URL) => {
       if (String(url).endsWith("/embed")) {
         return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
       }
+      n += 1;
       return { ok: true, status: 200, json: async () => ({
         facts: [],
-        experiences: [{ id: "exp_note1", engine: "engine:test/1", task: "报表口径", search_keys: ["周报"], solution: "表头中文、周五发 #ops、akshare 优先", sources: ["note:default/notes/n1.md"], supersedes: [] }],
+        experiences: [{ id: `exp_note${n}`, engine: "engine:test/1", task: `报表口径 ${n}`, search_keys: ["周报"], solution: "表头中文、周五发 #ops、akshare 优先", sources: ["note:default/notes/n1.md"], supersedes: [] }],
         cursor_next: {}, llm_calls: [{ stage: "distill_extract", ok: true, prompt_tokens: 900, completion_tokens: 400 }], tokens: 1300, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -68,17 +70,16 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
     }
     await fx.sched.distillNow("u-alice@test", "default");
     const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
-    assert.equal(distillCalls().length, 1, "u-root distilled via fallback path");
-    const req = distillCalls()[0].body as { items: Array<{ kind: string; tool?: string; summary: string; session_id: string }>; scope: string };
-    assert.equal(req.scope, "u-alice@test/default");
-    const noteItems = req.items.filter((i) => i.tool === "memory_write_page");
-    assert.equal(noteItems.length, 4, "all four notes entered as observation-shaped items");
-    assert.ok(noteItems[0].summary.startsWith("偏好 1："), "summary = title + body excerpt");
+    // chunked contract (production-probe tuned): 2 items per engine call
+    assert.equal(distillCalls().length, 2, "4 notes distill as 2-item chunks");
+    const allNoteItems = distillCalls().flatMap((c) => ((c.body as { items: Array<{ tool?: string; summary: string }> }).items).filter((i) => i.tool === "memory_write_page"));
+    assert.equal(allNoteItems.length, 4, "all four notes entered as observation-shaped items");
+    assert.ok(allNoteItems[0].summary.startsWith("偏好 1："), "summary = title + body excerpt");
     // L2 landed + cursor advanced — the cursor lives on the pages-table view
     // (notesAfter), the same surface the distiller reads, so assert against
     // THAT view; the FTS index samples updated_at separately (1ms drift).
     const l2 = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience" || p.type === "fact");
-    assert.equal(l2.length, 1);
+    assert.equal(l2.length, 2, "one engine page per chunk");
     const noteRows = root.db.notesAfter("default", "", 120);
     const lastUpdatedAt = noteRows.map((r) => r.updated_at).sort().at(-1)!;
     const st = root.db.getDistillState("default")!;
@@ -91,10 +92,10 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
     } as never);
     await new Promise((r) => setTimeout(r, 5));
     await fx.sched.distillNow("u-alice@test", "default");
+    assert.equal(distillCalls().length, 1, "one chunk call for the single new note");
     const req2 = distillCalls()[0]?.body as { items: Array<{ tool?: string; session_id: string }> };
-    assert.equal(distillCalls().length, 1);
     assert.equal(req2.items.filter((i) => i.tool === "memory_write_page").length, 1, "only the uncursored note re-enters");
-    assert.equal(req2.items[0].session_id.endsWith("n5.md") || req2.items[0].session_id.includes("n5"), true);
+    assert.ok(req2.items[0].session_id.includes("n5"));
   } finally {
     rmSync(data, { recursive: true, force: true });
   }
