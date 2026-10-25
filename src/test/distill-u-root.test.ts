@@ -64,6 +64,7 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
         frontmatter: { type: "note", title: `偏好 ${i}`, generated: { by: "test", at: `2026-10-25T0${i}:00:00.000Z` } },
         body: `第 ${i} 条偏好正文`,
       } as never);
+      await new Promise((r) => setTimeout(r, 5)); // index updated_at is write time — keep notes in distinct ms
     }
     await fx.sched.distillNow("u-alice@test", "default");
     const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
@@ -73,11 +74,12 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
     const noteItems = req.items.filter((i) => i.tool === "memory_write_page");
     assert.equal(noteItems.length, 4, "all four notes entered as observation-shaped items");
     assert.ok(noteItems[0].summary.startsWith("偏好 1："), "summary = title + body excerpt");
-    // L2 landed + cursor advanced (index updated_at = write time, not
-    // frontmatter; the cursor must equal the last note's indexed updated_at)
+    // L2 landed + cursor advanced — the cursor lives on the pages-table view
+    // (notesAfter), the same surface the distiller reads, so assert against
+    // THAT view; the FTS index samples updated_at separately (1ms drift).
     const l2 = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience" || p.type === "fact");
     assert.equal(l2.length, 1);
-    const noteRows = root.db.recentPages(50, ["default"]).filter((p) => p.type === "note");
+    const noteRows = root.db.notesAfter("default", "", 120);
     const lastUpdatedAt = noteRows.map((r) => r.updated_at).sort().at(-1)!;
     const st = root.db.getDistillState("default")!;
     assert.equal(st.note_cursor, lastUpdatedAt);
@@ -87,6 +89,7 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
       frontmatter: { type: "note", title: "偏好 5", generated: { by: "test", at: "2026-10-25T05:00:00.000Z" } },
       body: "第五条",
     } as never);
+    await new Promise((r) => setTimeout(r, 5));
     await fx.sched.distillNow("u-alice@test", "default");
     const req2 = distillCalls()[0]?.body as { items: Array<{ tool?: string; session_id: string }> };
     assert.equal(distillCalls().length, 1);
