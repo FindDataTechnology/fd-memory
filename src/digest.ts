@@ -56,9 +56,17 @@ function itemLine(item: DigestItem): string {
   return `- 〔${item.layer}·${item.kind}${conf}${date}〕${item.title}${excerpt ? `：${excerpt}` : ""}`;
 }
 
+// Notification semantics (constructed-benchmark finding, 2026-10-25): a
+// handoff line is "there is an open handoff [id], gist, accept it" — the full
+// summary lives in the page and is recovered on claim. Round-report handoffs
+// ran 700-1500 tokens each and drowned the whole block (retrieval was fine;
+// the memory section rendered as one title-only truncated line).
+const HANDOFF_GIST_CHARS = 100;
+
 function handoffLine(h: DigestHandoff): string {
   const to = h.to_agent ? `（→ ${h.to_agent}，${String(h.created_at ?? "").slice(0, 10)}）` : `（${String(h.created_at ?? "").slice(0, 10)}）`;
-  return `- [${String(h.id).slice(0, 8)}] ${String(h.summary ?? "").replace(/\s+/g, " ").trim()}${to}`;
+  const gist = String(h.summary ?? "").replace(/\s+/g, " ").trim().slice(0, HANDOFF_GIST_CHARS);
+  return `- [${String(h.id).slice(0, 8)}] ${gist}${String(h.summary ?? "").length > HANDOFF_GIST_CHARS ? "…" : ""}${to}`;
 }
 
 export function renderDigest(opts: {
