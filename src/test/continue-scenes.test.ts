@@ -22,13 +22,57 @@ function scene(over: Partial<ContinueScene> = {}): ContinueScene {
   };
 }
 
+function note(ok: boolean) {
+  return ok
+    ? { id: "n1", title: "报表口径偏好", body: "表头一律中文；数据源优先 akshare。", updated_at: "2026-10-23T00:00:00.000Z" }
+    : ({ title: "缺字段" } as never);
+}
+
 test("a full valid set passes", () => {
+  const scenes: ContinueScene[] = [];
+  for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
+    for (let i = 0; i < 4; i++) {
+      const s = scene({ id: `${project}-${i}`, source: { root: "d-x", project } });
+      if (i === 0) s.history.notes = [note(true)];
+      scenes.push(s);
+    }
+  }
+  const v = validateScenes(scenes);
+  assert.equal(v.ok, true, JSON.stringify(v.errors));
+});
+
+test("set without note scenes is refused (L1 recall lane must stay covered)", () => {
   const scenes: ContinueScene[] = [];
   for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
     for (let i = 0; i < 4; i++) scenes.push(scene({ id: `${project}-${i}`, source: { root: "d-x", project } }));
   }
   const v = validateScenes(scenes);
-  assert.equal(v.ok, true, JSON.stringify(v.errors));
+  assert.equal(v.ok, false);
+  assert.match(v.errors.join(";"), /note 场景数 0 < 3/);
+});
+
+test("malformed note is refused; notes-only history counts as non-empty", () => {
+  const base = () => {
+    const scenes: ContinueScene[] = [];
+    for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
+      for (let i = 0; i < 4; i++) {
+        const s = scene({ id: `${project}-${i}`, source: { root: "d-x", project } });
+        if (i === 0) s.history.notes = [note(true)];
+        scenes.push(s);
+      }
+    }
+    return scenes;
+  };
+  const bad = base();
+  bad[0].history.notes = [note(false)];
+  const vBad = validateScenes(bad);
+  assert.equal(vBad.ok, false);
+  assert.match(vBad.errors.join(";"), /note 缺 id\/title\/body\/updated_at/);
+
+  const notesOnly = base();
+  notesOnly[0].history = { observations: [], handoffs: [], pages: [], notes: [note(true)] };
+  const vOk = validateScenes(notesOnly);
+  assert.equal(vOk.ok, true, JSON.stringify(vOk.errors));
 });
 
 test("undersized set is refused regardless of quality", () => {

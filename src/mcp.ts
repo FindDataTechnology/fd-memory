@@ -228,7 +228,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): M
     },
     {
       name: "memory_write_page",
-      description: "Write a durable note page — default into your own area, target 'shared' into the pack's shared area.",
+      description: "Write a durable note page — default into your own area, target 'shared' into the pack's shared area. Use it whenever the user explicitly asks you to remember something, or you learn a preference/fact worth carrying into later sessions; recent notes are recalled automatically at later session starts.",
       inputSchema: {
         type: "object",
         properties: { title: { type: "string" }, body: { type: "string" }, ...targetProps },

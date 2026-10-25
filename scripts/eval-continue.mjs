@@ -29,6 +29,7 @@ import { StoreRoot } from "../dist/store.js";
 import { hybridCandidates } from "../dist/distill-scheduler.js";
 import { renderDigest } from "../dist/digest.js";
 import { validateScenes } from "../dist/continue-scenes.js";
+import { newPage } from "../dist/okf.js";
 
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
@@ -146,6 +147,11 @@ function loadScene(scene, dataDir) {
       to_agent: h.to_agent ?? null, state: h.state, accepted_by: null, accepted_at: null, created_at: h.created_at,
     });
   }
+  // L1 notes (add-chat-memory-injection): seeded exactly as the chat lane's
+  // MCP write-back produces them — note pages under the project's notes/.
+  for (const n of scene.history.notes ?? []) {
+    root.writePage(project, "notes", n.id, newPage("note", n.title, n.body), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
+  }
   return { root, project };
 }
 
@@ -186,10 +192,25 @@ async function digestBlock(root, project, scene) {
         confidence: meta?.confidence ?? null, updated_at: meta?.updated_at ?? null,
       };
     });
+  // L1 notes appended after L2 — verbatim the production /digest face
+  // (http.ts add-digest-note-recall): top-3 recent notes of the project,
+  // headers stripped, 400-char excerpt. Notes ride recent-first, not query-
+  // matched, faithful to the seam the chat lane reads.
+  const NOTES_LIMIT = 3;
+  const recentNotes = root.db.recentPages(20, [project]).filter((p) => p.type === "note").slice(0, NOTES_LIMIT);
+  const noteItems = recentNotes.map((p) => {
+    const page = root.readPageByRel(p.path);
+    return {
+      id: p.path, layer: "L1", kind: "note", title: p.title,
+      excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+      confidence: null, updated_at: p.updated_at,
+    };
+  });
+  const allItems = [...items, ...noteItems];
   const handoffs = scene.history.handoffs.filter((h) => h.state === "open")
     .map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
-  const block = renderDigest({ items, handoffs, budgetTokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500), now: new Date().toISOString() });
-  return { block, nItems: items.length };
+  const block = renderDigest({ items: allItems, handoffs, budgetTokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500), now: new Date().toISOString() });
+  return { block, nItems: allItems.length };
 }
 
 // -- judge ----------------------------------------------------------------------
