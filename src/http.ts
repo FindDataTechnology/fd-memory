@@ -328,7 +328,13 @@ export class Service {
           confidence: null, updated_at: p.updated_at,
         };
       });
-      const handoffs = dRoot.db.openHandoffs([project]).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
+      // Handoffs cap (add-chat-memory-injection drill, 2026-10-25): the
+      // renderer spends budget handoffs-first, so an owner root with a pile
+      // of open handoffs (e.g. a day of fleet drills) starved the L1 notes
+      // segment to zero — the chat lane's core recall — while cluster roots
+      // never noticed (they carry 0-2 handoffs). Cap the sample at 3; the
+      // renderer's ordering is untouched.
+      const handoffs = dRoot.db.openHandoffs([project]).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
       const allItems = [...items, ...noteItems];
       const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
       const rendered = (digest.match(/〔L/g) ?? []).length;

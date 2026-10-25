@@ -140,6 +140,38 @@ test("/digest L1: budget squeeze drops notes before L2 items; truncated honest",
   }
 });
 
+test("/digest: open-handoff pile caps at 3 so notes survive the budget (chat-lane starvation regression)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const root = svc.rootForKey("u-alice");
+    // a day-of-drills shape: five open handoffs with long summaries + the
+    // user note the chat lane must recall
+    for (let i = 1; i <= 5; i++) {
+      root.db.upsertHandoff({
+        id: `h${i}`, project: "default", from_agent: "m",
+        summary: `岗 ${i} 回合沉淀：` + "长摘要正文".repeat(60),
+        open_questions: "[]", next_steps: "[]", files_touched: "[]",
+        to_agent: null, state: "open", accepted_by: null, accepted_at: null, created_at: new Date().toISOString(),
+      });
+    }
+    await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "default", title: "周报口径", body: "表头一律用中文；每周五下班前发到 #ops 频道；数据源优先 akshare。" }) });
+    const r = await fetch(base + "/digest?project=default&q=周报&budget=1500", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number };
+    assert.equal(r.status, 200);
+    assert.ok(d.digest.includes("h4") === false && d.digest.includes("h5") === false, "handoffs capped at 3 (ids h4/h5 absent)");
+    assert.equal(d.notes, 1, "the note must not starve under a handoff pile");
+    assert.ok(d.digest.includes("周报口径"));
+    assert.ok(d.digest.includes("#ops"));
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("/digest L1: a forgotten note never re-enters the block", async () => {
   const data = tmpData();
   const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
