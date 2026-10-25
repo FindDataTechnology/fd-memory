@@ -278,6 +278,15 @@ export class RootDb {
     ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
   }
 
+  // /digest L1 segment (2026-10-26 benchmark): a type-blind recentPages window
+  // loses notes whenever fresh L2/handoff pages churn above them — query the
+  // type directly so note recall never depends on other page kinds' activity.
+  recentNotes(project: string, limit = 5): Array<{ path: string; title: string; updated_at: string }> {
+    return this.db
+      .prepare("SELECT path, title, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT ?")
+      .all(project, limit) as never;
+  }
+
   // u-root distillation (add-u-root-distillation): note pages as distill
   // inputs, cursor = updated_at ISO string (same shape as handoff_cursor);
   // forget/excluded rows drop out of the pages index so they never re-enter.

@@ -295,3 +295,28 @@ test("/digest L1: segment caps at 5 and the rank-4 note is visible (recall-depth
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest L1: note recall is window-independent — fresh L2 churn above old notes cannot evict them", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const root = svc.rootForKey("u-alice");
+    // the old note the chat lane must recall
+    await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-win", title: "宏观研究员验收结论", body: "第二轮验收通过，跨成员可见性已修正。" }) });
+    // then a burst of 25 fresh L2 pages churns ABOVE it (distillation write-back shape)
+    for (let i = 1; i <= 25; i++) {
+      root.writeDistillPage("c-win", "experience", { id: `exp_w${i}`, engine: "e", confidence: 0.8, task: `巡视产出 ${i}`, search_keys: ["巡视"], solution: "产出正文", sources: [], supersedes: [] });
+    }
+    const r = await fetch(base + "/digest?project=c-win&q=宏观研究员&budget=1500", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number };
+    assert.equal(r.status, 200);
+    assert.ok(d.notes >= 1, `the old note rides regardless of L2 churn (notes=${d.notes})`);
+    assert.ok(d.digest.includes("宏观研究员验收结论"));
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

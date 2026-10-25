@@ -203,8 +203,8 @@ async function digestBlock(root, project, scene) {
   // (http.ts add-digest-note-recall): top-3 recent notes of the project,
   // headers stripped, 400-char excerpt. Notes ride recent-first, not query-
   // matched, faithful to the seam the chat lane reads.
-  const NOTES_LIMIT = 3;
-  const recentNotes = root.db.recentPages(20, [project]).filter((p) => p.type === "note").slice(0, NOTES_LIMIT);
+  const NOTES_LIMIT = 5;
+  const recentNotes = root.db.recentNotes(project, NOTES_LIMIT);
   const noteItems = recentNotes.map((p) => {
     const page = root.readPageByRel(p.path);
     return {

@@ -339,10 +339,7 @@ export class Service {
       // rank-4/5 notes — their TITLES alone carry the signal. Segment widens
       // to 5 with gist-sized lines (title + ~100-char excerpt).
       const NOTES_LIMIT = 5;
-      const recentNotes = dRoot.db
-        .recentPages(20, [project])
-        .filter((p) => p.type === "note")
-        .slice(0, NOTES_LIMIT);
+      const recentNotes = dRoot.db.recentNotes(project, NOTES_LIMIT);
       const noteItems: DigestItem[] = recentNotes.map((p) => {
         const page = dRoot.readPageByRel(p.path);
         return {
