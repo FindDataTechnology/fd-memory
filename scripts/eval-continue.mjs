@@ -218,7 +218,10 @@ async function digestBlock(root, project, scene) {
   // digest-lane starvation fix) so eval conclusions extrapolate
   // mirror the production recency gate (48h): "待认领" = actionable now
   const HANDOFF_MAX_AGE_MS = 48 * 3600_000;
-  const handoffs = scene.history.handoffs.filter((h) => h.state === "open" && Date.now() - Date.parse(h.created_at) < HANDOFF_MAX_AGE_MS).slice(0, 3)
+  // ABLATION (adjudication, 2026-10-26): EVAL_NO_HANDOFFS=1 renders the digest
+  // without the open-handoffs segment at all — isolates the handoff segment's
+  // pull from the memory content's value.
+  const handoffs = process.env.EVAL_NO_HANDOFFS ? [] : scene.history.handoffs.filter((h) => h.state === "open" && Date.now() - Date.parse(h.created_at) < HANDOFF_MAX_AGE_MS).slice(0, 3)
     .map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
   const block = renderDigest({ items: allItems, handoffs, budgetTokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500), now: new Date().toISOString() });
   return { block, nItems: allItems.length };
