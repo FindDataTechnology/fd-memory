@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { renderDigest, estimateTokens, DIGEST_DEFAULT_BUDGET_TOKENS } from "../digest.js";
+import { DigestItem, renderDigest, estimateTokens, DIGEST_DEFAULT_BUDGET_TOKENS } from "../digest.js";
 
 const NOW = "2026-10-25T00:00:00.000Z";
 
@@ -79,4 +79,24 @@ test("default budget is 1500 and zero items still renders the header", () => {
   assert.match(out, /## 记忆摘要 \/ Memory digest（fd-memory，截至 2026-10-25）/);
   assert.ok(!out.includes("### 相关记忆"));
   assert.ok(!out.includes("### 待认领交接"));
+});
+
+test("note share: recent notes keep a floor when L2 candidates fill the budget; no-notes case unchanged", () => {
+  const l2Item = (n: number): DigestItem => ({
+    id: `exp_${n}`, layer: "L2", kind: "experience", title: `L2 条目 ${n}：` + "正文".repeat(120),
+    excerpt: "摘录".repeat(150), confidence: 0.8, updated_at: "2026-10-24T00:00:00.000Z",
+  });
+  const note: DigestItem = {
+    id: "n1", layer: "L1", kind: "note", title: "周报口径",
+    excerpt: "表头一律用中文；每周五下班前发到 #ops 频道；数据源优先 akshare。",
+    confidence: null, updated_at: "2026-10-25T00:00:00.000Z",
+  };
+  // 6 heavy L2 items would consume the whole 1500 budget — the note must still ride
+  const withNote = renderDigest({ items: [...Array.from({ length: 6 }, (_, i) => l2Item(i + 1)), note], handoffs: [], budgetTokens: 1500, now: NOW });
+  assert.ok(withNote.includes("周报口径"), "note survives L2 pressure via its share");
+  assert.ok(withNote.includes("#ops"));
+  // a notes-only root uses the full budget (no artificial share cap)
+  const notesOnly = renderDigest({ items: [note], handoffs: [], budgetTokens: 1500, now: NOW });
+  assert.ok(notesOnly.includes("周报口径"));
+  assert.ok(notesOnly.includes("akshare"), "notes-only block renders the full note line");
 });

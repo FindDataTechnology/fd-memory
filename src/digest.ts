@@ -104,31 +104,47 @@ export function renderDigest(opts: {
     const sectionTitle = "### 相关记忆 / Related memory";
     lines.push("", sectionTitle);
     used += estimateTokens(sectionTitle);
-    let opened = false;
-    for (const item of items) {
-      let line = itemLine(item);
-      let cost = estimateTokens(line);
-      if (used + cost > budget) {
-        if (!opened && items.length > 0) {
-          // Even the first entry exceeds the remaining budget: truncate its
-          // excerpt to fit rather than emitting an empty section.
-          const room = Math.max(0, budget - used);
-          const static_ = `${item.title}：`;
-          const staticCost = estimateTokens(static_) + estimateTokens("- 〔〕") + estimateTokens(`${item.layer}·${item.kind}`);
-          const roomChars = Math.max(0, (room - staticCost) * 2); // CJK≈1 token/char
-          line = `- 〔${item.layer}·${item.kind}〕${String(item.title).slice(0, roomChars)}…`;
-          cost = estimateTokens(line);
-          if (cost > budget - used) break;
-          lines.push(line);
-          used += cost;
-          opened = true;
+    // Note share (constructed-benchmark finding, 2026-10-25 ②): L2 candidates
+    // render first by recall rank, but when they fill the budget the recent
+    // notes — the "user just told me this" context the chat lane most needs —
+    // were squeezed to zero. Reserve a floor for L1 notes; L2 keeps the rest,
+    // and notes may expand into whatever L2 leaves unused. No L1 items ⇒
+    // byte-identical to the previous single-loop behavior.
+    const NOTE_SHARE_TOKENS = 200;
+    const l1 = items.filter((i) => i.layer === "L1");
+    const rest = items.filter((i) => i.layer !== "L1");
+    const cap = l1.length ? budget - Math.min(NOTE_SHARE_TOKENS, Math.floor(budget / 3)) : budget;
+    const pushItems = (list: typeof items, capTokens: number): number => {
+      let spent = 0;
+      let opened = false;
+      for (const item of list) {
+        let line = itemLine(item);
+        let cost = estimateTokens(line);
+        if (used + spent + cost > capTokens) {
+          if (!opened && list.length > 0) {
+            // Even the first entry exceeds the remaining budget: truncate its
+            // excerpt to fit rather than emitting an empty section.
+            const room = Math.max(0, capTokens - used - spent);
+            const static_ = `${item.title}：`;
+            const staticCost = estimateTokens(static_) + estimateTokens("- 〔〕") + estimateTokens(`${item.layer}·${item.kind}`);
+            const roomChars = Math.max(0, (room - staticCost) * 2); // CJK≈1 token/char
+            line = `- 〔${item.layer}·${item.kind}〕${String(item.title).slice(0, roomChars)}…`;
+            cost = estimateTokens(line);
+            if (cost > capTokens - used - spent) break;
+            lines.push(line);
+            spent += cost;
+            opened = true;
+          }
+          break; // whole-item granularity: later items = lower recall rank
         }
-        break; // whole-item granularity: later items = lower recall rank
+        lines.push(line);
+        spent += cost;
+        opened = true;
       }
-      lines.push(line);
-      used += cost;
-      opened = true;
-    }
+      return spent;
+    };
+    used += pushItems(rest, cap);
+    used += pushItems(l1, budget);
   }
 
   lines.push("", "（fd-memory 生成；认领交接用 memory_handoff_accept，本摘要不自动消费。）");
