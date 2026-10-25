@@ -271,3 +271,27 @@ test("/digest L1: a forgotten note never re-enters the block", async () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest L1: segment caps at 5 and the rank-4 note is visible (recall-depth regression)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    for (let i = 1; i <= 6; i++) {
+      const w = await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-depth", title: `填充 ${i}`, body: `第 ${i} 条填充内容` }) });
+      assert.equal(w.status, 200);
+      await new Promise((r) => setTimeout(r, 8));
+    }
+    const r = await fetch(base + "/digest?project=c-depth&q=填充&budget=1500", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number };
+    assert.equal(r.status, 200);
+    assert.ok(d.notes <= 5, `segment caps at 5 (got ${d.notes})`);
+    assert.ok(d.digest.includes("填充 4"), "rank-4 note rides the widened segment");
+    assert.ok(!d.digest.includes("填充 1"), "the 6th-newest note stays out (cap) — recentPages orders newest-first");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

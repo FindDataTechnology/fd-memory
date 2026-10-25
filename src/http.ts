@@ -330,7 +330,11 @@ export class Service {
       // 补记三: turn 2 got a byte-identical empty digest with turn 1's note on
       // disk). Renderer budget discipline carries the ordering: handoffs
       // section first, then array order (L2 before notes), tail truncated.
-      const NOTES_LIMIT = 3;
+      // L1 recall depth (benchmark+eval finding, 2026-10-26): the only
+      // benchmark miss and the wx titles-beats-digest eval gap both traced to
+      // rank-4/5 notes — their TITLES alone carry the signal. Segment widens
+      // to 5 with gist-sized lines (title + ~100-char excerpt).
+      const NOTES_LIMIT = 5;
       const recentNotes = dRoot.db
         .recentPages(20, [project])
         .filter((p) => p.type === "note")
@@ -339,7 +343,7 @@ export class Service {
         const page = dRoot.readPageByRel(p.path);
         return {
           id: p.path, layer: "L1" as const, kind: "note", title: p.title,
-          excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+          excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 100),
           confidence: null, updated_at: p.updated_at,
         };
       });

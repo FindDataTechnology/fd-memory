@@ -209,7 +209,7 @@ async function digestBlock(root, project, scene) {
     const page = root.readPageByRel(p.path);
     return {
       id: p.path, layer: "L1", kind: "note", title: p.title,
-      excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+      excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 100),
       confidence: null, updated_at: p.updated_at,
     };
   });

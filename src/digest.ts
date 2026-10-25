@@ -110,7 +110,7 @@ export function renderDigest(opts: {
     // were squeezed to zero. Reserve a floor for L1 notes; L2 keeps the rest,
     // and notes may expand into whatever L2 leaves unused. No L1 items ⇒
     // byte-identical to the previous single-loop behavior.
-    const NOTE_SHARE_TOKENS = 200;
+    const NOTE_SHARE_TOKENS = 400;
     const l1 = items.filter((i) => i.layer === "L1");
     const rest = items.filter((i) => i.layer !== "L1");
     const cap = l1.length ? budget - Math.min(NOTE_SHARE_TOKENS, Math.floor(budget / 3)) : budget;
