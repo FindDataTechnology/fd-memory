@@ -35,6 +35,11 @@ export interface DistillSchedulerOptions {
 }
 
 const DEBOUNCE_MS = 5 * 60_000;
+// Person roots distill on WRITE triggers (add-write-triggered-distill) — the
+// material is a discrete note/handoff the user just produced, and its value
+// decays fast; a 60s debounce merges bursts without the 5min session wait.
+const U_DEBOUNCE_MS = 60_000;
+const debounceFor = (rootKey: string) => (rootKey.startsWith("u-") ? U_DEBOUNCE_MS : DEBOUNCE_MS);
 const FALLBACK_INTERVAL_MS = 10 * 60_000;
 const DRAIN_TICK_MS = 60_000;
 const MAX_BACKOFF_MS = 60 * 60_000;
@@ -118,7 +123,7 @@ export class DistillScheduler {
     if (!this.enabled()) return;
     this.fallbackScan();
     const due = [...this.pending.values()].filter(
-      (p) => !this.inflight.has(DistillScheduler.key(p.rootKey, p.project)) && this.now() - p.since >= DEBOUNCE_MS,
+      (p) => !this.inflight.has(DistillScheduler.key(p.rootKey, p.project)) && this.now() - p.since >= debounceFor(p.rootKey),
     );
     const batch = due.slice(0, 2); // cross-project concurrency ≤2
     await Promise.allSettled(batch.map((p) => this.distillOne(p.rootKey, p.project)));

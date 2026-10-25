@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { TokenStore } from "../auth.js";
 import { StoreRoot } from "../store.js";
 import { DistillScheduler } from "../distill-scheduler.js";
+import { buildTools } from "../mcp.js";
 
 function tmpData(): string {
   return mkdtempSync(join(tmpdir(), "fdm-distill-u-"));
@@ -142,6 +143,64 @@ test("u-root: scan discovers projects from the pages index (no observations need
     const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
     assert.equal(distillCalls().length, 1);
     assert.equal((distillCalls()[0].body as { scope: string }).scope, "u-carol@test/prefs");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── write-triggered distillation (add-write-triggered-distill) ───────────────
+test("mcp write face: successful note/handoff writes notify the scheduler; failures don't", () => {
+  const data = tmpData();
+  try {
+    const store = new TokenStore(join(data, "tokens.db"), "p");
+    const minted = store.mint("person", "u/alice");
+    const scope = store.verify(minted.token)!;
+    const root = new StoreRoot(data, "u-alice");
+    const calls: Array<[string, string]> = [];
+    const tools = buildTools(scope, root, { allows: () => true }, (rk, p) => calls.push([rk, p]));
+    const call = (name: string, args: Record<string, unknown> = {}) => {
+      const out = tools.find((t) => t.name === name)!.handler(args) as { content: [{ text: string }]; isError?: boolean };
+      return { isError: out.isError === true, body: JSON.parse(out.content[0].text) };
+    };
+    const n1 = call("memory_write_page", { title: "口径", body: "表头中文" });
+    assert.equal(n1.isError, false);
+    const h1 = call("memory_handoff_begin", { summary: "交接", next_steps: ["下一步"] });
+    assert.equal(h1.isError, false);
+    // a person's shared write is refused BEFORE any write — no notify
+    const bad = call("memory_write_page", { title: "x", body: "y", target: "shared" });
+    assert.equal(bad.isError, true);
+    assert.deepEqual(calls, [["u-alice", "default"], ["u-alice", "default"]], "two successful writes notified, refused one not");
+    root.db.close();
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("u-root debounce: write-triggered distill ready in 60s, d-root keeps the 5min session debounce", async () => {
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    let t = 1_000_000;
+    const fx = fixture(data, sidecar, { ...GATES });
+    (fx.sched as unknown as { now: () => number }).now = () => t;
+    const uRoot = fx.openRoot("u-alice@test");
+    uRoot.writePage("default", "notes", "n1", { frontmatter: { type: "note", title: "t", generated: { by: "test", at: "2026-10-25T00:00:00.000Z" } }, body: "b" } as never);
+    fx.sched.notifyCapture("u-alice@test", "default", [{ event: "session-end" }]);
+    assert.equal(fx.sched.pendingCount(), 1);
+    t += 30_000; // 30s: still inside the u- 60s debounce window
+    await fx.sched.drain();
+    assert.equal(sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).length, 0, "not yet: 30s < 60s u-debounce");
+    t += 35_000; // 65s: past the u- window, but before the next drain tick matters — drain directly
+    await fx.sched.drain();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).length, 1, "distilled after the 60s u-debounce");
+    // d-root: session capture still waits the full 5min
+    const dRoot = fx.openRoot("d-pkD");
+    dRoot.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: "定位", tool: null, created_at: "2026-10-25T00:00:00.000Z", project: "agentA" });
+    fx.sched.notifyCapture("d-pkD", "agentA", [{ event: "session-end" }]);
+    t += 4 * 60_000; // 4min < 5min
+    await fx.sched.drain();
+    assert.equal(sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).filter((c) => String((c.body as { scope?: string })?.scope ?? "").startsWith("d-pkD")).length, 0, "d-root still inside its 5min debounce");
   } finally {
     rmSync(data, { recursive: true, force: true });
   }

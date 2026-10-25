@@ -519,7 +519,12 @@ export class Service {
 
     // Grants consulted per call (fresh table read): revoking a grant narrows
     // the tool face immediately, mirroring the token's own no-cache rule.
-    const tools = () => buildTools(session.scope, session.root, { allows: (ns, mode) => this.tokens.allows(session.scope.tokenId, ns, mode) });
+    const tools = () => buildTools(session.scope, session.root, { allows: (ns, mode) => this.tokens.allows(session.scope.tokenId, ns, mode) }, (rootKey, project) => {
+      // Write-triggered distillation (add-write-triggered-distill): a
+      // successful note/handoff write marks the project pending — the
+      // isDistillableRoot gate and FD_MEMORY_DISTILL_U switch apply inside.
+      this.distill.notifyCapture(rootKey, project, [{ event: "session-end" }]);
+    });
 
     if (msg.method === "tools/list") {
       res.writeHead(200, { "content-type": "application/json" });

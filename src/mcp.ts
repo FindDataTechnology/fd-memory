@@ -52,12 +52,21 @@ function err(code: string, extra: Record<string, unknown> = {}): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify({ error: code, ...extra }) }], isError: true };
 }
 
-export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): McpTool[] {
+export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, notify?: (rootKey: string, project: string) => void): McpTool[] {
   const { project: baseProject } = namespaceParts(scope.namespace);
   const isDeploy = scope.kind === "deployment" || scope.kind === "pod";
   const packNs = isDeploy ? "d/" + namespaceParts(scope.namespace).rootKey.slice(2) : null;
   const ownProject = scope.kind === "pod" ? null : baseProject;
   const auditOf = (project: string) => ({ principal: `${scope.kind}:${scope.tokenId}`, scope: nsOfProject(project) });
+  // Write-triggered distillation (add-write-triggered-distill): a successful
+  // note write or handoff begin IS a distill-raw-material event — notify the
+  // scheduler immediately instead of waiting for the fallback scan. Optional:
+  // callers that don't wire it keep the pre-existing behavior byte-identical.
+  const notifyWrite = (project: string) => {
+    try {
+      notify?.(namespaceParts(scope.namespace).rootKey, project);
+    } catch { /* never fail the write because the notify path hiccuped */ }
+  };
 
   // A project of this root as a namespace the grant table can judge.
   const nsOfProject = (project: string): string =>
@@ -138,6 +147,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): M
           files_touched: (args.files_touched as string[]) ?? [],
           ...(args.to_agent != null ? { to_agent: String(args.to_agent) } : {}),
         }, auditOf(w.project!));
+        notifyWrite(row.project);
         return text({ handoff_id: row.id, state: row.state, project: row.project, source: sourceOf(row.project) });
       },
     },
@@ -238,6 +248,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck): M
         const w = writeProject(args.target);
         if (w.error) return w.error;
         const rel = root.writePage(w.project!, "notes", randomUUID().slice(0, 8), newPage("note", String(args.title), String(args.body)), auditOf(w.project!));
+        notifyWrite(w.project!);
         return text({ path: rel, source: sourceOf(w.project!) });
       },
     },
