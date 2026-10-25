@@ -30,7 +30,6 @@ import { hybridCandidates } from "../dist/distill-scheduler.js";
 import { renderDigest } from "../dist/digest.js";
 import { validateScenes } from "../dist/continue-scenes.js";
 import { newPage } from "../dist/okf.js";
-
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
 const ARMS = ["none", "titles", "digest"];
@@ -103,6 +102,7 @@ const scenes = JSON.parse(readFileSync(scenesFile, "utf8"));
 const only = arg("only")?.split(",").map((s) => s.trim());
 let selected = only ? scenes.filter((s) => only.includes(s.id)) : scenes;
 const armFilter = arg("arm"); // e.g. "digest" — single-arm mode (grid runs): no pairing verdict
+const prepDistillOn = Boolean(process.env.EVAL_PREP_DISTILL); // old-note depth ablation (add-u-root-distillation)
 const v = validateScenes(selected);
 if (!v.ok && !arg("calib")) {
   console.error("[eval-continue] scene gate REFUSED:\n" + v.errors.map((e) => `  - ${e}`).join("\n"));
@@ -236,6 +236,63 @@ function parseJudge(text) {
   }
 }
 
+// -- old-note depth ablation (add-u-root-distillation 3.1) ---------------------
+// For scenes whose background sits in notes beyond the L1 top-3, run the REAL
+// distill path — the same sidecar contract distillOne speaks (items built
+// exactly like the scheduler's, engine candidates from hybridCandidates) —
+// over the seeded root, then render the digest arm again. The delta against
+// the plain digest arm measures what distillation unlocks.
+async function prepDistill(root, project, scene) {
+  const url = String(process.env.DISTILLER_URL ?? "").replace(/\/+$/, "");
+  if (!url) throw new Error("EVAL_PREP_DISTILL set but DISTILLER_URL absent");
+  const items = [
+    ...(scene.history.notes ?? []).map((n) => ({
+      kind: "observation", session_id: `note:${n.id}`, at: n.updated_at, event: "note-write", tool: "memory_write_page",
+      summary: `${n.title}：${String(n.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400)}`,
+      agent: "user",
+    })),
+    ...(scene.history.handoffs ?? []).filter((h) => h.state === "open").map((h) => ({ kind: "handoff", session_id: h.id, at: h.created_at, summary: `${h.summary}｜next: ${h.next_steps}`, agent: "fixture" })),
+  ];
+  if (!items.length) return 0;
+  const candidates = await hybridCandidates({ root, project, queryFor: scene.task, k: 8, embed, log: { warn: () => {} } });
+  const res = await fetch(`${url}/distill`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${process.env.DISTILLER_SHARED_TOKEN ?? ""}` },
+    body: JSON.stringify({ scope: `eval/${project}`, cursor: { obs: 0, handoff: "" }, items, candidates }),
+  });
+  if (!res.ok) throw new Error(`distill HTTP ${res.status}`);
+  const result = await res.json();
+  if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
+  const norm = (e, kind) => ({
+    id: String(e.id ?? `${kind}_${Math.random().toString(36).slice(2, 8)}`),
+    engine: String(e.engine ?? "engine:unknown"),
+    confidence: e.confidence != null ? Number(e.confidence) : undefined,
+    sources: Array.isArray(e.sources) ? e.sources : [],
+    supersedes: Array.isArray(e.supersedes) ? e.supersedes : [],
+    ...(kind === "fact"
+      ? { statement: e.statement != null ? String(e.statement) : undefined, subject: e.subject != null ? String(e.subject) : undefined, details: e.details != null ? String(e.details) : undefined }
+      : { task: e.task != null ? String(e.task) : undefined, search_keys: Array.isArray(e.search_keys) ? e.search_keys : undefined, solution: e.solution != null ? String(e.solution) : undefined, boundary_envs: e.boundary_envs != null ? String(e.boundary_envs) : undefined }),
+  });
+  const audit = { principal: "eval:prep-distill", scope: `eval/${project}` };
+  const newRels = [];
+  for (const f of result.facts ?? []) newRels.push(root.writeDistillPage(project, "fact", norm(f, "fact"), audit));
+  for (const x of result.experiences ?? []) newRels.push(root.writeDistillPage(project, "experience", norm(x, "experience"), audit));
+  if (embedLane && newRels.length) {
+    const texts = [], rels = [];
+    for (const rel of newRels) {
+      const page = root.readPageByRel(rel);
+      if (!page) continue;
+      texts.push(`${page.frontmatter?.title ?? ""} ${page.body}`.slice(0, 1500));
+      rels.push(rel);
+    }
+    if (texts.length) {
+      const r = await embedTexts(texts);
+      rels.forEach((rel, j) => { if (r.vectors[j]) root.db.setPageVector(rel, r.model, new Float32Array(r.vectors[j])); });
+    }
+  }
+  return newRels.length;
+}
+
 // -- main ------------------------------------------------------------------------
 async function main() {
   if (!process.env.MEMORY_LLM_API_KEY) { console.error("MEMORY_LLM_API_KEY absent"); process.exit(1); }
@@ -292,6 +349,46 @@ async function main() {
         perScene.push({ scene: scene.id, arm, re_derivation: score.re_derivation, first_step: score.first_step, tokens: agent.tokens + judgeTokens, digest_items: arm === "digest" ? d.nItems : undefined });
         console.log(`[eval-continue] ${scene.id}/${arm}: re=${score.re_derivation} fs=${score.first_step} (${(agent.tokens + judgeTokens).toLocaleString()} tok)`);
       }
+
+      // old-note depth arm (add-u-root-distillation 3.1): plain-digest already
+      // sampled above; re-sample after the real distill path prepared the root
+      const noteDepth = (scene.history.notes?.length ?? 0) > 3;
+      if (prepDistillOn && noteDepth && !armFilter) {
+        const wrote = await prepDistill(root, project, scene);
+        const dd = await digestBlock(root, project, scene);
+        const arm = "digest+distill";
+        const inject = dd.block;
+        let agent = await chat(agentModel, [
+          { role: "system", content: `${SYSTEM_BASE}\n\n${inject}` },
+          { role: "user", content: scene.task },
+        ], { maxTokens: 4000 });
+        if (!agent.text.trim()) {
+          agent = await chat(agentModel, [
+            { role: "system", content: `${SYSTEM_BASE}\n\n${inject}` },
+            { role: "user", content: scene.task },
+          ], { maxTokens: 8000 });
+        }
+        const judgeUser = (extra) => `${extra ? `${extra}\n\n` : ""}【任务】\n${scene.task}\n\n【期望背景集合】\n${scene.expected_background.map((e, i) => `${i + 1}. ${e}`).join("\n")}\n\n【agent 首回合响应】\n${agent.text}`;
+        let score = null, lastJudgeText = "", judgeTokens = 0;
+        for (const nudge of ["", "上一次输出不是合法 JSON。请只输出一个 JSON 对象，不要任何其他文字。", "再试一次：只输出形如 {\"re_derivation\":n,\"first_step\":n,\"evidence\":[\"…\"]} 的 JSON。"]) {
+          const judged = await chat(judgeModel, [
+            { role: "system", content: JUDGE_SYSTEM },
+            { role: "user", content: judgeUser(nudge) },
+          ], { maxTokens: 4000 });
+          lastJudgeText = judged.text;
+          judgeTokens += judged.tokens;
+          score = parseJudge(judged.text);
+          if (score) break;
+        }
+        if (!score) {
+          writeFileSync(join(runDir, `${scene.id}.distill.JUDGE-FAIL.md`), `# ${scene.id} arm=${arm}\n\n## inject\n${inject}\n\n## response\n${agent.text}\n\n## raw judge\n${lastJudgeText}\n`);
+          console.error(`[eval-continue] ${scene.id}/${arm}: judge unparseable — aborting`);
+          process.exit(1);
+        }
+        writeFileSync(join(runDir, `${scene.id}.distill.md`), `# ${scene.id} arm=${arm} (distilled ${wrote} pages)\n\n## task\n${scene.task}\n\n## inject\n${inject}\n\n## response\n${agent.text}\n\n## judge\n${JSON.stringify(score, null, 2)}\n`);
+        perScene.push({ scene: scene.id, arm, re_derivation: score.re_derivation, first_step: score.first_step, tokens: agent.tokens + judgeTokens, distilled_pages: wrote });
+        console.log(`[eval-continue] ${scene.id}/${arm}: re=${score.re_derivation} fs=${score.first_step} (+${wrote} L2) (${(agent.tokens + judgeTokens).toLocaleString()} tok)`);
+      }
       root.db.close();
     }
 
@@ -336,7 +433,18 @@ async function main() {
     const titlesAvgRe = avg(perScene.filter((r) => r.arm === "titles").map((r) => r.re_derivation));
     const gate1 = avg(diffsRe) >= 0.5 && winRateRe >= 0.7;
     const gate2 = avg(diffsFs) >= 0.5 && nonInferiorFs >= 0.7;
-    const verdict = n >= 12 ? (gate1 && gate2 ? "PASS" : "FAIL") : `INSUFFICIENT_N(${n})`;
+    // old-note depth gate (add-u-root-distillation 3.1): distilled digest must
+    // beat the plain digest on the deep scenes by ≥1 avg re_derivation
+    const ddRows = perScene.filter((r) => r.arm === "digest+distill");
+    let noteDepthGate = null, noteDepthDelta = null;
+    if (ddRows.length) {
+      const ddByScene = new Map(ddRows.map((r) => [r.scene, r]));
+      const deepPlain = perScene.filter((r) => r.arm === "digest" && r.scene.startsWith("deep-") && ddByScene.has(r.scene));
+      noteDepthDelta = avg(deepPlain.map((r) => ddByScene.get(r.scene).re_derivation - r.re_derivation));
+      noteDepthGate = deepPlain.length > 0 && noteDepthDelta >= 1;
+      console.log(`  note-depth: distilled vs plain digest over ${deepPlain.length} deep scenes: avg re delta ${noteDepthDelta.toFixed(2)} (gate ≥1.0) -> ${noteDepthGate ? "PASS" : "FAIL"}`);
+    }
+    const verdict = n >= 12 ? (gate1 && gate2 && (noteDepthGate === null || noteDepthGate) ? "PASS" : "FAIL") : `INSUFFICIENT_N(${n})`;
 
     console.log(`\n[eval-continue] paired n=${n}`);
     console.log(`  re_derivation: avg diff ${avg(diffsRe).toFixed(2)} (gate ≥0.5), win ${wins}/${n} = ${(winRateRe * 100).toFixed(0)}% (gate ≥70%) -> ${gate1 ? "PASS" : "FAIL"}`);
@@ -351,6 +459,7 @@ async function main() {
       top_k: Number(process.env.EVAL_TOP_K ?? 5), budget_tokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500),
       embed_lane: embedLane,
       thresholds: { avg_diff_min: 0.5, win_rate_min: 0.7, noninferior_min: 0.7, min_n: 12 },
+      note_depth: ddRows.length ? { scenes: ddRows.length, avg_re_delta: noteDepthDelta, gate: noteDepthGate } : undefined,
       per_scene: perScene.map(({ digest_items, ...r }) => ({ ...r, ...(digest_items != null ? { digest_items } : {}) })),
       verdict, tokens: spent,
       run_dir_local: runDir,
