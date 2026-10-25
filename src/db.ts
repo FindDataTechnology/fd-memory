@@ -95,7 +95,8 @@ export class RootDb {
       );
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
-        handoff_cursor TEXT NOT NULL DEFAULT '', updated_at TEXT,
+        handoff_cursor TEXT NOT NULL DEFAULT '', note_cursor TEXT NOT NULL DEFAULT '',
+        updated_at TEXT,
         last_error TEXT, last_tokens INTEGER NOT NULL DEFAULT 0,
         gaps INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
         pending_since INTEGER
@@ -120,6 +121,12 @@ export class RootDb {
     }
     if (!pageCols.has("supersedes")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN supersedes TEXT NOT NULL DEFAULT '[]'");
+    }
+    // u-root distillation (add-u-root-distillation): notes ride their own
+    // string cursor (updated_at), mirroring handoff_cursor.
+    const dsCols = this.columnsOf("distill_state");
+    if (!dsCols.has("note_cursor")) {
+      this.db.exec("ALTER TABLE distill_state ADD COLUMN note_cursor TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -250,12 +257,12 @@ export class RootDb {
 
   // -- distill state (add-memory-distiller) -----------------------------------
 
-  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
+  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; note_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
     return this.db.prepare("SELECT * FROM distill_state WHERE project=?").get(project) as never;
   }
 
-  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
-    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
+  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; note_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
+    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", note_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
     const next = {
       ...cur,
       ...patch,
@@ -263,12 +270,25 @@ export class RootDb {
       updated_at: new Date().toISOString(),
     };
     this.db.prepare(
-      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
-       VALUES (?,?,?,?,?,?,?,?,?)
-       ON CONFLICT(project) DO UPDATE SET obs_cursor=excluded.obs_cursor, handoff_cursor=excluded.handoff_cursor,
+      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, note_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
+       VALUES (?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(project) DO UPDATE SET obs_cursor=excluded.obs_cursor, handoff_cursor=excluded.handoff_cursor, note_cursor=excluded.note_cursor,
          updated_at=excluded.updated_at, last_error=excluded.last_error, last_tokens=excluded.last_tokens,
          gaps=excluded.gaps, next_attempt_at=excluded.next_attempt_at, pending_since=excluded.pending_since`,
-    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
+    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
+  }
+
+  // u-root distillation (add-u-root-distillation): note pages as distill
+  // inputs, cursor = updated_at ISO string (same shape as handoff_cursor);
+  // forget/excluded rows drop out of the pages index so they never re-enter.
+  notesAfter(project: string, cursor: string, limit = 120): Array<{ path: string; title: string; body: string; updated_at: string }> {
+    return this.db
+      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' AND updated_at>? ORDER BY updated_at LIMIT ?")
+      .all(project, cursor, limit) as never;
+  }
+
+  distinctProjects(): string[] {
+    return (this.db.prepare("SELECT DISTINCT project FROM pages WHERE project IS NOT NULL").all() as Array<{ project: string }>).map((r) => r.project);
   }
 
   observationsAfter(project: string, cursor: number, limit = 500): ObservationRow[] {

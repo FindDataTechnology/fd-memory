@@ -276,12 +276,27 @@ export class Service {
       const k = Math.min(8, Math.max(1, Number(url.searchParams.get("k") ?? 5) || 5));
       const budget = Math.min(2000, Math.max(64, Number(url.searchParams.get("budget") ?? 1500) || 1500));
       let modelNote: string | undefined;
+      const t0 = Date.now();
+      // Internal deadline (add-u-root-distillation D4): the caller (cell) gives
+      // the whole request ~5s; a slow sidecar embed used to eat all of it and
+      // the entire digest face timed out into the title-list rung. Bound the
+      // embed attempt so keyword recall — still a digest block, with a
+      // model_note — always wins the race inside the caller's budget.
+      const EMBED_DEADLINE_MS = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS ?? 3500);
       const embed = async (texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> => {
+        let timer: NodeJS.Timeout | undefined;
         try {
-          return await sidecarEmbed(process.env, texts);
+          return await Promise.race([
+            sidecarEmbed(process.env, texts),
+            new Promise<never>((_, rej) => {
+              timer = setTimeout(() => rej(new Error(`embed deadline ${EMBED_DEADLINE_MS}ms exceeded`)), EMBED_DEADLINE_MS);
+            }),
+          ]);
         } catch (e) {
           modelNote = `vector lane unavailable — keyword-only recall (${(e as Error)?.message ?? e})`;
           throw e; // hybridCandidates catches and falls back to keyword
+        } finally {
+          clearTimeout(timer);
         }
       };
       const candidates = await hybridCandidates({ root: dRoot, project, queryFor: q, k, embed });
@@ -339,6 +354,10 @@ export class Service {
       const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
       const rendered = (digest.match(/〔L/g) ?? []).length;
       const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
+      // served-rung line (add-u-root-distillation D4): hit-rate is observable
+      // from the logs — vector vs keyword, load, ms. rootKey stays server-side.
+      const logRoot = scope.kind === "platform" || scope.kind === "runner" ? rootKeyParam : namespaceParts(scope.namespace).rootKey;
+      console.log(`[digest] ${logRoot}:${project} rung=${modelNote ? "keyword" : "vector"} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
     }

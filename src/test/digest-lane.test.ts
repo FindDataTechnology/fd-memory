@@ -172,6 +172,85 @@ test("/digest: open-handoff pile caps at 3 so notes survive the budget (chat-lan
   }
 });
 
+// ── embed deadline (add-u-root-distillation 2.2) ────────────────────────────
+// A real local sidecar (slow / fast) stands in for the lane; the deadline
+// must turn a 6s embed into a keyword block inside the caller's budget.
+
+test("/digest: slow embed degrades at the internal deadline — keyword block inside budget with model_note", async () => {
+  const lane = createServer((req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ vectors: [[0.1, 0.2]], model: "slow", tokens: 1 }));
+    }, 6000);
+  });
+  await new Promise<void>((r) => lane.listen(0, "127.0.0.1", () => r()));
+  const lanePort = (lane.address() as { port: number }).port;
+  const prevUrl = process.env.FD_MEMORY_DISTILLER_URL;
+  const prevTok = process.env.DISTILLER_SHARED_TOKEN;
+  const prevDl = process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS;
+  process.env.FD_MEMORY_DISTILLER_URL = `http://127.0.0.1:${lanePort}`;
+  process.env.DISTILLER_SHARED_TOKEN = "t";
+  process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS = "200";
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const t0 = Date.now();
+    const r = await fetch(base + "/digest?project=default&q=x", { headers: { authorization: `Bearer ${person}` } });
+    const ms = Date.now() - t0;
+    const d = (await r.json()) as { digest: string; model_note?: string };
+    assert.equal(r.status, 200);
+    assert.ok(ms < 4000, `returned in ${ms}ms, well under the caller's 5s budget`);
+    assert.match(d.model_note ?? "", /deadline/, "model_note names the deadline degradation");
+    assert.ok(d.digest.length > 0, "a keyword-rendered block still came back");
+  } finally {
+    if (prevUrl === undefined) delete process.env.FD_MEMORY_DISTILLER_URL; else process.env.FD_MEMORY_DISTILLER_URL = prevUrl;
+    if (prevTok === undefined) delete process.env.DISTILLER_SHARED_TOKEN; else process.env.DISTILLER_SHARED_TOKEN = prevTok;
+    if (prevDl === undefined) delete process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS; else process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS = prevDl;
+    await new Promise<void>((r) => server.close(() => r()));
+    lane.close();
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("/digest: fast embed keeps the vector rung (no model_note)", async () => {
+  const lane = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const n = (JSON.parse(body || "{}").texts ?? [""]).length;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ vectors: Array.from({ length: n }, () => [0.3, 0.4]), model: "fast", tokens: n }));
+    });
+  });
+  await new Promise<void>((r) => lane.listen(0, "127.0.0.1", () => r()));
+  const lanePort = (lane.address() as { port: number }).port;
+  const prevUrl = process.env.FD_MEMORY_DISTILLER_URL;
+  const prevTok = process.env.DISTILLER_SHARED_TOKEN;
+  process.env.FD_MEMORY_DISTILLER_URL = `http://127.0.0.1:${lanePort}`;
+  process.env.DISTILLER_SHARED_TOKEN = "t";
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const root = svc.rootForKey("u-alice");
+    root.writeDistillPage("default", "experience", { id: "exp_v1", engine: "e", confidence: 0.9, task: "巡检流程", search_keys: ["巡检"], solution: "先读摘要再分派", sources: [], supersedes: [] });
+    const r = await fetch(base + "/digest?project=default&q=巡检", { headers: { authorization: `Bearer ${person}` } });
+    const d = (await r.json()) as { digest: string; model_note?: string; items: number };
+    assert.equal(r.status, 200);
+    assert.equal(d.model_note, undefined, "vector rung served, no degradation note");
+    assert.ok(d.digest.includes("巡检流程"));
+  } finally {
+    if (prevUrl === undefined) delete process.env.FD_MEMORY_DISTILLER_URL; else process.env.FD_MEMORY_DISTILLER_URL = prevUrl;
+    if (prevTok === undefined) delete process.env.DISTILLER_SHARED_TOKEN; else process.env.DISTILLER_SHARED_TOKEN = prevTok;
+    await new Promise<void>((r) => server.close(() => r()));
+    lane.close();
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("/digest L1: a forgotten note never re-enters the block", async () => {
   const data = tmpData();
   const svc = new Service({ dataDir: data, port: 0, pepper: "p" });

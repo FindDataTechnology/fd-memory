@@ -48,6 +48,16 @@ const FALLBACK_BUDGET_RESERVE = 100_000;
 const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
+// Root-family gate (add-u-root-distillation D1): pack roots always distill;
+// person roots distill unless the deployment opts out. FD_MEMORY_DISTILL_U=0
+// is the kill switch — no pending marks, no fallback scan, byte-identical to
+// the pre-enablement behavior.
+function isDistillableRoot(rootKey: string, env: NodeJS.ProcessEnv | undefined): boolean {
+  if (rootKey.startsWith("d-")) return true;
+  if (rootKey.startsWith("u-")) return env?.FD_MEMORY_DISTILL_U !== "0";
+  return false;
+}
+
 export class DistillScheduler {
   private pending = new Map<string, { rootKey: string; project: string; since: number }>();
   private inflight = new Set<string>();
@@ -85,7 +95,7 @@ export class DistillScheduler {
   // pending. Projects are d/-member or shared projects only (design D1).
   notifyCapture(rootKey: string, project: string, events: Array<{ event?: string }>): void {
     if (!this.enabled()) return;
-    if (!rootKey.startsWith("d-")) return;
+    if (!isDistillableRoot(rootKey, this.opts.env)) return;
     const boundary = events.some((e) => e?.event === "session-end" || e?.event === "stop");
     if (!boundary) return;
     const key = DistillScheduler.key(rootKey, project);
@@ -139,12 +149,16 @@ export class DistillScheduler {
     if (this.now() - this.lastFallback < FALLBACK_INTERVAL_MS) return;
     this.lastFallback = this.now();
     for (const [rootKey, root] of this.opts.roots) {
-      if (!rootKey.startsWith("d-")) continue;
+      if (!isDistillableRoot(rootKey, this.opts.env)) continue;
       const day = new Date().toISOString().slice(0, 10);
       const remaining = this.dailyLimit() - this.opts.tokens.distillBudgetUsed(rootKey, day).tokens;
       if (remaining < FALLBACK_BUDGET_RESERVE) continue; // active projects first
       const projects = new Set<string>();
+      // Pack roots discover work via capture observations; person roots
+      // (add-u-root-distillation D3) have none — the pages index is their
+      // project discovery surface.
       for (const row of root.db.recentObservations(2000) as unknown as Array<{ project: string }>) projects.add(row.project);
+      if (rootKey.startsWith("u-")) for (const p of root.db.distinctProjects()) projects.add(p);
       for (const project of projects) {
         const state = root.db.getDistillState(project);
         const lag = root.db.maxObservationRowid(project) - (state?.obs_cursor ?? 0);
@@ -171,7 +185,15 @@ export class DistillScheduler {
           .db.prepare("SELECT * FROM handoffs WHERE project=? AND created_at>? ORDER BY created_at LIMIT ?")
           .all(project, state?.handoff_cursor ?? "", MAX_ITEMS) as unknown as HandoffRow[];
       } catch { /* handoff cursor best-effort */ }
-      if (obs.length === 0 && handoffs.length === 0) return;
+      // Person-root raw material (add-u-root-distillation D2): note pages are
+      // what chat MCP writes actually produce; observations never exist there.
+      // Synthesized as observation-shaped items — a note IS a captured event
+      // of the user asking to remember — so the sidecar contract is untouched.
+      let notes: Array<{ path: string; title: string; body: string; updated_at: string }> = [];
+      try {
+        notes = root.db.notesAfter(project, state?.note_cursor ?? "", MAX_ITEMS);
+      } catch { /* note cursor best-effort (pre-migration dbs) */ }
+      if (obs.length === 0 && handoffs.length === 0 && notes.length === 0) return;
 
       // budget guardrail (per root = per owner at v1; see auth.ts)
       const day = new Date().toISOString().slice(0, 10);
@@ -185,6 +207,11 @@ export class DistillScheduler {
       const items: DistillItem[] = [
         ...obs.map((o) => ({ kind: "observation" as const, session_id: o.session_id, at: o.created_at, event: o.event, tool: o.tool, summary: o.summary, agent: o.agent })),
         ...handoffs.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${h.summary}｜next: ${h.next_steps}` , agent: h.from_agent })),
+        ...notes.map((n) => ({
+          kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "note-write", tool: "memory_write_page",
+          summary: `${n.title}：${String(n.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400)}`,
+          agent: "user",
+        })),
       ].sort((a, b) => (a.at < b.at ? -1 : 1));
 
       const queryFor = obs.slice(-40).map((o) => o.summary).join(" ");
@@ -225,9 +252,13 @@ export class DistillScheduler {
       }
       const maxRid = obs.length ? Math.max(...obs.map((o) => o.rid)) : (state?.obs_cursor ?? 0);
       const maxHandoff = handoffs.length ? handoffs[handoffs.length - 1].created_at : (state?.handoff_cursor ?? "");
+      // note cursor is scheduler-local (the engine knows nothing of notes):
+      // last note's updated_at, monotonic like handoff_cursor
+      const maxNote = notes.length ? notes[notes.length - 1].updated_at : (state?.note_cursor ?? "");
       root.db.upsertDistillState(project, {
         obs_cursor: Math.max(state?.obs_cursor ?? 0, result.cursor_next?.obs ?? maxRid),
         handoff_cursor: (result.cursor_next?.handoff ?? maxHandoff) > (state?.handoff_cursor ?? "") ? String(result.cursor_next?.handoff ?? maxHandoff) : maxHandoff,
+        note_cursor: maxNote > (state?.note_cursor ?? "") ? maxNote : (state?.note_cursor ?? ""),
         last_error: null,
         last_tokens: result.tokens ?? 0,
         next_attempt_at: 0,

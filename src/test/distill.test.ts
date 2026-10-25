@@ -246,10 +246,14 @@ test("scheduler: gates — no URL or not enabled means notify/drain are inert", 
       assert.equal(sidecar.calls.length, 0);
       fx.sched.stop();
     }
-    // u/ roots are never distilled at v1 even with gates on
+    // u/ roots enter via notifyCapture since add-u-root-distillation — and
+    // stay out under the FD_MEMORY_DISTILL_U=0 kill switch
     const fx = schedulerFixture(data, sidecar, { ...GATES });
     fx.sched.notifyCapture("u-alice", "cell", [{ event: "session-end" }]);
-    assert.equal(fx.sched.pendingCount(), 0);
+    assert.equal(fx.sched.pendingCount(), 1);
+    const fxOff = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_U: "0" });
+    fxOff.sched.notifyCapture("u-alice", "cell", [{ event: "session-end" }]);
+    assert.equal(fxOff.sched.pendingCount(), 0);
   } finally {
     rmSync(data, { recursive: true, force: true });
   }
