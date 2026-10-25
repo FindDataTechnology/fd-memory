@@ -151,8 +151,13 @@ function loadScene(scene, dataDir) {
   }
   // L1 notes (add-chat-memory-injection): seeded exactly as the chat lane's
   // MCP write-back produces them — note pages under the project's notes/.
+  // Recency backfill: indexPage stamps updated_at at load time (all notes in
+  // one burst = same ms), which makes the digest L1 "recent 3" cut arbitrary
+  // and the old-note ablation meaningless — restore the fixture's timestamps.
   for (const n of scene.history.notes ?? []) {
-    root.writePage(project, "notes", n.id, newPage("note", n.title, n.body), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
+    const rel = root.writePage(project, "notes", n.id, newPage("note", n.title, n.body), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
+    root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(n.updated_at, rel);
+    root.db.db.prepare("UPDATE pages_fts SET updated_at=? WHERE path=?").run(n.updated_at, rel);
   }
   return { root, project };
 }
@@ -247,7 +252,7 @@ async function prepDistill(root, project, scene) {
   if (!url) throw new Error("EVAL_PREP_DISTILL set but DISTILLER_URL absent");
   const items = [
     ...(scene.history.notes ?? []).map((n) => ({
-      kind: "observation", session_id: `note:${n.id}`, at: n.updated_at, event: "note-write", tool: "memory_write_page",
+      kind: "observation", session_id: `note:${n.id}`, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page",
       summary: `${n.title}：${String(n.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400)}`,
       agent: "user",
     })),

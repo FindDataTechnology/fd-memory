@@ -230,7 +230,9 @@ export class DistillScheduler {
         // truncated JSON is swallowed into an EMPTY result (no error, 0 pages)
         // — 4 real patrol handoffs → completion_tokens 6000 → silent zero. 2
         // items per call with 800-char summaries stay under the ceiling (4.4k
-        // completion). Handoffs and notes are chunked per-stream so cursors
+        // completion). Note items ride event "user-prompt-submit": the engine
+        // silently DROPS unknown events (probe: "note-write" batches → 0 LLM
+        // calls, no error). Handoffs and notes are chunked per-stream so cursors
         // advance cleanly; the daily budget is billed once for the whole run.
         const CHUNK = 2;
         const CAP = 800;
@@ -279,7 +281,7 @@ export class DistillScheduler {
         }
         for (let i = 0; i < notes.length; i += CHUNK) {
           const batch = notes.slice(i, i + CHUNK);
-          wrote += await callEngine(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "note-write", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
+          wrote += await callEngine(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
           root.db.upsertDistillState(project, { note_cursor: batch[batch.length - 1].updated_at, last_tokens: spentTotal });
         }
         this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, wrote);
@@ -291,7 +293,7 @@ export class DistillScheduler {
         ...obs.map((o) => ({ kind: "observation" as const, session_id: o.session_id, at: o.created_at, event: o.event, tool: o.tool, summary: o.summary, agent: o.agent })),
         ...handoffs.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${h.summary}｜next: ${h.next_steps}` , agent: h.from_agent })),
         ...notes.map((n) => ({
-          kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "note-write", tool: "memory_write_page",
+          kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page",
           summary: `${n.title}：${String(n.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400)}`,
           agent: "user",
         })),
