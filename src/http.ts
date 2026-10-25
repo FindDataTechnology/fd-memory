@@ -319,7 +319,11 @@ export class Service {
           id: c.id, layer: "L2", kind: c.kind, title: c.task,
           // page bodies carry "## Task/## Solution" section headers — strip
           // for the excerpt (producer-side hygiene, same as the eval)
-          excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+          // L2 gist (2026-10-26 benchmark): 400-char excerpts made ~350-token
+          // lines — three retrieval hits consumed most of the budget and
+          // crowded notes out. Titles+short gist carry the signal (the titles
+          // arm won on titles alone); 150 keeps ~8-10 lines per block.
+          excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 150),
           confidence, updated_at,
         };
       });

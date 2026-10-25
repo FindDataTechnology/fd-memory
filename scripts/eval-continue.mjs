@@ -195,7 +195,7 @@ async function digestBlock(root, project, scene) {
         id: c.id, layer: "L2", kind: c.kind, title: c.task,
         // page bodies carry "## Task/## Solution" section headers — strip for
         // the excerpt (render stays pure; this is producer-side hygiene)
-        excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+        excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 150),
         confidence: meta?.confidence ?? null, updated_at: meta?.updated_at ?? null,
       };
     });
