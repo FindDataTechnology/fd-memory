@@ -214,7 +214,9 @@ async function digestBlock(root, project, scene) {
     };
   });
   const allItems = [...items, ...noteItems];
-  const handoffs = scene.history.handoffs.filter((h) => h.state === "open")
+  // mirror the production /digest assembly (open-handoffs cap at 3,
+  // digest-lane starvation fix) so eval conclusions extrapolate
+  const handoffs = scene.history.handoffs.filter((h) => h.state === "open").slice(0, 3)
     .map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
   const block = renderDigest({ items: allItems, handoffs, budgetTokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500), now: new Date().toISOString() });
   return { block, nItems: allItems.length };

@@ -81,7 +81,12 @@ export function renderDigest(opts: {
     used += estimateTokens(sectionTitle);
     for (const h of handoffs) {
       const line = handoffLine(h);
-      used += estimateTokens(line);
+      const cost = estimateTokens(line);
+      // Handoffs are notifications, not privileged spend: they obey the same
+      // budget as memory items (production probe 2026-10-25 — a pile of
+      // round-report handoffs drowned the whole block and misled the agent).
+      if (used + cost > budget) break;
+      used += cost;
       lines.push(line);
     }
   }
