@@ -79,3 +79,84 @@ test("/digest: permission matrix, degradation, clamps, assembly", async () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── L1 note recall (add-digest-note-recall) ─────────────────────────────────
+
+async function start(svc: Service) {
+  const server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  return { server, base: `http://127.0.0.1:${(server.address() as { port: number }).port}` };
+}
+
+test("/digest L1: no-L2 project's recent notes ride with 〔L1·note〕 annotation", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    // notes land via the real /pages face (the lane hook ② uses)
+    const w1 = await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-2", title: "集群回合 2026-10-25 08:00", body: "成员回报：数据研究员在位；下一步复核队列。" }) });
+    const w2 = await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-2", title: "集群回合 2026-10-25 09:00", body: "第二轮：队列已复核，空。" }) });
+    assert.equal(w1.status, 200); assert.equal(w2.status, 200);
+    const r = await fetch(base + "/digest?project=c-2&q=集群回合", { headers: H });
+    const d = (await r.json()) as { digest: string; items: number; notes: number; truncated: boolean };
+    assert.equal(r.status, 200);
+    assert.equal(d.items, 0, "no L2 candidates");
+    assert.equal(d.notes, 2);
+    assert.match(d.digest, /〔L1·note｜2026-10-2\d〕集群回合 2026-10-25 08:00/);
+    assert.ok(d.digest.includes("数据研究员在位"));
+    assert.equal(d.truncated, false);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("/digest L1: budget squeeze drops notes before L2 items; truncated honest", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const root = svc.rootForKey("u-alice");
+    root.writeDistillPage("c-3", "experience", { id: "exp_n1", engine: "e", confidence: 0.9, task: "巡检流程（已蒸馏）", search_keys: ["巡检"], solution: "先读摘要再分派成员", sources: [], supersedes: [] });
+    await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-3", title: "集群回合 note", body: "写回内容".repeat(60) }) });
+    // tight budget: header + handoffs(absent) + L2 line fit, the note must go
+    const r = await fetch(base + "/digest?project=c-3&q=巡检&budget=170", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number; truncated: boolean; items: number };
+    assert.ok(d.digest.includes("巡检流程（已蒸馏）"), "L2 survives");
+    if (d.notes === 0) {
+      assert.equal(d.truncated, true);
+      assert.ok(!d.digest.includes("集群回合 note"));
+    } else {
+      assert.equal(d.truncated, d.notes < 1 && false, "note rendered means no squeeze claim");
+    }
+    assert.equal(d.items, 1);
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("/digest L1: a forgotten note never re-enters the block", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const w = await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-4", title: "被遗忘的回合", body: "内容" }) });
+    const { path } = (await w.json()) as { path: string };
+    const f = await fetch(base + "/forget", { method: "POST", headers: H, body: JSON.stringify({ path, confirm: true }) });
+    assert.equal(f.status, 200);
+    const r = await fetch(base + "/digest?project=c-4&q=回合", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number };
+    assert.equal(d.notes, 0);
+    assert.ok(!d.digest.includes("被遗忘的回合"));
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

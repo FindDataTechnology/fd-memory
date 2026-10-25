@@ -308,11 +308,33 @@ export class Service {
           confidence, updated_at,
         };
       });
+      // Recent notes ride as L1 items AFTER the L2 candidates (add-digest-
+      // note-recall): the cluster-turn write-back is a note, and without this
+      // rung every turn's digest had no reader of the previous turn's
+      // write-back — the loop was open (production counter-evidence §15.31
+      // 补记三: turn 2 got a byte-identical empty digest with turn 1's note on
+      // disk). Renderer budget discipline carries the ordering: handoffs
+      // section first, then array order (L2 before notes), tail truncated.
+      const NOTES_LIMIT = 3;
+      const recentNotes = dRoot.db
+        .recentPages(20, [project])
+        .filter((p) => p.type === "note")
+        .slice(0, NOTES_LIMIT);
+      const noteItems: DigestItem[] = recentNotes.map((p) => {
+        const page = dRoot.readPageByRel(p.path);
+        return {
+          id: p.path, layer: "L1" as const, kind: "note", title: p.title,
+          excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 400),
+          confidence: null, updated_at: p.updated_at,
+        };
+      });
       const handoffs = dRoot.db.openHandoffs([project]).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
-      const digest = renderDigest({ items, handoffs, budgetTokens: budget, now: new Date().toISOString() });
+      const allItems = [...items, ...noteItems];
+      const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
       const rendered = (digest.match(/〔L/g) ?? []).length;
+      const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ project, digest, items: items.length, truncated: rendered < items.length, ...(modelNote ? { model_note: modelNote } : {}) }));
+      return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
     }
 
     // ── /memory + /forget (add-memory-distiller, memory-visibility): the
