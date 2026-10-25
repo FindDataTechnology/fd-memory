@@ -70,8 +70,10 @@ async function chat(model, messages, { maxTokens = 1600, temperature = 0 } = {})
       spent += used;
       return { text: doc.choices?.[0]?.message?.content ?? "", tokens: used };
     } catch (e) {
+      // network-layer failures (fetch failed / ECONNRESET) retry like 5xx —
+      // a lane blip must not kill a 45-scene run either
       lastErr = e;
-      if (attempt === 2) throw e;
+      if (attempt >= 4) throw e;
     }
   }
   throw lastErr ?? new Error("chat failed");
@@ -254,10 +256,19 @@ async function main() {
       for (const arm of armFilter ? [armFilter] : ARMS) {
         const inject = blocks[arm];
         const system = inject ? `${SYSTEM_BASE}\n\n${inject}` : SYSTEM_BASE;
-        const agent = await chat(agentModel, [
+        // Reasoning lane: a tight budget burns out in reasoning with an EMPTY
+        // content (31% of arms on run 3) — start higher and retry an empty
+        // response once with an even larger budget before sampling it.
+        let agent = await chat(agentModel, [
           { role: "system", content: system },
           { role: "user", content: scene.task },
-        ]);
+        ], { maxTokens: 4000 });
+        if (!agent.text.trim()) {
+          agent = await chat(agentModel, [
+            { role: "system", content: system },
+            { role: "user", content: scene.task },
+          ], { maxTokens: 8000 });
+        }
         const judgeUser = (extra) => `${extra ? `${extra}\n\n` : ""}【任务】\n${scene.task}\n\n【期望背景集合】\n${scene.expected_background.map((e, i) => `${i + 1}. ${e}`).join("\n")}\n\n【agent 首回合响应】\n${agent.text}`;
         let score = null;
         let lastJudgeText = "";
@@ -266,7 +277,7 @@ async function main() {
           const judged = await chat(judgeModel, [
             { role: "system", content: JUDGE_SYSTEM },
             { role: "user", content: judgeUser(nudge) },
-          ], { maxTokens: 2400 });
+          ], { maxTokens: 4000 });
           lastJudgeText = judged.text;
           judgeTokens += judged.tokens;
           score = parseJudge(judged.text);
