@@ -100,3 +100,21 @@ test("note share: recent notes keep a floor when L2 candidates fill the budget; 
   assert.ok(notesOnly.includes("周报口径"));
   assert.ok(notesOnly.includes("akshare"), "notes-only block renders the full note line");
 });
+
+test("itemLine: distiller task≈solution duplication collapses to one statement; title capped at 90", () => {
+  const narrative = "用户要求按角色职责执行本轮节奏工作，随后连续多轮要求输出 ≤512 字「明日纪要」，全部以 digest turn error 结束、未产出。";
+  const dup: DigestItem = {
+    id: "e1", layer: "L2", kind: "fact", title: narrative + "assistant 在镜像上跑了基线：",
+    excerpt: narrative + "assistant 在镜像上跑了基线：189 套件 158 pass。",
+    confidence: 0.8, updated_at: "2026-10-25T00:00:00.000Z",
+  };
+  const out = renderDigest({ items: [dup], handoffs: [], budgetTokens: 1500, now: NOW });
+  const line = out.split("\n").find((l) => l.startsWith("- 〔L2"))!;
+  assert.equal((line.match(/明日纪要/g) ?? []).length, 1, "narrative appears once, not echoed");
+  assert.ok(line.includes("189 套件 158 pass"), "the non-duplicated tail survives");
+  const longTitle: DigestItem = { ...dup, title: "长".repeat(200), excerpt: "不同内容的摘录" };
+  const out2 = renderDigest({ items: [longTitle], handoffs: [], budgetTokens: 1500, now: NOW });
+  const line2 = out2.split("\n").find((l) => l.startsWith("- 〔L2"))!;
+  assert.ok(line2.includes("…"), "over-90 title capped with ellipsis");
+  assert.ok(line2.includes("不同内容的摘录"), "distinct excerpt kept");
+});

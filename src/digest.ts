@@ -52,8 +52,20 @@ function alive(item: DigestItem, now: string): boolean {
 function itemLine(item: DigestItem): string {
   const conf = item.confidence != null ? `｜置信 ${Number(item.confidence).toFixed(2)}` : "";
   const date = item.updated_at ? `｜${String(item.updated_at).slice(0, 10)}` : "";
-  const excerpt = String(item.excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, 400);
-  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${item.title}${excerpt ? `：${excerpt}` : ""}`;
+  const title = String(item.title ?? "").replace(/\s+/g, " ").trim();
+  // Title cap (run12 transcript): distiller L2 rows carry task ≈ the whole
+  // narrative — an unbounded title + its excerpt echo read everything twice
+  // and drowned the signal the titles arm wins with (crisp one-liners).
+  const shownTitle = title.length > 90 ? `${title.slice(0, 90)}…` : title;
+  let excerpt = String(item.excerpt ?? "").replace(/\s+/g, " ").trim().slice(0, 400);
+  // Strip the shared prefix so the line never says the same thing twice.
+  if (excerpt && title) {
+    const max = Math.min(title.length, excerpt.length);
+    let common = 0;
+    while (common < max && title[common] === excerpt[common]) common += 1;
+    if (common >= 40) excerpt = excerpt.slice(common).trimStart();
+  }
+  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${shownTitle}${excerpt ? `：${excerpt}` : ""}`;
 }
 
 // Notification semantics (constructed-benchmark finding, 2026-10-25): a
@@ -81,23 +93,6 @@ export function renderDigest(opts: {
   const header = `## 记忆摘要 / Memory digest（fd-memory，截至 ${now.slice(0, 10)}）`;
   const lines: string[] = [header];
   let used = estimateTokens(header);
-
-  const handoffs = opts.handoffs ?? [];
-  if (handoffs.length > 0) {
-    const sectionTitle = "### 待认领交接 / Open handoffs";
-    lines.push("", sectionTitle);
-    used += estimateTokens(sectionTitle);
-    for (const h of handoffs) {
-      const line = handoffLine(h);
-      const cost = estimateTokens(line);
-      // Handoffs are notifications, not privileged spend: they obey the same
-      // budget as memory items (production probe 2026-10-25 — a pile of
-      // round-report handoffs drowned the whole block and misled the agent).
-      if (used + cost > budget) break;
-      used += cost;
-      lines.push(line);
-    }
-  }
 
   const items = opts.items.filter((i) => alive(i, now));
   if (items.length > 0) {
@@ -145,6 +140,23 @@ export function renderDigest(opts: {
     };
     used += pushItems(rest, cap);
     used += pushItems(l1, budget);
+  }
+
+  const handoffs = opts.handoffs ?? [];
+  if (handoffs.length > 0) {
+    const sectionTitle = "### 待认领交接 / Open handoffs";
+    lines.push("", sectionTitle);
+    used += estimateTokens(sectionTitle);
+    for (const h of handoffs) {
+      const line = handoffLine(h);
+      const cost = estimateTokens(line);
+      // Handoffs are notifications, not privileged spend: they obey the same
+      // budget as memory items (production probe 2026-10-25 — a pile of
+      // round-report handoffs drowned the whole block and misled the agent).
+      if (used + cost > budget) break;
+      used += cost;
+      lines.push(line);
+    }
   }
 
   lines.push("", "（fd-memory 生成；认领交接用 memory_handoff_accept，本摘要不自动消费。）");

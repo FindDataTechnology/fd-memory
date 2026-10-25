@@ -320,3 +320,25 @@ test("/digest L1: note recall is window-independent — fresh L2 churn above old
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest: handoffs past the 48h recency gate leave the block (stale-claim pull regression)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const root = svc.rootForKey("u-alice");
+    const old = new Date(Date.now() - 72 * 3600_000).toISOString(); // 3 days old
+    const fresh = new Date(Date.now() - 2 * 3600_000).toISOString(); // 2 hours old
+    root.db.upsertHandoff({ id: "stale1", project: "c-age", from_agent: "m", summary: "三天前的轮报交接", open_questions: "[]", next_steps: "[]", files_touched: "[]", to_agent: null, state: "open", accepted_by: null, accepted_at: null, created_at: old });
+    root.db.upsertHandoff({ id: "fresh1", project: "c-age", from_agent: "m", summary: "两小时前的交接", open_questions: "[]", next_steps: "[]", files_touched: "[]", to_agent: null, state: "open", accepted_by: null, accepted_at: null, created_at: fresh });
+    const r = await fetch(base + "/digest?project=c-age&q=x&budget=1500", { headers: H });
+    const d = (await r.json()) as { digest: string };
+    assert.ok(d.digest.includes("fresh1"), "fresh handoff rides");
+    assert.ok(!d.digest.includes("stale1"), "3-day-old open handoff is drifted state, not a notification");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

@@ -354,7 +354,14 @@ export class Service {
       // segment to zero — the chat lane's core recall — while cluster roots
       // never noticed (they carry 0-2 handoffs). Cap the sample at 3; the
       // renderer's ordering is untouched.
-      const handoffs = dRoot.db.openHandoffs([project]).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
+      // Recency gate (run12 micro-A/B, 2026-10-26): "待认领" means actionable
+      // NOW. Week-old open handoffs (drifted state — the round that created
+      // them already moved on) led every digest turn and pulled the agent into
+      // claiming stale work over the current task. Created within the max-age
+      // window only; older ones stay queryable via /pages and the MCP face.
+      const HANDOFF_MAX_AGE_MS = Number(process.env.FD_MEMORY_DIGEST_HANDOFF_MAX_AGE_H ?? 48) * 3600_000;
+      const freshEnough = (iso: string) => Date.now() - Date.parse(iso) < HANDOFF_MAX_AGE_MS;
+      const handoffs = dRoot.db.openHandoffs([project]).filter((h) => freshEnough(h.created_at)).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
       const allItems = [...items, ...noteItems];
       const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
       const rendered = (digest.match(/〔L/g) ?? []).length;
