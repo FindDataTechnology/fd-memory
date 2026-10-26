@@ -71,12 +71,22 @@ export function distillCandidates(root: StoreRoot, projects: string[], queryFor:
     .split(/[^\p{L}\p{N}_-]+/u)
     .filter((t) => t.length >= 2);
   if (terms.length === 0) return active.slice(0, k);
+  // Field-weighted overlap (2026-10-26 precision probe): a flat haystack let
+  // pages whose BODY merely mentions the topic tie with pages whose TITLE is
+  // the topic — "记忆 作用域" surfaced fleet patrol pages that mention memory in
+  // passing. Title hits weigh 3, search_keys 2, body 1.
   const scored = active.map((c) => {
-    const hay = `${c.task} ${c.search_keys.join(" ")} ${c.solution}`.toLowerCase();
+    const title = String(c.task ?? "").toLowerCase();
+    const keys = c.search_keys.join(" ").toLowerCase();
+    const body = String(c.solution ?? "").toLowerCase();
     let score = 0;
-    for (const t of terms) if (hay.includes(t)) score++;
+    for (const t of terms) {
+      if (title.includes(t)) score += 3;
+      else if (keys.includes(t)) score += 2;
+      else if (body.includes(t)) score += 1;
+    }
     return { c, score };
   });
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, k).map((x) => x.c);
+  return scored.filter((x) => x.score > 0).slice(0, k).map((x) => x.c);
 }

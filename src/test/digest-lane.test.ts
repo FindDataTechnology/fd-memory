@@ -376,6 +376,7 @@ test("/digest L1: query-matched notes ride first regardless of recency slot; emp
 });
 
 test("/digest: vector lane reaches pages the keyword path misses (recall-cap regression)", async () => {
+  __resetEmbedGate();
   const data = tmpData();
   const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
   const { server, base } = await start(svc);

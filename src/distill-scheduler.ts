@@ -459,7 +459,7 @@ export async function hybridCandidates(opts: {
     return merged.slice(0, k);
   } catch (e) {
     log?.warn(`[hybrid] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
-    return keyword;
+    return keyword.slice(0, k); // the fallback must honour k like the success path
   }
 }
 

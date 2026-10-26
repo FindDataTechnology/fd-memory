@@ -350,11 +350,12 @@ export class RootDb {
   // unreachable no matter how close its embedding. Scan every vector of the
   // query's model instead (page count is small: tens to low hundreds).
   allPageVectors(model: string): Array<{ page_rel: string; vector: Float32Array }> {
-    const rows = this.db.prepare("SELECT page_rel, vector, dim FROM page_vectors WHERE model=?").all(model) as Array<{ page_rel: string; vector: Buffer; dim: number }>;
+    const rows = this.db.prepare("SELECT page_rel, vector, dim FROM page_vectors WHERE model=?").all(model) as Array<{ page_rel: string; vector: Uint8Array; dim: number }>;
     return rows.map((r) => {
-      const buf = r.vector;
+      // node:sqlite yields Uint8Array (not Buffer) — view it, don't method-call it
+      const view = new DataView(r.vector.buffer, r.vector.byteOffset, r.vector.byteLength);
       const out = new Float32Array(r.dim);
-      for (let i = 0; i < r.dim; i++) out[i] = buf.readFloatLE(i * 4);
+      for (let i = 0; i < r.dim; i++) out[i] = view.getFloat32(i * 4, true);
       return { page_rel: r.page_rel, vector: out };
     });
   }
