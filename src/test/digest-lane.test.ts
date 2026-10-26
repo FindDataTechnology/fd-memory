@@ -420,3 +420,46 @@ test("/digest: vector lane reaches pages the keyword path misses (recall-cap reg
     __resetEmbedGate();
   }
 });
+
+test("/digest: the vector lane respects supersede — retired pages do not resurrect via full scan", async () => {
+  __resetEmbedGate();
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const root = svc.rootForKey("u-alice");
+    const oldPage = root.writeDistillPage("c-sup", "fact", { id: "fact_old", engine: "e", statement: "部署目标 cheap-4", subject: "部署", details: "v1", sources: [], supersedes: [] });
+    const newPage = root.writeDistillPage("c-sup", "fact", { id: "fact_new", engine: "e", statement: "部署目标 cheap-8（更正）", subject: "部署", details: "v2", sources: [], supersedes: ["fact_old"] });
+    const vec = new Float32Array(4); vec[0] = 1;
+    root.db.setPageVector(oldPage, "vm", vec);
+    root.db.setPageVector(newPage, "vm", vec);
+    const lane = createServer((req, res) => {
+      let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+        const n = (JSON.parse(b || "{}").texts ?? [""]).length;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ vectors: Array.from({ length: n }, () => [1, 0, 0, 0]), model: "vm", tokens: n }));
+      });
+    });
+    await new Promise<void>((r) => lane.listen(0, "127.0.0.1", () => r()));
+    const prevUrl = process.env.FD_MEMORY_DISTILLER_URL; const prevTok = process.env.DISTILLER_SHARED_TOKEN;
+    process.env.FD_MEMORY_DISTILLER_URL = `http://127.0.0.1:${(lane.address() as { port: number }).port}`;
+    process.env.DISTILLER_SHARED_TOKEN = "t";
+    try {
+      const r = await fetch(base + "/digest?project=c-sup&q=部署&budget=1500", { headers: { authorization: `Bearer ${person}` } });
+      const d = (await r.json()) as { digest: string; model_note?: string };
+      assert.equal(d.model_note, undefined, "vector rung served");
+      assert.ok(d.digest.includes("cheap-8"), "successor rides");
+      assert.ok(!d.digest.includes("cheap-4"), "superseded page stays retired even in the full scan");
+    } finally {
+      if (prevUrl === undefined) delete process.env.FD_MEMORY_DISTILLER_URL; else process.env.FD_MEMORY_DISTILLER_URL = prevUrl;
+      if (prevTok === undefined) delete process.env.DISTILLER_SHARED_TOKEN; else process.env.DISTILLER_SHARED_TOKEN = prevTok;
+      __resetEmbedGate();
+      await new Promise<void>((r) => server.close(() => r()));
+      lane.close();
+      rmSync(data, { recursive: true, force: true });
+    }
+  } finally {
+    __resetEmbedGate();
+  }
+});

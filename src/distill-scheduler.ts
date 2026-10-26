@@ -443,9 +443,12 @@ export async function hybridCandidates(opts: {
       }
     }
     const scored: Array<DistillCandidate & { score: number }> = [];
+    const superseded = root.db.supersededIds();
     for (const v of root.db.allPageVectors(q.model)) {
       if (v.vector.length !== qv.length) continue;
       const rel = v.page_rel;
+      const baseId = rel.split("/").pop()?.replace(/\.md$/, "") ?? "";
+      if (superseded.has(baseId)) continue; // retired by a newer distillation
       const projectOfRel = rel.split("/")[0];
       if (!projects.includes(projectOfRel)) continue;
       let c = byRel.get(rel);

@@ -318,6 +318,19 @@ export class RootDb {
       .all(project, cursor, limit) as never;
   }
 
+  // Superseded-id set (2026-10-26 vector-lane gap): the keyword path filters
+  // superseded candidates via distillCandidates' active set, but the full-scan
+  // vector lane reads page_vectors directly — without this set it resurrects
+  // pages a newer distillation already retired.
+  supersededIds(): Set<string> {
+    const rows = this.db.prepare("SELECT supersedes FROM pages WHERE supersedes IS NOT NULL AND supersedes != '[]'").all() as Array<{ supersedes: string }>;
+    const ids = new Set<string>();
+    for (const r of rows) {
+      try { for (const id of JSON.parse(r.supersedes) as string[]) ids.add(id); } catch { /* malformed supersedes — ignore row */ }
+    }
+    return ids;
+  }
+
   distinctProjects(): string[] {
     return (this.db.prepare("SELECT DISTINCT project FROM pages WHERE project IS NOT NULL").all() as Array<{ project: string }>).map((r) => r.project);
   }
