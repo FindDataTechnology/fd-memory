@@ -374,3 +374,48 @@ test("/digest L1: query-matched notes ride first regardless of recency slot; emp
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest: vector lane reaches pages the keyword path misses (recall-cap regression)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const root = svc.rootForKey("u-alice");
+    // a page whose WORDS share nothing with the query, but whose vector is a
+    // perfect match (we plant the vector directly — the recall path must reach
+    // it on cosine alone).
+    root.writeDistillPage("c-vec", "experience", { id: "exp_sem", engine: "e", confidence: 0.9, task: "代号青鸾使用规约", search_keys: ["青鸾"], solution: "对外材料统一用青鸾代号", sources: [], supersedes: [] });
+    const rel = "c-vec/experiences/exp_sem.md";
+    const vec = new Float32Array(4); vec[0] = 1; // unit vector on dim 0
+    root.db.setPageVector(rel, "vec-test-model", vec);
+    // sidecar stub returning the SAME direction for any text
+    const lane = createServer((req, res) => {
+      let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => {
+        const n = (JSON.parse(b || "{}").texts ?? [""]).length;
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ vectors: Array.from({ length: n }, () => [1, 0, 0, 0]), model: "vec-test-model", tokens: n }));
+      });
+    });
+    await new Promise<void>((r) => lane.listen(0, "127.0.0.1", () => r()));
+    const prevUrl = process.env.FD_MEMORY_DISTILLER_URL; const prevTok = process.env.DISTILLER_SHARED_TOKEN;
+    process.env.FD_MEMORY_DISTILLER_URL = `http://127.0.0.1:${(lane.address() as { port: number }).port}`;
+    process.env.DISTILLER_SHARED_TOKEN = "t";
+    try {
+      // query words deliberately do NOT appear in the page
+      const r = await fetch(base + "/digest?project=c-vec&q=zzz%20totally%20unrelated&budget=1500", { headers: { authorization: `Bearer ${person}` } });
+      const d = (await r.json()) as { digest: string; items: number; model_note?: string };
+      assert.equal(d.model_note, undefined, "vector rung served");
+      assert.ok(d.digest.includes("代号青鸾使用规约"), "semantic hit reached via cosine alone (keyword path had nothing)");
+    } finally {
+      if (prevUrl === undefined) delete process.env.FD_MEMORY_DISTILLER_URL; else process.env.FD_MEMORY_DISTILLER_URL = prevUrl;
+      if (prevTok === undefined) delete process.env.DISTILLER_SHARED_TOKEN; else process.env.DISTILLER_SHARED_TOKEN = prevTok;
+      __resetEmbedGate();
+      await new Promise<void>((r) => server.close(() => r()));
+      lane.close();
+      rmSync(data, { recursive: true, force: true });
+    }
+  } finally {
+    __resetEmbedGate();
+  }
+});

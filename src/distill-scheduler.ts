@@ -418,15 +418,38 @@ export async function hybridCandidates(opts: {
     const q = await embed([queryFor]);
     if (!q.vectors.length) return keyword;
     const qv = q.vectors[0];
-    const scored: Array<DistillCandidate & { score: number }> = [];
+    // Scan EVERY vector of this model (2026-10-26 recall-cap fix): scoring only
+    // keyword-recalled candidates made the vector lane a mere re-ranker, so a
+    // page whose embedding was closest but whose words didn't overlap was
+    // unreachable. L2 pages carry a `task`/`statement`; rebuild a candidate
+    // from the page itself for vector-only hits.
+    const byRel = new Map<string, DistillCandidate>();
     for (const c of keyword) {
       for (const project2 of projects) {
-        const rel = `${project2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
-        const pv = root.db.getPageVector(rel);
-        if (!pv || pv.model !== q.model || pv.vector.length !== qv.length) continue;
-        scored.push({ ...c, score: cosine(qv, pv.vector) });
-        break;
+        byRel.set(`${project2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`, c);
       }
+    }
+    const scored: Array<DistillCandidate & { score: number }> = [];
+    for (const v of root.db.allPageVectors(q.model)) {
+      if (v.vector.length !== qv.length) continue;
+      const rel = v.page_rel;
+      const projectOfRel = rel.split("/")[0];
+      if (!projects.includes(projectOfRel)) continue;
+      let c = byRel.get(rel);
+      if (!c) {
+        const m = rel.match(/^([^/]+)\/(facts|experiences)\/(.+)\.md$/);
+        if (!m) continue;
+        const page = root.readPageByRel(rel);
+        if (!page) continue;
+        const kind = m[2] === "facts" ? "fact" : "experience";
+        c = {
+          id: m[3], kind,
+          task: kind === "fact" ? String(page.frontmatter?.subject ?? page.frontmatter?.title ?? m[3]) : String(page.frontmatter?.title ?? m[3]),
+          search_keys: [], solution: String(page.body ?? "").slice(0, 400),
+          boundary_envs: "", supersedes: [],
+        };
+      }
+      scored.push({ ...c, score: cosine(qv, v.vector) });
     }
     scored.sort((a, b) => b.score - a.score);
     const vectorIds = new Set(scored.map((x) => x.id));
