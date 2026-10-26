@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { serializeEmbed, __resetEmbedGate } from "../embed-gate.js";
+import { serializeEmbed, __resetEmbedGate, embedLaneCoolingDown, noteEmbedOutcome } from "../embed-gate.js";
 
 function slowEmbed(ms: number) {
   let active = 0, maxActive = 0, calls = 0;
@@ -49,4 +49,19 @@ test("gate: a failing call does not poison the chain", async () => {
   await assert.rejects(() => bad, /boom/);
   const ok = await serializeEmbed(fn, ["y"]);
   assert.equal(ok.vectors.length, 1, "next call still runs");
+});
+
+test("adaptive skip: two consecutive slow outcomes open a cooldown; success resets the streak", async () => {
+  __resetEmbedGate();
+  noteEmbedOutcome(true);
+  assert.equal(embedLaneCoolingDown(), false);
+  noteEmbedOutcome(false);
+  assert.equal(embedLaneCoolingDown(), false, "one strike is not enough");
+  noteEmbedOutcome(false);
+  assert.equal(embedLaneCoolingDown(), true, "two strikes → cool-down");
+  assert.equal(embedLaneCoolingDown(Date.now() + 61_000), false, "window expires");
+  __resetEmbedGate();
+  noteEmbedOutcome(false);
+  noteEmbedOutcome(true);
+  assert.equal(embedLaneCoolingDown(), false, "success resets the streak");
 });

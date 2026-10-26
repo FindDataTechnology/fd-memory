@@ -12,7 +12,7 @@ import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
-import { serializeEmbed } from "./embed-gate.js";
+import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
 import { renderDigest, DigestItem } from "./digest.js";
 
 export interface ServiceOptions {
@@ -288,15 +288,19 @@ export class Service {
       // model_note — always wins the race inside the caller's budget.
       const EMBED_DEADLINE_MS = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS ?? 3500);
       const embed = async (texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> => {
+        if (embedLaneCoolingDown()) throw new Error("embed lane cooling down (recent slow streak) — keyword recall");
         let timer: NodeJS.Timeout | undefined;
         try {
-          return await Promise.race([
+          const out = await Promise.race([
             serializeEmbed((t) => sidecarEmbed(process.env, t), texts),
             new Promise<never>((_, rej) => {
               timer = setTimeout(() => rej(new Error(`embed deadline ${EMBED_DEADLINE_MS}ms exceeded`)), EMBED_DEADLINE_MS);
             }),
           ]);
+          noteEmbedOutcome(true);
+          return out;
         } catch (e) {
+          noteEmbedOutcome(false);
           modelNote = `vector lane unavailable — keyword-only recall (${(e as Error)?.message ?? e})`;
           throw e; // hybridCandidates catches and falls back to keyword
         } finally {

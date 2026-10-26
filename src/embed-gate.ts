@@ -28,8 +28,32 @@ export function serializeEmbed(embed: EmbedFn, texts: string[], opts: { coalesce
   return run;
 }
 
+// Adaptive skip (2026-10-26 probe): the sidecar degrades monotonically under
+// sustained load (8 sequential probes: 1.2s → 11.7s). Once recent attempts
+// keep blowing the deadline, paying the full timeout every request is pure
+// loss — skip the lane for a cool-down window and serve keyword recall
+// immediately. A successful call resets the streak.
+const slowStreak = { n: 0, until: 0 };
+const SLOW_STREAK_LIMIT = 2;
+const COOLDOWN_MS = 60_000;
+
+export function embedLaneCoolingDown(now = Date.now()): boolean {
+  return now < slowStreak.until;
+}
+
+export function noteEmbedOutcome(ok: boolean, now = Date.now()): void {
+  if (ok) {
+    slowStreak.n = 0;
+    return;
+  }
+  slowStreak.n += 1;
+  if (slowStreak.n >= SLOW_STREAK_LIMIT) slowStreak.until = now + COOLDOWN_MS;
+}
+
 // Test seam: reset the module-level gate.
 export function __resetEmbedGate(): void {
   chain = Promise.resolve();
   inflight.clear();
+  slowStreak.n = 0;
+  slowStreak.until = 0;
 }
