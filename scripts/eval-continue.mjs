@@ -204,8 +204,13 @@ async function digestBlock(root, project, scene) {
   // headers stripped, 400-char excerpt. Notes ride recent-first, not query-
   // matched, faithful to the seam the chat lane reads.
   const NOTES_LIMIT = 5;
-  const recentNotes = root.db.recentNotes(project, NOTES_LIMIT);
-  const noteItems = recentNotes.map((p) => {
+  const matched = scene.task.trim() ? root.db.queryNotes(project, scene.task, 3) : [];
+  const matchedPaths = new Set(matched.map((p) => p.path));
+  const merged = [
+    ...matched,
+    ...root.db.recentNotes(project, NOTES_LIMIT).filter((p) => !matchedPaths.has(p.path)),
+  ].slice(0, NOTES_LIMIT);
+  const noteItems = merged.map((p) => {
     const page = root.readPageByRel(p.path);
     return {
       id: p.path, layer: "L1", kind: "note", title: p.title,

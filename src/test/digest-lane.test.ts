@@ -342,3 +342,32 @@ test("/digest: handoffs past the 48h recency gate leave the block (stale-claim p
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest L1: query-matched notes ride first regardless of recency slot; empty query stays pure recency", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    // an OLD note （写触发哨兵: relevant to a query) + newer filler notes
+    await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-rel", title: "苦瓜溯源批次口径", body: "苦瓜批次数据一律按批次号溯源，不合并。" }) });
+    for (let i = 1; i <= 5; i++) {
+      await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-rel", title: `填充 ${i}`, body: `第 ${i} 条` }) });
+      await new Promise((r) => setTimeout(r, 8));
+    }
+    const r = await fetch(base + "/digest?project=c-rel&q=苦瓜溯源&budget=1500", { headers: H });
+    const d = (await r.json()) as { digest: string; notes: number };
+    assert.ok(d.digest.includes("苦瓜溯源批次口径"), "old-but-relevant note rides via query match, not recency");
+    const idx = d.digest.indexOf("苦瓜溯源批次口径");
+    const idxFill = d.digest.indexOf("填充 5");
+    assert.ok(idx < (idxFill < 0 ? Infinity : idxFill), "matched note sorts before recency fillers");
+    // empty query → pure recency (byte-stable)
+    const r2 = await fetch(base + "/digest?project=c-rel&q=&budget=1500", { headers: H });
+    const d2 = (await r2.json()) as { digest: string };
+    assert.ok(!d2.digest.includes("苦瓜溯源批次口径"), "empty query = recency-only, the old note drops below rank-5");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

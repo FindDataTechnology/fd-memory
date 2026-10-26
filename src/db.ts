@@ -281,10 +281,32 @@ export class RootDb {
   // /digest L1 segment (2026-10-26 benchmark): a type-blind recentPages window
   // loses notes whenever fresh L2/handoff pages churn above them — query the
   // type directly so note recall never depends on other page kinds' activity.
-  recentNotes(project: string, limit = 5): Array<{ path: string; title: string; updated_at: string }> {
+  recentNotes(project: string, limit = 5): Array<{ path: string; title: string; body: string; updated_at: string }> {
     return this.db
-      .prepare("SELECT path, title, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT ?")
+      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT ?")
       .all(project, limit) as never;
+  }
+
+  // Query-matched note recall (2026-10-26 iteration): notes are only ever
+  // recency-ranked — anything older than rank-5 is invisible until distillation
+  // catches up (lossy + latent). Score title+body against the same terms rules
+  // as the L2 keyword path; returns matched notes with scores (ties by recency).
+  queryNotes(project: string, queryFor: string, limit = 3): Array<{ path: string; title: string; body: string; updated_at: string; score: number }> {
+    const rows = this.db
+      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT 200")
+      .all(project) as Array<{ path: string; title: string; body: string | null; updated_at: string }>;
+    const terms = String(queryFor ?? "").toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((t) => t.length >= 2);
+    if (terms.length === 0) return rows.slice(0, limit).map((r) => ({ ...r, body: r.body ?? "", score: 0 }));
+    const out = rows
+      .map((r) => {
+        const hay = `${r.title} ${String(r.body ?? "")}`.toLowerCase();
+        let score = 0;
+        for (const t of terms) if (hay.includes(t)) score++;
+        return { ...r, body: r.body ?? "", score };
+      })
+      .filter((r) => r.score > 0)
+      .sort((a, b) => b.score - a.score || (a.updated_at < b.updated_at ? 1 : -1));
+    return out.slice(0, limit);
   }
 
   // u-root distillation (add-u-root-distillation): note pages as distill

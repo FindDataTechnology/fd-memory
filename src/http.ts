@@ -339,8 +339,16 @@ export class Service {
       // rank-4/5 notes — their TITLES alone carry the signal. Segment widens
       // to 5 with gist-sized lines (title + ~100-char excerpt).
       const NOTES_LIMIT = 5;
-      const recentNotes = dRoot.db.recentNotes(project, NOTES_LIMIT);
-      const noteItems: DigestItem[] = recentNotes.map((p) => {
+      // Query-relevant notes ride FIRST (the "remember it, find it" lane that
+      // doesn't wait for distillation latency), then recency fills the rest.
+      // Empty/no-match query → pure recency, byte-identical to before.
+      const matched = q.trim() ? dRoot.db.queryNotes(project, q, 3) : [];
+      const matchedPaths = new Set(matched.map((p) => p.path));
+      const merged = [
+        ...matched,
+        ...dRoot.db.recentNotes(project, NOTES_LIMIT).filter((p) => !matchedPaths.has(p.path)),
+      ].slice(0, NOTES_LIMIT);
+      const noteItems: DigestItem[] = merged.map((p) => {
         const page = dRoot.readPageByRel(p.path);
         return {
           id: p.path, layer: "L1" as const, kind: "note", title: p.title,
