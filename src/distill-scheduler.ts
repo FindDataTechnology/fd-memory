@@ -241,6 +241,26 @@ export class DistillScheduler {
       }
 
       const audit = { principal: "distiller:scheduler", scope: `${rootKey}/${project}` };
+      // Patrol-echo dedup (2026-10-26 audit): cron-heavy roots distilled the
+      // same "ran the round patrol" narrative every round — mission-planner
+      // burned 605k tokens/day producing 277 near-identical L2 pages. The
+      // engine sees candidates but never self-dedupes, so the write face does:
+      // a new L2 whose title shares the first 16 chars with an existing page
+      // of the same kind supersedes it (files persist; the read face retires
+      // the old page via the supersededIds filters).
+      const TITLE_PREFIX = 16;
+      const dedupeSupersedes = (title: string, kind: "fact" | "experience"): string[] => {
+        const prefix = String(title ?? "").replace(/\s+/g, " ").trim().slice(0, TITLE_PREFIX);
+        if (prefix.length < TITLE_PREFIX) return [];
+        const kindDir = kind === "fact" ? "facts" : "experiences";
+        const rows = root.db.db.prepare(
+          `SELECT path, title FROM pages WHERE project=? AND type=? AND title LIKE ? ORDER BY updated_at DESC LIMIT 20`,
+        ).all(project, kind, `${prefix}%`) as Array<{ path: string; title: string }>;
+        return rows
+          .filter((r) => String(r.title ?? "").replace(/\s+/g, " ").trim().slice(0, TITLE_PREFIX) === prefix)
+          .map((r) => r.path.split("/").pop()?.replace(/\.md$/, "") ?? "")
+          .filter(Boolean);
+      };
 
       if (rootKey.startsWith("u-")) {
         // Person-root chunked distillation (add-u-root-distillation D2, tuned
@@ -282,11 +302,15 @@ export class DistillScheduler {
           };
           if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
           for (const fact of result.facts ?? []) {
-            const rel = root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
+            const entry = normalizeEntry(fact, "fact");
+            entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
+            const rel = root.writeDistillPage(project, "fact", entry, audit);
             writeEntryVector(root, rel, fact);
           }
           for (const exp of result.experiences ?? []) {
-            const rel = root.writeDistillPage(project, "experience", normalizeEntry(exp, "experience"), audit);
+            const entry = normalizeEntry(exp, "experience");
+            entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
+            const rel = root.writeDistillPage(project, "experience", entry, audit);
             writeEntryVector(root, rel, exp);
           }
           spentTotal += result.tokens ?? 0;
@@ -347,11 +371,15 @@ export class DistillScheduler {
       if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
 
       for (const fact of result.facts ?? []) {
-        const rel = root.writeDistillPage(project, "fact", normalizeEntry(fact, "fact"), audit);
+        const entry = normalizeEntry(fact, "fact");
+        entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
+        const rel = root.writeDistillPage(project, "fact", entry, audit);
         writeEntryVector(root, rel, fact);
       }
       for (const exp of result.experiences ?? []) {
-        const rel = root.writeDistillPage(project, "experience", normalizeEntry(exp, "experience"), audit);
+        const entry = normalizeEntry(exp, "experience");
+        entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
+        const rel = root.writeDistillPage(project, "experience", entry, audit);
         writeEntryVector(root, rel, exp);
       }
       const maxRid = obs.length ? Math.max(...obs.map((o) => o.rid)) : (state?.obs_cursor ?? 0);

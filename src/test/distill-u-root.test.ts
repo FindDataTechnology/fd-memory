@@ -240,3 +240,46 @@ test("disk discovery: a root never touched since boot still distills (lazy-roots
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("patrol-echo dedup: a new L2 with the same 16-char title prefix supersedes the old page", async () => {
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const fx = fixture(data, sidecar, { ...GATES });
+    const root = fx.openRoot("u-dedup@test");
+    // existing L2 from a previous round
+    root.writeDistillPage("default", "experience", { id: "exp_r1", engine: "e", confidence: 0.8, task: "按 mission-protocol 每回合执行任务巡检并分派", search_keys: ["巡检"], solution: "第一轮的巡检产出", sources: [], supersedes: [] });
+    // a different page that must NOT be touched
+    root.writeDistillPage("default", "experience", { id: "exp_other", engine: "e", confidence: 0.8, task: "完全不同的另一件事", search_keys: [], solution: "别动我", sources: [], supersedes: [] });
+    let call = 0;
+    const sched = new DistillScheduler({
+      roots: fx.roots, openRoot: fx.openRoot, tokens: fx.tokens, env: { ...GATES },
+      fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+        if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1]], model: "m", tokens: 1 }) };
+        call += 1;
+        return { ok: true, status: 200, json: async () => ({ facts: [], experiences: [{ id: `exp_r${call + 1}`, engine: "e", task: "按 mission-protocol 每回合执行任务巡检并分派（第二轮）", search_keys: [], solution: `第 ${call + 1} 轮巡检产出`, sources: [], supersedes: [] }], cursor_next: {}, llm_calls: [], tokens: 900, errors: [] }) };
+      }) as unknown as typeof fetch,
+      now: () => Date.now(),
+    });
+    // a note triggers the distill; the engine returns the same-titled experience
+    root.writePage("default", "notes", "n1", { frontmatter: { type: "note", title: "t", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } }, body: "又巡检了一遍" } as never);
+    await sched.distillNow("u-dedup@test", "default");
+    const rows = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience");
+    const r1 = rows.find((r) => r.path.includes("exp_r1"));
+    const other = rows.find((r) => r.path.includes("exp_other"));
+    const r2 = rows.find((r) => r.path.includes("exp_r2"));
+    assert.ok(r2, "new page written");
+    assert.deepEqual(JSON.parse(r2!.supersedes), ["exp_r1"], "the NEW page lists the same-prefix old page (supersede direction: new → old)");
+    assert.equal(JSON.parse(r1!.supersedes).length, 0, "the old page's own list stays empty");
+    assert.equal(JSON.parse(other!.supersedes).length, 0, "different page untouched");
+    // read face: old page filtered, new+other remain
+    const c = await (await import("../distill.js")).distillCandidates(root, ["default"], "巡检");
+    assert.ok(!c.some((x) => x.id === "exp_r1"), "retired page out of the active candidate set");
+    assert.ok(c.some((x) => x.id === "exp_r2"), "successor in the active set");
+    const cAll = await (await import("../distill.js")).distillCandidates(root, ["default"], "另一件事");
+    assert.ok(cAll.some((x) => x.id === "exp_other"), "unrelated page still reachable by its own terms");
+    root.db.close();
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
