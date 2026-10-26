@@ -12,6 +12,7 @@ import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
+import { serializeEmbed } from "./embed-gate.js";
 import { renderDigest, DigestItem } from "./digest.js";
 
 export interface ServiceOptions {
@@ -290,7 +291,7 @@ export class Service {
         let timer: NodeJS.Timeout | undefined;
         try {
           return await Promise.race([
-            sidecarEmbed(process.env, texts),
+            serializeEmbed((t) => sidecarEmbed(process.env, t), texts),
             new Promise<never>((_, rej) => {
               timer = setTimeout(() => rej(new Error(`embed deadline ${EMBED_DEADLINE_MS}ms exceeded`)), EMBED_DEADLINE_MS);
             }),

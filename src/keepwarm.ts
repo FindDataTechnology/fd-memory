@@ -8,6 +8,7 @@
 // digest face has its own degradation path — this is pure opportunism).
 
 import { sidecarEmbed } from "./distill-scheduler.js";
+import { serializeEmbed } from "./embed-gate.js";
 
 const DEFAULT_INTERVAL_MS = 4 * 60_000;
 
@@ -22,7 +23,7 @@ export function startEmbedKeepwarm(opts: {
   const url = String(env.FD_MEMORY_DISTILLER_URL ?? "").trim();
   if (!url || env.FD_MEMORY_EMBED_KEEPWARM === "0") return { stop: () => {} };
   const intervalMs = opts.intervalMs ?? (Number(env.FD_MEMORY_EMBED_KEEPWARM_INTERVAL_MS ?? DEFAULT_INTERVAL_MS) || DEFAULT_INTERVAL_MS);  const timer = setInterval(() => {
-    sidecarEmbed(env, ["keep-warm"], opts.fetchImpl).catch(() => {
+    serializeEmbed((t) => sidecarEmbed(env, t, opts.fetchImpl), ["keep-warm"]).catch(() => {
       /* silent: opportunistic warmth, the digest face degrades on its own */
     });
   }, intervalMs);

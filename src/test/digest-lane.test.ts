@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { Service } from "../http.js";
+import { __resetEmbedGate } from "../embed-gate.js";
 
 function tmpData(): string {
   return mkdtempSync(join(tmpdir(), "fdm-digestlane-"));
@@ -177,6 +178,7 @@ test("/digest: open-handoff pile caps at 3 so notes survive the budget (chat-lan
 // must turn a 6s embed into a keyword block inside the caller's budget.
 
 test("/digest: slow embed degrades at the internal deadline — keyword block inside budget with model_note", async () => {
+  __resetEmbedGate();
   const lane = createServer((req, res) => {
     setTimeout(() => {
       res.writeHead(200, { "content-type": "application/json" });
@@ -215,6 +217,7 @@ test("/digest: slow embed degrades at the internal deadline — keyword block in
 });
 
 test("/digest: fast embed keeps the vector rung (no model_note)", async () => {
+  __resetEmbedGate();
   const lane = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
