@@ -13,6 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
+import { noteDistill } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -290,6 +291,7 @@ export class DistillScheduler {
           root.db.upsertDistillState(project, { note_cursor: batch[batch.length - 1].updated_at, last_tokens: spentTotal });
         }
         this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, wrote);
+        noteDistill(true, wrote, spentTotal);
         this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
         return;
       }
@@ -353,6 +355,7 @@ export class DistillScheduler {
         next_attempt_at: 0,
       });
       this.opts.tokens.distillBudgetAdd(rootKey, day, result.tokens ?? 0, result.llm_calls?.length ?? 0);
+      noteDistill(true, (result.facts?.length ?? 0) + (result.experiences?.length ?? 0), result.tokens ?? 0);
       this.log.log(`[distill] ${key}: ${result.facts?.length ?? 0} facts, ${result.experiences?.length ?? 0} experiences, ${(result.tokens ?? 0).toLocaleString()} tokens`);
     } catch (e) {
       const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
@@ -360,6 +363,7 @@ export class DistillScheduler {
       const prev = state?.next_attempt_at && state.next_attempt_at > this.now() ? state.next_attempt_at - this.now() : 30_000;
       const backoff = Math.min(MAX_BACKOFF_MS, Math.max(30_000, prev * 2));
       root.db.upsertDistillState(project, { last_error: String((e as Error)?.message ?? e).slice(0, 300), next_attempt_at: this.now() + backoff });
+      noteDistill(false, 0, 0, String((e as Error)?.message ?? e));
       this.log.warn(`[distill] ${key} failed (cursor kept, backoff ${Math.round(backoff / 1000)}s): ${(e as Error)?.message ?? e}`);
     } finally {
       this.inflight.delete(key);

@@ -13,6 +13,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
+import { noteDigestRung, noteEmbedSample, metricsSnapshot } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 
 export interface ServiceOptions {
@@ -288,8 +289,12 @@ export class Service {
       // model_note — always wins the race inside the caller's budget.
       const EMBED_DEADLINE_MS = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS ?? 3500);
       const embed = async (texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> => {
-        if (embedLaneCoolingDown()) throw new Error("embed lane cooling down (recent slow streak) — keyword recall");
+        if (embedLaneCoolingDown()) {
+          noteEmbedSample({ ms: 0, ok: false, reason: "cooling_down" });
+          throw new Error("embed lane cooling down (recent slow streak) — keyword recall");
+        }
         let timer: NodeJS.Timeout | undefined;
+        const e0 = Date.now();
         try {
           const out = await Promise.race([
             serializeEmbed((t) => sidecarEmbed(process.env, t), texts),
@@ -298,9 +303,11 @@ export class Service {
             }),
           ]);
           noteEmbedOutcome(true);
+          noteEmbedSample({ ms: Date.now() - e0, ok: true });
           return out;
         } catch (e) {
           noteEmbedOutcome(false);
+          noteEmbedSample({ ms: Date.now() - e0, ok: false, reason: String((e as Error)?.message ?? e) });
           modelNote = `vector lane unavailable — keyword-only recall (${(e as Error)?.message ?? e})`;
           throw e; // hybridCandidates catches and falls back to keyword
         } finally {
@@ -385,6 +392,7 @@ export class Service {
       // served-rung line (add-u-root-distillation D4): hit-rate is observable
       // from the logs — vector vs keyword, load, ms. rootKey stays server-side.
       const logRoot = scope.kind === "platform" || scope.kind === "runner" ? rootKeyParam : namespaceParts(scope.namespace).rootKey;
+      noteDigestRung(modelNote ? "keyword" : "vector");
       console.log(`[digest] ${logRoot}:${project} rung=${modelNote ? "keyword" : "vector"} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
@@ -634,6 +642,19 @@ export class Service {
       }
       res.writeHead(403, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment|pod", "platform:person"] }));
+    }
+
+    // Operational snapshot (add-memory-metrics): one curl answers "is the
+    // vector rung holding up, how slow is embed, is distillation yielding".
+    // Runner/platform only — the counters carry root activity cadence.
+    if (path === "/admin/metrics") {
+      // POST per the admin face convention (mint/reindex/report); body unused.
+      if (scope.kind !== "runner" && scope.kind !== "platform") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "service_token_required" }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(metricsSnapshot()));
     }
 
     if (path === "/admin/reindex") {
