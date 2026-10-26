@@ -29,6 +29,12 @@ export interface DistillSchedulerOptions {
   openRoot: (rootKey: string) => StoreRoot;
   roots: Map<string, StoreRoot>;
   tokens: TokenStore;
+  // Disk discovery (2026-10-26 lazy-roots gap): the live roots map only holds
+  // roots touched since boot — a root nobody hit after a restart never
+  // distills, no matter how much note material accumulated. The service
+  // supplies the owner-dir listing; the scan opens uncached roots once (the
+  // map is the cache) so every root distills regardless of traffic.
+  discoverRoots?: () => string[];
   log?: { warn: (msg: string) => void; log: (msg: string) => void };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
@@ -154,6 +160,13 @@ export class DistillScheduler {
   private fallbackScan(): void {
     if (this.now() - this.lastFallback < FALLBACK_INTERVAL_MS) return;
     this.lastFallback = this.now();
+    if (this.opts.discoverRoots) {
+      for (const rootKey of this.opts.discoverRoots()) {
+        if (isDistillableRoot(rootKey, this.opts.env) && !this.opts.roots.has(rootKey)) {
+          try { this.opts.openRoot(rootKey); } catch { /* unreadable root — skip this scan */ }
+        }
+      }
+    }
     for (const [rootKey, root] of this.opts.roots) {
       if (!isDistillableRoot(rootKey, this.opts.env)) continue;
       const day = new Date().toISOString().slice(0, 10);

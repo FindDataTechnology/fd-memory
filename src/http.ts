@@ -4,6 +4,8 @@
 // namespace), /healthz, /admin/* (token ops, root-scoped). Auth on every
 // route except /healthz; auth failures are structured JSON.
 
+import { readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { TokenStore, Scope, namespaceParts } from "./auth.js";
@@ -37,6 +39,11 @@ export class Service {
       roots: this.roots,
       openRoot: (key) => this.rootForKey(key),
       tokens: this.tokens,
+      discoverRoots: () => {
+        try {
+          return readdirSync(join(this.opts.dataDir, "owners")).filter((d: string) => existsSync(join(this.opts.dataDir, "owners", d, "wiki")));
+        } catch { return []; }
+      },
       env: process.env,
     });
   }

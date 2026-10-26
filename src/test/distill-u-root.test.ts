@@ -205,3 +205,34 @@ test("u-root debounce: write-triggered distill ready in 60s, d-root keeps the 5m
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("disk discovery: a root never touched since boot still distills (lazy-roots gap regression)", async () => {
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const tokens = new TokenStore(join(data, "tokens.db"), "p");
+    const roots = new Map<string, StoreRoot>();
+    const openRoot = (key: string) => {
+      let r = roots.get(key);
+      if (!r) { r = new StoreRoot(data, key); roots.set(key, r); }
+      return r;
+    };
+    const sched = new DistillScheduler({
+      roots, openRoot, tokens,
+      env: { ...GATES },
+      discoverRoots: () => ["u-fresh@test"], // disk has this owner dir; map is empty
+      fetchImpl: (async (url: RequestInfo | URL) => {
+        if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1]], model: "m", tokens: 1 }) };
+        return { ok: true, status: 200, json: async () => ({ facts: [], experiences: [{ id: "exp_d1", engine: "e", task: "t", search_keys: [], solution: "s", sources: [], supersedes: [] }], cursor_next: {}, llm_calls: [], tokens: 100, errors: [] }) };
+      }) as unknown as typeof fetch,
+      now: () => Date.now(),
+    });
+    const root = openRoot("u-fresh@test");
+    root.writePage("default", "notes", "n1", { frontmatter: { type: "note", title: "t", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } }, body: "b" } as never);
+    await sched.distillNow("u-fresh@test", "default");
+    assert.ok(sidecar.calls.some((c) => String(c.url).endsWith("/distill")), "discovered root distilled despite empty live map");
+    root.db.close();
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
