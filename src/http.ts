@@ -11,6 +11,7 @@ import { StoreRoot } from "./store.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
+import { startEmbedKeepwarm } from "./keepwarm.js";
 import { renderDigest, DigestItem } from "./digest.js";
 
 export interface ServiceOptions {
@@ -24,6 +25,7 @@ export class Service {
   readonly tokens: TokenStore;
   readonly ingest: CaptureIngest;
   readonly distill: DistillScheduler;
+  private keepwarm: { stop: () => void } | null = null;
   private roots = new Map<string, StoreRoot>();
 
   constructor(readonly opts: ServiceOptions) {
@@ -62,6 +64,7 @@ export class Service {
     const host = this.opts.host ?? "127.0.0.1";
     server.listen(this.opts.port, host);
     this.distill.start();
+    this.keepwarm = startEmbedKeepwarm({ env: process.env });
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
   }
 
