@@ -59,9 +59,9 @@ test("adaptive skip: two consecutive slow outcomes open a cooldown; success rese
   assert.equal(embedLaneCoolingDown(), false, "one strike is not enough");
   noteEmbedOutcome(false);
   assert.equal(embedLaneCoolingDown(), true, "two strikes → cool-down");
-  assert.equal(embedLaneCoolingDown(Date.now() + 61_000), false, "window expires");
+  assert.equal(embedLaneCoolingDown(Date.now() + 121_000), false, "window expires (2min base)");
   __resetEmbedGate();
   noteEmbedOutcome(false);
   noteEmbedOutcome(true);
-  assert.equal(embedLaneCoolingDown(), false, "success resets the streak");
+  assert.equal(embedLaneCoolingDown(), false, "one success takes a strike off, no cooldown yet");
 });
