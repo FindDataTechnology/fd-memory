@@ -222,6 +222,7 @@ test("disk discovery: a root never touched since boot still distills (lazy-roots
       env: { ...GATES },
       discoverRoots: () => ["u-fresh@test"], // disk has this owner dir; map is empty
       fetchImpl: (async (url: RequestInfo | URL) => {
+        sidecar.calls.push({ url: String(url) });
         if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1]], model: "m", tokens: 1 }) };
         return { ok: true, status: 200, json: async () => ({ facts: [], experiences: [{ id: "exp_d1", engine: "e", task: "t", search_keys: [], solution: "s", sources: [], supersedes: [] }], cursor_next: {}, llm_calls: [], tokens: 100, errors: [] }) };
       }) as unknown as typeof fetch,
@@ -229,7 +230,10 @@ test("disk discovery: a root never touched since boot still distills (lazy-roots
     });
     const root = openRoot("u-fresh@test");
     root.writePage("default", "notes", "n1", { frontmatter: { type: "note", title: "t", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } }, body: "b" } as never);
-    await sched.distillNow("u-fresh@test", "default");
+    // drive the SCAN (the discovery surface), not distillNow — discovery lives in fallbackScan
+    (sched as unknown as { lastFallback: number }).lastFallback = 0;
+    await sched.drain();
+    await new Promise((r) => setTimeout(r, 50));
     assert.ok(sidecar.calls.some((c) => String(c.url).endsWith("/distill")), "discovered root distilled despite empty live map");
     root.db.close();
   } finally {
