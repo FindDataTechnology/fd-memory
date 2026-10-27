@@ -1,7 +1,7 @@
 {
-  "name": "fd-memory",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@deepseek-ai/yongyi",
+  "version": "0.2.0",
+  "private": false,
   "type": "module",
   "engines": {
     "node": ">=22.5.0"
@@ -17,5 +17,12 @@
   "devDependencies": {
     "typescript": "^5.6.0",
     "@types/node": "^22.0.0"
-  }
+  },
+  "description": "YongYi (永忆) — long-term working-memory service for agentic platforms and multi-agent systems",
+  "bin": {
+    "yongyi": "dist/index.js"
+  },
+  "files": [
+    "README.md"
+  ]
 }

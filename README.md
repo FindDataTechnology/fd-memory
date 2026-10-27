@@ -1,9 +1,9 @@
-# fd-memory
+# 永忆（YongYi）
 
 **面向 AI Agent 与 Multi-Agent 平台的长期记忆服务。**
 Working memory for agentic platforms — durable, layered, self-distilling memory as a service.
 
-FD-memory 是一个为**智能体 / 多智能体系统**设计的长期记忆基础设施：把「一个 agent 过去知道的一切」变成**每回合都可召回**的结构化知识，支撑跨平台部署与多 agent 协同。
+永忆（YongYi，fd-memory 的产品品牌）是一个为**智能体 / 多智能体系统**设计的长期记忆基础设施：把「一个 agent 过去知道的一切」变成**每回合都可召回**的结构化知识，支撑跨平台部署与多 agent 协同。
 
 ## 为什么
 
@@ -42,7 +42,7 @@ FD-memory 把这些收敛到一个服务里，让记忆是**案件内层**（L0 
 
 - **单进程 Node**：零外部依赖（内置 SQLite + FTS5），`fd-memory serve`
 - **可插拔蒸馏器**：不启动 sidecar 也可以用全部读写面；装上后 L2 蒸馏自动分层
-- **NPM 包**：`npm pack` 一件脱机交付（src + scripts + Docker + fixtures）
+- **NPM 包**：`npm pack` 一件脱机交付（src + scripts + Docker + fixtures）；发布面定型 `@deepseek-ai/yongyi`（`yongyi --help`）
 
 ## 快速启动（约 2 分钟）
 

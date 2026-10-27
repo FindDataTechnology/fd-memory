@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>永忆 · YongYi — 面向智能体与多智能体平台的长期记忆服务</title>
+<meta name="description" content="永忆（YongYi）是一个面向 AI Agent 与 Multi-Agent 平台的长期记忆基础设施，把「一个 agent 过去知道的一切」变成每回合都可召回的结构化知识。">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='46' fill='%230a0f1e'/%3E%3Ccircle cx='50' cy='50' r='28' fill='none' stroke='%2346c7d4' stroke-width='3'/%3E%3Ccircle cx='50' cy='50' r='8' fill='%23e8b45e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Serif+SC:wght@400;600;700&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<a class="skip-link" href="#main">跳到正文</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="brand-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="22" height="22"><circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="16" cy="16" r="5.4" fill="currentColor"/></svg>
+    </span>
+    <span class="brand-name">永忆</span>
+    <span class="brand-en">YongYi</span>
+    <span class="brand-tag">long-term working memory</span>
+    <nav class="topnav" aria-label="主导航">
+      <a href="#layers">分层</a>
+      <a href="#recall">召回</a>
+      <a href="#dedup">接替</a>
+      <a href="#start">起跑</a>
+      <a href="https://github.com/FindDataTechnology/fd-memory" target="_blank" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+<section class="hero" aria-label="首屏">
+  <div class="hero-sky" aria-hidden="true" id="sky"></div>
+
+  <div class="hero-left">
+    <p class="hero-kicker">智能体长期记忆服务</p>
+    <h1 class="hero-title">会话会结束，<br>记忆不结束。</h1>
+    <p class="hero-sub">
+      永忆（YongYi）把一个 agent 过去知道的一切——笔记、交接、事实与经验——变成每回合都可召回的结构化知识。换一个会话、隔一个季度回来，不用重推背景。
+    </p>
+    <div class="hero-cta">
+      <a class="cta-primary" href="#start">5 分钟起跑</a>
+      <a class="cta-ghost" href="#layers">先看分层</a>
+    </div>
+    <p class="hero-proof">在产底线：单进程、零外部依赖、内置 SQLite + FTS；任何车道失败都优雅降级——不 5xx、不中断会话。</p>
+  </div>
+
+  <aside class="digest" aria-label="运行中的记忆河">
+    <p class="digest-title">记忆河 · live</p>
+    <ul class="digest-list" id="digestList"></ul>
+    <p class="digest-foot">琥珀 = 新写入 · 青 = 语义召回 · 灰 = 接替退役</p>
+  </aside>
+</section>
+
+<section class="layers" id="layers" aria-label="四层记忆">
+  <div class="container">
+    <header class="sec-head">
+      <p class="sec-num">01</p>
+      <h2 class="sec-title">四层记忆 · L0 → L3</h2>
+      <p class="sec-lead">不是一层记忆用力撑平，而是四层位各自归位、各司其职。写完立即可召回，召回之后由 supersede 决定谁才该被信。</p>
+    </header>
+
+    <ul class="layer-stack">
+      <li class="layer" data-layer="L0">
+        <div class="layer-bar"><span class="layer-fill" style="--w:100%"></span></div>
+        <div class="layer-meta">
+          <h3><strong>L0</strong> observations</h3>
+          <p>原始事件流。每一个 tool 调用、每一轮会话、每一次往返，都按原始时间戳落盘——不评估、不改写，是蒸馏的原料级原始素材。</p>
+        </div>
+      </li>
+      <li class="layer" data-layer="L1">
+        <div class="layer-bar"><span class="layer-fill" style="--w:82%"></span></div>
+        <div class="layer-meta">
+          <h3><strong>L1</strong> notes + handoffs</h3>
+          <p>亲笔记与跨成员交接。写后立即进入双维召回（query 相关 top-3 + 新近 top-5）。写后约 1 分钟被写触发蒸馏接上，约 2 分钟就成为可检索的 L2。</p>
+        </div>
+      </li>
+      <li class="layer" data-layer="L2">
+        <div class="layer-bar"><span class="layer-fill" style="--w:66%"></span></div>
+        <div class="layer-meta">
+          <h3><strong>L2</strong> facts + experiences</h3>
+          <p>蒸馏过的结构化知识。检索对全库页面打分（向量 + 字段加权），词面不重合而语义最近的页也清晰可达。</p>
+        </div>
+      </li>
+      <li class="layer layer-roadmap" data-layer="L3">
+        <div class="layer-bar"><span class="layer-fill" style="--w:34%"></span></div>
+        <div class="layer-meta">
+          <h3><strong>L3</strong> profiles (roadmap)</h3>
+          <p>用户偏好画像。按 owner 聚合的跨项目偏好抽取，注入时提供「这个用户是谁」。当前处于路线图位置。</p>
+        </div>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section class="recall" id="recall" aria-label="召回三维防护">
+  <div class="container">
+    <header class="sec-head">
+      <p class="sec-num">02</p>
+      <h2 class="sec-title">召回三维防护</h2>
+      <p class="sec-lead">全向量检索解除关键词限流；字段加权保关键词；双维 note 保证新写进的均能检索到。</p>
+    </header>
+
+    <div class="lanes">
+      <article class="lane">
+        <header class="lane-head">
+          <h3>向量 · 全库扫描</h3>
+          <span class="lane-tag">semantic</span>
+        </header>
+        <p>不再以「关键词召回的候选」为限。向量对全库页面逐张打分——词面不重合但语义最近的页也清晰可达，得分即召回秩。</p>
+      </article>
+      <article class="lane">
+        <header class="lane-head">
+          <h3>关键词 · 字段加权</h3>
+          <span class="lane-tag">title ×3 / keys ×2 / body ×1</span>
+        </header>
+        <p>慢 embed 时也一样稳：title 命中记 3 分、search_keys 记 2 分、body 记 1 分——标题命中的才是真主题，正文顺带提到的不加分。</p>
+      </article>
+      <article class="lane">
+        <header class="lane-head">
+          <h3>Note · 双维召回</h3>
+          <span class="lane-tag">query ≤3 + recent ≤5</span>
+        </header>
+        <p>新近不是唯一入口——相关才是。query 匹配的 note 排在最前，再由新近补齐到至多 5 条；两层合起来，旧 note 不靠新近度也能被召回。</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="dedup" id="dedup" aria-label="接替去重">
+  <div class="container">
+    <header class="sec-head">
+      <p class="sec-num">03</p>
+      <h2 class="sec-title">接替 · supersede</h2>
+      <p class="sec-lead">一件事改了？最新的结论是你该信的。旧版本保留可查，但读面永远只看到最新那一条。</p>
+    </header>
+
+    <figure class="supersede-demo" aria-label="接替示例">
+      <figcaption>生产 evidence：两个版本的部署目标简述</figcaption>
+      <div class="sup-lanes">
+        <div class="sup-row sup-old">
+          <span class="sup-state sup-retired">v1 · 已接替</span>
+          <span class="sup-text">部署目标 cheap-4，所有演示流量走 cheap-4。</span>
+        </div>
+        <div class="sup-arrow" aria-hidden="true">
+          <span class="sup-arrow-label">superseded by</span>
+          <svg viewBox="0 0 60 14" width="60" height="14" aria-hidden="true"><line x1="0" y1="7" x2="52" y2="7" stroke="currentColor" stroke-width="1" stroke-dasharray="3 3"/><polyline points="46,3 52,7 46,11" fill="none" stroke="currentColor" stroke-width="1"/></svg>
+        </div>
+        <div class="sup-row sup-new">
+          <span class="sup-state sup-live">v2 · 当前</span>
+          <span class="sup-text">更正：部署目标已改为 cheap-8，cheap-4 退役，所有演示流量改走 cheap-8。</span>
+        </div>
+      </div>
+    </figure>
+
+    <p class="dedup-note">没有「哪个版本对」的分歧——被接替的旧版只用来审计与复盘；读面永远给最新一条结论。</p>
+  </div>
+</section>
+
+<section class="metrics" aria-label="可观测">
+  <div class="container">
+    <article class="metric-card">
+      <header class="metric-head">观测面 · /admin/metrics</header>
+      <dl class="metric-grid">
+        <div><dt>digest_rung</dt><dd>vector · keyword · cooling <small>占比可回放</small></dd></div>
+        <div><dt>embed</dt><dd>ms p50 / p90 / max <small>+ 失败原因分桶</small></dd></div>
+        <div><dt>distill</dt><dd>runs · pages · tokens · failures <small>日预算 600k/owner</small></dd></div>
+        <div><dt>cursor</dt><dd>note_cursor · handoff_cursor · obs_cursor <small>按项目按 owner</small></dd></div>
+      </dl>
+    </article>
+  </div>
+</section>
+
+<section class="start" id="start" aria-label="快速起跑">
+  <div class="container">
+    <header class="sec-head">
+      <p class="sec-num">04</p>
+      <h2 class="sec-title">5 分钟起跑</h2>
+      <p class="sec-lead">CLI 发第一枚 bootstrap token，再用它发一枚人根 token，就能问记忆——全程不需要任何外部用户的 token。</p>
+    </header>
+
+    <div class="steps">
+      <div class="step">
+        <p class="step-num">01</p>
+        <div class="step-body">
+          <p>装依赖并构建（Node ≥ 22.5）</p>
+          <pre class="code"><code>npm ci && npm run build</code></pre>
+        </div>
+      </div>
+      <div class="step">
+        <p class="step-num">02</p>
+        <div class="step-body">
+          <p>本地启动（内置 SQLite+FTS，零外部依赖）</p>
+          <pre class="code"><code>./dist/index.js serve --port 4000 &amp;
+curl http://127.0.0.1:4000/healthz  # → {"status":"ok"}</code></pre>
+        </div>
+      </div>
+      <div class="step">
+        <p class="step-num">03</p>
+        <div class="step-body">
+          <p>发 bootstrap token（CLI 自举）</p>
+          <pre class="code"><code>./dist/index.js token mint \
+  --kind platform --namespace '*' \
+  --label bootstrap</code></pre>
+        </div>
+      </div>
+      <div class="step">
+        <p class="step-num">04</p>
+        <div class="step-body">
+          <p>用它发一枚人根 token，问记忆</p>
+          <pre class="code"><code>curl -X POST localhost:4000/admin/mint \
+  -H "authorization: Bearer $BOOT" \
+  -d '{"namespace":"u/demo"}'
+# person token → /digest</code></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="license">
+  <div class="container license-inner">
+    <h2 class="sec-title">MIT License</h2>
+    <p class="license-copy">use it · change it · deploy it · sell it — MIT。多 agent 协同的许可底色：一份许可、一处成功，能拿走随意用。</p>
+    <p class="license-more">@deepseek-ai/yongyi · 寻数科技 Base-line · 2026</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="foot">
+  <div class="container foot-inner">
+    <span>永忆（YongYi）· fd-memory 品牌化名</span>
+    <span class="foot-right">
+      <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/README.md">README</a> ·
+      <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/LICENSE">LICENSE</a> ·
+      <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/docs/eval-continue.md">evidence report</a>
+    </span>
+  </div>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
