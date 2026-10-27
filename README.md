@@ -42,7 +42,7 @@ FD-memory 把这些收敛到一个服务里，让记忆是**案件内层**（L0 
 
 - **单进程 Node**：零外部依赖（内置 SQLite + FTS5），`fd-memory serve`
 - **可插拔蒸馏器**：不启动 sidecar 也可以用全部读写面；装上后 L2 蒸馏自动分层
-- **NPM 包**：`npm pack` 一件脱机交付（src + scripts + Docker + fixtures）；发布面定型 `@deepseek-ai/yongyi`（`yongyi --help`）
+- **NPM 包**：`npm pack` 一件脱机交付（src + scripts + Docker + fixtures）；发布面定型 `@finddatatechnology/yongyi`（`yongyi --help`）
 
 ## 快速启动（约 2 分钟）
 
@@ -150,7 +150,7 @@ distiller/             # Python sidecar（LLM/嵌入调用——可以装起来�
 - [x] 内部硬编码为零（src/ 无内部 IP/秘密/内部项目名）
 - [ ] 公开 CI 通到公开镜像仓库（ghcr.io / Docker Hub）
 - [ ] L0-L2 公开开发文档（当前 docs 是生产 runbook，面向运维）
-- [ ] 公开 NPM 包（fd-memory 当前 `private: true`，准备作为 `@deepseek-ai/fd-memory`）
+- [ ] 公开 NPM 包（fd-memory 当前 `private: true`，准备作为 `@finddatatechnology/yongyi`）
 
 ## License
 

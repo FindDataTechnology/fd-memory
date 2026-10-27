@@ -25,7 +25,7 @@ Not a vector store (raw recall never sees the session file), and not a chat fram
 - **Fundamentals:** markdown truth wiki + derived SQLite indexes; token authority by family (runner / platform / person / deployment/pod); root isolation per owner; supersede-aware L2; echo dedup; full-scan vector + field-weighted keyword recall; dual-dimension notes
 - **Built on it (internal):** 壹座 平台、万星（微信）、集群与 cron 引擎、agent 会话
 - **Design home:** Chinese-first. zh-CN leads every surface; en is readable but secondary, never the lead.
-- **Packaging reality:** multi-root memory per user/agent/pack; a public OSS build path exists (`Dockerfile` + `npm pack`; decided 2026-10-26 the public package name is `@deepseek-ai/yongyi`).
+- **Packaging reality:** multi-root memory per user/agent/pack; a public OSS build path exists (`Dockerfile` + `npm pack`; decided 2026-10-26 the public package name is `@finddatatechnology/yongyi`).
 
 ## Capabilities and Constraints
 
@@ -40,7 +40,7 @@ Confirmed constraints:
 
 ## Brand Commitments
 
-Name canon: **永忆（YongYi）** — owner choice on 2026-10-26 as fd-memory's public brand. Package name `@deepseek-ai/yongyi` confirmed same session. `fd-memory` stays as the internal code root and Docker image during transition; public surfaces use 永忆 first. License MIT. Typeface/identity are new (no reuse of paas/Platform).
+Name canon: **永忆（YongYi）** — owner choice on 2026-10-26 as fd-memory's public brand. Package name corrected to `@finddatatechnology/yongyi` on 2026-10-27 (publish org follows the owner's npm account, not the dsh scope). `fd-memory` stays as the internal code root and Docker image during transition; public surfaces use 永忆 first. License MIT. Typeface/identity are new (no reuse of paas/Platform).
 
 ## Evidence on Hand
 
