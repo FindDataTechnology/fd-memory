@@ -9,5 +9,9 @@ These are the review/preview game captures of `/site/index.html`, all produced b
 | /tmp/yongyi-mobile.png              | same URL, Playwright Chromium `--viewport-size=390,844`                   | AI draw none    | 2026-10-27T08:25Z |
 | /tmp/yongyi-mobile-v2.png           | same URL after CSS/layout fixes #1–#5, same viewport                      | AI draw none    | 2026-10-27T08:27Z |
 | /tmp/yongyi-full.png                | same URL, `--full-page`                                                   | AI draw none    | 2026-10-27T08:28Z |
+| /tmp/yongyi-desktop-v3.png          | same URL after finish-review FIX round (typography, digest copy, hero copy) | AI draw none    | 2026-10-27T09:14Z |
+| /tmp/yongyi-mobile-v3.png           | same URL after FIX round, same mobile viewport                            | AI draw none    | 2026-10-27T09:14Z |
+| /tmp/yongyi-desktop-final.png       | same URL, ship state (SVG hover restored, digest read-only, glass removed) | AI draw none   | 2026-10-27T09:36Z |
+| /tmp/yongyi-mobile-final.png        | same URL, ship state, same mobile viewport                                 | AI draw none   | 2026-10-27T09:36Z |
 
 The artifact itself contains **no third-party images**: the constellation, rings, supersede arc, legend dots, and written content are all self-drawn SVG + local CSS. Google Fonts CDN (`fonts.googleapis.com`) loads `Noto Serif SC` + `IBM Plex Mono`; those are public-font-library references, not hosted assets, and they carry no `crossorigin` or integrity requirement (fallbacks in css: Songti SC / SF Mono).
