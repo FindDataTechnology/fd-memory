@@ -145,6 +145,7 @@ a:focus-visible {
   position: absolute;
   inset: 0 0 0 8%;
   z-index: 0;
+  overflow: hidden;
 }
 .hero-left {
   position: relative;

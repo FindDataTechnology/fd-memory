@@ -112,14 +112,14 @@
   }
 
   /* supersede arc between a dim old node and a bright new one */
-  var oldNode = circle(CX + 250, CY - 160, 4, "#5a5345", null);
-  circle(CX + 250, CY - 160, 9, "none", "#5a5345", "2 4");
-  label(CX + 250, CY - 190, "v1 · superseded", 11, "#7d7663");
-  var newNode = circle(CX + 330, CY - 120, 6, "#e8b45e", null);
-  circle(CX + 330, CY - 120, 12, "none", "#e8b45e", "2 4");
-  label(CX + 330, CY - 96, "v2 · candidate", 11.5, "#e8b45e");
+  var oldNode = circle(CX + 150, CY - 160, 4, "#5a5345", null);
+  circle(CX + 150, CY - 160, 9, "none", "#5a5345", "2 4");
+  label(CX + 150, CY - 190, "v1 · superseded", 11, "#7d7663");
+  var newNode = circle(CX + 180, CY - 120, 6, "#e8b45e", null);
+  circle(CX + 180, CY - 120, 12, "none", "#e8b45e", "2 4");
+  label(CX + 180, CY - 96, "v2 · candidate", 11.5, "#e8b45e");
 
-  var arcPath = "M " + (CX + 250) + " " + (CY - 150) + " Q " + (CX + 300) + " " + (CY - 150) + " " + (CX + 330) + " " + (CY - 132);
+  var arcPath = "M " + (CX + 150) + " " + (CY - 150) + " Q " + (CX + 175) + " " + (CY - 150) + " " + (CX + 180) + " " + (CY - 132);
   var arc = document.createElementNS(NS, "path");
   arc.setAttribute("d", arcPath);
   arc.setAttribute("fill", "none");
