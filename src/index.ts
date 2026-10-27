@@ -1,4 +1,5 @@
-// fd-memory entry: `serve` (default), `token mint|list|revoke`, `reindex`.
+#!/usr/bin/env node
+// YongYi entry: `serve` (default), `token mint|list|revoke`, `reindex`.
 
 import { Service } from "./http.js";
 import { TokenStore } from "./auth.js";
@@ -15,12 +16,12 @@ function pepper(): string {
 const cmd = process.argv[2] ?? "serve";
 
 if (cmd === "--help" || cmd === "help") {
-  console.log(`fd-memory — fleet working-memory service
+  console.log(`yongyi (永忆) — long-term working-memory service
 usage:
-  fd-memory serve [--port N]        start the HTTP service (default)
-  fd-memory token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]
-  fd-memory token list
-  fd-memory token revoke --id <id>
+  yongyi serve [--port N]        start the HTTP service (default)
+  yongyi token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]
+  yongyi token list
+  yongyi token revoke --id <id>
 env:
   FD_MEMORY_DATA     data directory (default ~/Library/Application Support/fd-memory)
   FD_MEMORY_PEPPER   token hash pepper (set this in production)
