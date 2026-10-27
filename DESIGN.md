@@ -49,6 +49,12 @@
 - `style.css` — tokens + layout + layout + monochrome prose styles
 - `script.js` — constellation canvas + digest flow + supersede-hover wiring (dead code merged into the write-flash moment)
 
+## Surface: memory-landing (2026-10-28)
+
+`site/memory-landing/index.html` — human entry page for the API host `memory.finddatatech.cloud` (overseas visitors land here first; must explain the endpoint and link back to the main site). Self-contained single file: inline CSS, zero external font requests, system fallback stack (Noto Serif SC → Georgia/Songti; IBM Plex Mono → ui-monospace). Shared tokens (`--bg/--ink/--cyan/--amber`) inline-copied from this file.
+
+Finish-review verdict: **SHIP** (8/8 pass, 2026-10-28). Recorded exception: amber doubles here as an *attention* mark (Bearer emphasis + GET/POST method labels) since the page has no live-write semantics — judged spirit-compliant with the amber rule (semantic, sparing, non-systemic). If a future main-site re-review tightens, demote the method labels to `--ink-dim` (one CSS line).
+
 ## Never
 
 - No invented pricing, benchmarks, production customer claims, or mission control styled clock

@@ -17,3 +17,9 @@ These are the review/preview game captures of `/site/index.html`, all produced b
 | /tmp/yongyi-mobile-final2.png       | same URL after FIX round 3, same mobile viewport — SHIP verdict            | AI draw none   | 2026-10-27T13:35Z |
 
 The artifact itself contains **no third-party images**: the constellation, rings, supersede arc, legend dots, and written content are all self-drawn SVG + local CSS. Google Fonts CDN (`fonts.googleapis.com`) loads `Noto Serif SC` + `IBM Plex Mono`; those are public-font-library references, not hosted assets, and they carry no `crossorigin` or integrity requirement (fallbacks in css: Songti SC / SF Mono).
+
+| /tmp/yongyi-landing-desktop.png     | `playwright screenshot http://127.0.0.1:49381/memory-landing/index.html`  | AI draw none    | 2026-10-28T06:34Z |
+| /tmp/yongyi-landing-mobile.png      | same URL, Playwright Chromium `--viewport-size=390,844`                   | AI draw none    | 2026-10-28T06:34Z |
+| /tmp/yongyi-landing-full.png        | same URL, `--full-page`                                                   | AI draw none    | 2026-10-28T06:34Z |
+
+The memory-landing surface (site/memory-landing/index.html) ships no rasters at all — one hand-authored inline SVG constellation ornament; finish-review SHIP 8/8 (2026-10-28).
