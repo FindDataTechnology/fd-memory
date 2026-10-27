@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>永忆 YongYi — 记忆服务 API 入口 / Memory API</title>
+<meta name="description" content="永忆（YongYi）记忆服务的 API 端点。/mcp · /digest · /healthz。官网与快速开始：yongyi.finddatatech.cloud">
+<style>
+:root{
+  --bg:#070c17; --bg-2:#0b1220; --line:#1b2739;
+  --ink:#e9e2d2; --ink-dim:#b6ac97; --ink-faint:#978e79;
+  --cyan:#4fd0d8; --amber:#e8b45e;
+  --serif:"Noto Serif SC",Georgia,"Songti SC","Noto Serif",serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0; background:radial-gradient(120% 90% at 70% 10%,var(--bg-2) 0%,var(--bg) 58%);
+  color:var(--ink); font-family:var(--serif); line-height:1.7;
+  display:grid; place-items:center; padding:48px 24px;
+}
+::selection{background:rgba(232,180,94,.32); color:#fff}
+a{color:var(--cyan); text-decoration:none; text-underline-offset:3px}
+a:hover{text-decoration:underline}
+a:focus-visible,button:focus-visible{outline:2px solid var(--amber); outline-offset:3px; border-radius:4px}
+main{width:100%; max-width:660px; min-width:0}
+.sky{width:100%; height:120px; display:block; margin:0 auto 28px; overflow:visible}
+.brand{display:flex; align-items:baseline; gap:12px; flex-wrap:wrap}
+.brand h1{margin:0; font-size:clamp(28px,4vw,38px); font-weight:600; letter-spacing:.02em}
+.brand .en{font-family:var(--mono); font-size:12px; letter-spacing:.16em; text-transform:uppercase; color:var(--ink-faint)}
+.lede{margin:14px 0 6px; color:var(--ink-dim); font-size:16.5px}
+.lede-en{margin:0 0 26px; color:var(--ink-faint); font-size:14.5px; font-family:var(--mono); line-height:1.75}
+.cta{display:flex; gap:12px; flex-wrap:wrap; margin:0 0 30px}
+.btn{
+  display:inline-flex; align-items:center; gap:8px; padding:11px 20px; border-radius:999px;
+  font-size:14.5px; font-family:var(--serif); border:1px solid var(--cyan);
+  color:var(--bg); background:var(--cyan); transition:background .18s ease, color .18s ease, border-color .18s ease;
+}
+.btn:hover{text-decoration:none; background:#7fe0e6; border-color:#7fe0e6}
+.btn.ghost{background:transparent; color:var(--ink-dim); border-color:var(--line)}
+.btn.ghost:hover{color:var(--ink); border-color:var(--ink-faint)}
+.panel{border:1px solid var(--line); border-radius:14px; background:rgba(11,18,32,.72); padding:18px 20px; min-width:0}
+.panel h2{margin:0 0 10px; font-size:13px; letter-spacing:.12em; text-transform:uppercase; color:var(--ink-faint); font-family:var(--mono); font-weight:500}
+.panel p{margin:0 0 12px; font-size:14px; color:var(--ink-dim)}
+pre{
+  max-width:100%;
+  margin:0; padding:14px 16px; background:#060a12; border:1px solid var(--line); border-radius:10px;
+  overflow-x:auto; font-family:var(--mono); font-size:12.8px; line-height:1.8; color:var(--ink-dim);
+}
+pre b{color:var(--amber); font-weight:500}
+pre .c{color:var(--ink-faint)}
+footer{margin-top:30px; display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap;
+  font-family:var(--mono); font-size:11.5px; letter-spacing:.06em; color:var(--ink-faint)}
+@media (prefers-reduced-motion:no-preference){
+  main{animation:rise .7s cubic-bezier(.16,1,.3,1) both}
+  @keyframes rise{from{opacity:0; transform:translateY(12px)} to{opacity:1; transform:none}}
+}
+</style>
+</head>
+<body>
+<main>
+  <svg class="sky" viewBox="0 0 660 120" role="img" aria-label="永忆星图：中心为当前会话，三条轨道承载笔记、经验与画像">
+    <g fill="none" stroke="#1b2739">
+      <ellipse cx="330" cy="60" rx="210" ry="44"/>
+      <ellipse cx="330" cy="60" rx="140" ry="30"/>
+      <ellipse cx="330" cy="60" rx="74" ry="16"/>
+    </g>
+    <g stroke="#269fa8" stroke-opacity=".45">
+      <line x1="330" y1="60" x2="212" y2="36"/>
+      <line x1="330" y1="60" x2="450" y2="82"/>
+      <line x1="330" y1="60" x2="452" y2="34"/>
+    </g>
+    <circle cx="330" cy="60" r="7" fill="#e8b45e"/>
+    <circle cx="330" cy="60" r="15" fill="none" stroke="#e8b45e" stroke-opacity=".55" stroke-dasharray="2 4"/>
+    <circle cx="212" cy="36" r="4" fill="#4fd0d8"/>
+    <circle cx="450" cy="82" r="4" fill="#4fd0d8"/>
+    <circle cx="452" cy="34" r="3.4" fill="#7d7663"/>
+    <g fill="#978e79" font-family="'IBM Plex Mono',ui-monospace,monospace" font-size="10">
+      <text x="330" y="96" text-anchor="middle" fill="#7d7663">L0·L1·L2 · owner root</text>
+    </g>
+  </svg>
+
+  <div class="brand">
+    <h1>永忆 · API 入口</h1>
+    <span class="en">YongYi — memory service endpoint</span>
+  </div>
+  <p class="lede">这里是永忆记忆服务的接口端点。官网、设计说明与五分钟上手指南在 <a href="https://yongyi.finddatatech.cloud/">yongyi.finddatatech.cloud</a>。</p>
+  <p class="lede-en">This host serves the YongYi memory service API. For the product site, docs and the five-minute quickstart, visit yongyi.finddatatech.cloud.</p>
+
+  <div class="cta">
+    <a class="btn" href="https://yongyi.finddatatech.cloud/">前往官网 <span aria-hidden="true">→</span></a>
+    <a class="btn ghost" href="https://yongyi.finddatatech.cloud/#start">五分钟上手</a>
+  </div>
+
+  <section class="panel" aria-label="接口一览 / Endpoints">
+    <h2>Endpoints</h2>
+    <p>所有请求走 <b style="color:var(--amber);font-weight:500">Authorization: Bearer &lt;token&gt;</b>；<code style="font-family:var(--mono)">/healthz</code> 除外，它公开只读。</p>
+    <pre><span class="c"># 健康检查 / health probe</span>
+GET  https://memory.finddatatech.cloud/healthz
+
+<span class="c"># 平台接缝读面 / platform-seam digest</span>
+GET  https://memory.finddatatech.cloud/digest?q=...&amp;k=5
+
+<span class="c"># MCP（streamable-http）
+</span>POST https://memory.finddatatech.cloud/mcp   <span class="c">// JSON-RPC</span></pre>
+  </section>
+
+  <footer>
+    <span>永忆 YongYi · 本地优先的长期记忆</span>
+    <span>© 2026 FindData · MIT</span>
+  </footer>
+</main>
+</body>
+</html>
