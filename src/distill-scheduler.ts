@@ -13,7 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
-import { noteDistill } from "./metrics.js";
+import { noteDistill, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -147,7 +147,34 @@ export class DistillScheduler {
   }
 
   private async embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> {
-    return sidecarEmbed(this.opts.env ?? process.env, texts, this.opts.fetchImpl ?? fetch, this.url());
+    const out = await sidecarEmbed(this.opts.env ?? process.env, texts, this.opts.fetchImpl ?? fetch, this.url());
+    this.checkModelConsistency(out.model);
+    return out;
+  }
+
+  // First-embed self-check (2026-10-28): the sidecar's CURRENT model is only
+  // knowable from a response. The moment the process learns it, compare it
+  // against every discoverable root's dominant model — a mismatch means that
+  // root's whole vector history is excluded from recall RIGHT NOW, silently.
+  // Once per model per process; the log line is the alarm, /admin/reembed is
+  // the fix.
+  private modelChecked = false;
+  private modelWarned = new Set<string>();
+  private checkModelConsistency(current: string): void {
+    if (this.modelChecked || !current) return;
+    this.modelChecked = true;
+    try {
+      const keys = new Set<string>([...this.opts.roots.keys(), ...(this.opts.discoverRoots?.() ?? [])]);
+      for (const key of keys) {
+        if (!isDistillableRoot(key, this.opts.env)) continue;
+        let root: StoreRoot;
+        try { root = this.opts.roots.get(key) ?? this.opts.openRoot(key); } catch { continue; }
+        const dom = root.db.dominantVectorModel();
+        if (!dom || dom.model === current || this.modelWarned.has(dom.model)) continue;
+        this.modelWarned.add(dom.model);
+        this.log.warn(`[vector] ${key}: dominant model ${dom.model} != sidecar model ${current} — ${dom.n} vector(s) are EXCLUDED from recall right now; re-embed via POST /admin/reembed`);
+      }
+    } catch { /* best-effort: never block the embed lane */ }
   }
 
   // Force a project through now (tests); respects inflight + backoff.
@@ -362,13 +389,13 @@ export class DistillScheduler {
             const entry = normalizeEntry(fact, "fact");
             entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
             const rel = root.writeDistillPage(project, "fact", entry, audit);
-            writeEntryVector(root, rel, fact);
+            writeEntryVector(root, rel, fact, this.log);
           }
           for (const exp of result.experiences ?? []) {
             const entry = normalizeEntry(exp, "experience");
             entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
             const rel = root.writeDistillPage(project, "experience", entry, audit);
-            writeEntryVector(root, rel, exp);
+            writeEntryVector(root, rel, exp, this.log);
           }
           spentTotal += result.tokens ?? 0;
           return (result.facts?.length ?? 0) + (result.experiences?.length ?? 0);
@@ -431,13 +458,13 @@ export class DistillScheduler {
         const entry = normalizeEntry(fact, "fact");
         entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
         const rel = root.writeDistillPage(project, "fact", entry, audit);
-        writeEntryVector(root, rel, fact);
+        writeEntryVector(root, rel, fact, this.log);
       }
       for (const exp of result.experiences ?? []) {
         const entry = normalizeEntry(exp, "experience");
         entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
         const rel = root.writeDistillPage(project, "experience", entry, audit);
-        writeEntryVector(root, rel, exp);
+        writeEntryVector(root, rel, exp, this.log);
       }
       const maxRid = obs.length ? Math.max(...obs.map((o) => o.rid)) : (state?.obs_cursor ?? 0);
       const maxHandoff = handoffs.length ? handoffs[handoffs.length - 1].created_at : (state?.handoff_cursor ?? "");
@@ -578,7 +605,13 @@ export async function hybridCandidates(opts: {
     const vectorIds = new Set(scored.map((x) => x.id));
     const merged = [...scored, ...keyword.filter((x) => !vectorIds.has(x.id)).map((x) => ({ ...x, score: -1 }))];
     const modelMismatch = root.db.vectorModelCounts().filter((m) => m.model !== q.model).reduce((a, m) => a + m.n, 0);
-    if (modelMismatch > 0) log?.warn(`[hybrid] ${project}: ${modelMismatch} vector(s) on other models — excluded from cosine (gap noted)`);
+    if (modelMismatch > 0) {
+      noteVectorEvent("mismatch_excluded", modelMismatch);
+      // The recall gap is silent by construction (the filter simply hides the
+      // rows), so this warning is the only signal that a model switch
+      // stranded history. Actionable fix: POST /admin/reembed.
+      log?.warn(`[hybrid] ${project}: ${modelMismatch} vector(s) on other models EXCLUDED from cosine — recall is running on a partial corpus; re-embed via POST /admin/reembed`);
+    }
     return merged.slice(0, k);
   } catch (e) {
     log?.warn(`[hybrid] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
@@ -586,11 +619,29 @@ export async function hybridCandidates(opts: {
   }
 }
 
-function writeEntryVector(root: StoreRoot, rel: string, entry: Record<string, unknown>): void {
+function writeEntryVector(root: StoreRoot, rel: string, entry: Record<string, unknown>, log?: { warn: (m: string) => void }): void {
   const v = (entry as { vector?: unknown }).vector;
   if (Array.isArray(v) && v.length > 0) {
     try {
-      root.db.setPageVector(rel, String((entry as { vector_model?: unknown }).vector_model ?? ""), new Float32Array(v as number[]));
+      const model = String((entry as { vector_model?: unknown }).vector_model ?? "").trim();
+      if (!model) {
+        // The sidecar did not name its model: the vector could never be
+        // matched by a query (allPageVectors filters by model), so storing it
+        // is silent loss. Skip and count.
+        noteVectorEvent("skipped_no_model");
+        log?.warn(`[vector] ${rel}: embed response carried no model name — vector not stored`);
+        return;
+      }
+      const out = root.db.setPageVectorGuarded(rel, model, new Float32Array(v as number[]), {
+        policy: process.env.FD_MEMORY_EMBED_GUARD === "allow" ? "allow" : "reject",
+      });
+      if (!out.written) {
+        noteVectorEvent("writes_rejected");
+        log?.warn(`[vector] ${rel}: REFUSED off-model embedding (model=${model}, store dominant=${out.dominant}) — the vector space must stay single-model; re-embed via POST /admin/reembed if the switch was intentional`);
+      } else if (out.reason === "model_mismatch_allowed") {
+        noteVectorEvent("writes_allowed");
+        log?.warn(`[vector] ${rel}: off-model embedding stored by policy (model=${model}, dominant=${out.dominant}) — cosine against the dominant space is invalid until re-embedded`);
+      }
     } catch { /* companion store is never load-bearing */ }
   }
 }

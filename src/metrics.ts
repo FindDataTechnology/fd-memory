@@ -15,6 +15,17 @@ const digestRungs = { vector: 0, keyword: 0, cooling: 0 };
 const embedSamples: EmbedSample[] = [];
 const EMBED_SAMPLE_CAP = 200;
 const distills = { runs: 0, pages: 0, tokens: 0, failures: 0, lastError: "" as string };
+// Embedding-model consistency (2026-10-28): the vector space is only valid
+// while every stored vector and every query embedding come from ONE model.
+// These counters make drift observable from a single /admin/metrics read.
+const vectors = {
+  mismatch_excluded: 0, // vectors skipped by the model filter at query time
+  writes_rejected: 0, // guard refused a write whose model differs from the dominant
+  writes_allowed: 0, // guard allowed (policy=allow) an off-model write
+  skipped_no_model: 0, // sidecar returned no model name — vector NOT stored
+  reembed_runs: 0, // /admin/reembed executions
+  reembedded_pages: 0,
+};
 const startedAt = new Date().toISOString();
 
 export function noteDigestRung(rung: "vector" | "keyword" | "cooling"): void {
@@ -24,6 +35,11 @@ export function noteDigestRung(rung: "vector" | "keyword" | "cooling"): void {
 export function noteEmbedSample(s: EmbedSample): void {
   embedSamples.push(s);
   if (embedSamples.length > EMBED_SAMPLE_CAP) embedSamples.shift();
+}
+
+export type VectorEvent = "mismatch_excluded" | "writes_rejected" | "writes_allowed" | "skipped_no_model" | "reembed_runs" | "reembedded_pages";
+export function noteVectorEvent(kind: VectorEvent, n = 1): void {
+  vectors[kind] += n;
 }
 
 export function noteDistill(ok: boolean, pages: number, tokens: number, error?: string): void {
@@ -68,6 +84,7 @@ export function metricsSnapshot(): Record<string, unknown> {
       failure_reasons: reasons,
     },
     distill: { runs: distills.runs, pages: distills.pages, tokens: distills.tokens, failures: distills.failures, last_error: distills.lastError },
+    vectors: { ...vectors },
   };
 }
 
@@ -82,4 +99,10 @@ export function __resetMetrics(): void {
   distills.tokens = 0;
   distills.failures = 0;
   distills.lastError = "";
+  vectors.mismatch_excluded = 0;
+  vectors.writes_rejected = 0;
+  vectors.writes_allowed = 0;
+  vectors.skipped_no_model = 0;
+  vectors.reembed_runs = 0;
+  vectors.reembedded_pages = 0;
 }

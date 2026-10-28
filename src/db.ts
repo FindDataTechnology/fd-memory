@@ -428,10 +428,41 @@ export class RootDb {
   // truth. Written with distill pages, deleted with them (forget/drop).
 
   setPageVector(pageRel: string, model: string, vector: Float32Array): void {
+    if (!model || !String(model).trim()) {
+      // An unnamed model can never match a query (allPageVectors filters by
+      // model), so storing it would be a silent loss. Programmer error.
+      throw new Error("setPageVector: model is required");
+    }
     this.db.prepare(
       `INSERT INTO page_vectors (page_rel, model, dim, vector) VALUES (?,?,?,?)
        ON CONFLICT(page_rel) DO UPDATE SET model=excluded.model, dim=excluded.dim, vector=excluded.vector`,
     ).run(pageRel, model, vector.length, Buffer.from(vector.buffer, vector.byteOffset, vector.byteLength));
+  }
+
+  // The model most vectors already live under — the space a new write must
+  // belong to for cosine similarity to mean anything.
+  dominantVectorModel(): { model: string; n: number } | null {
+    const row = this.db.prepare("SELECT model, COUNT(*) AS n FROM page_vectors GROUP BY model ORDER BY n DESC LIMIT 1").get() as { model: string; n: number } | undefined;
+    return row ?? null;
+  }
+
+  // Consistency guard (2026-10-28): one embedding model per store, enforced at
+  // write time. A vector from another model is not "slightly worse recall" —
+  // cosine across model spaces is meaningless, and allPageVectors() would hide
+  // the row anyway, so writing it is pure loss. policy=reject (default) turns
+  // that loss into a loud refusal; policy=allow records it for drift audits.
+  setPageVectorGuarded(pageRel: string, model: string, vector: Float32Array, opts: { policy?: "reject" | "allow" } = {}): { written: boolean; reason?: string; dominant?: string } {
+    if (!model || !String(model).trim()) throw new Error("setPageVectorGuarded: model is required");
+    const dominant = this.dominantVectorModel();
+    if (dominant && dominant.model !== model) {
+      if ((opts.policy ?? "reject") === "reject") {
+        return { written: false, reason: "model_mismatch", dominant: dominant.model };
+      }
+      this.setPageVector(pageRel, model, vector);
+      return { written: true, reason: "model_mismatch_allowed", dominant: dominant.model };
+    }
+    this.setPageVector(pageRel, model, vector);
+    return { written: true };
   }
 
   // Full-scan vector read (2026-10-26 recall-cap fix): the hybrid path used to

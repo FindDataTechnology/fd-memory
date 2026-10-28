@@ -15,7 +15,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, metricsSnapshot } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -794,6 +794,59 @@ export class Service {
       const count = root.db.reindexFromWiki(root.wikiDir);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ reindexed: count }));
+    }
+
+    // Rebuild EVERY vector of one root under the sidecar's CURRENT model
+    // (2026-10-28): switching the embedding model strands all existing
+    // vectors — allPageVectors() filters by model, so history silently drops
+    // out of recall. This is the deliberate-switch tool: wipe the derived
+    // store, re-embed fact/experience pages in batches, write under the
+    // guard. Derived data only — markdown truth untouched.
+    if (path === "/admin/reembed" && req.method === "POST") {
+      let rootKey: string;
+      if (scope.kind === "runner" || scope.kind === "platform") {
+        rootKey = String(body.rootKey ?? "");
+        if (!rootKey) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_required" }));
+        }
+      } else if (scope.kind === "person") {
+        rootKey = namespaceParts(scope.namespace).rootKey;
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "service_token_required" }));
+      }
+      const root = this.rootForKey(rootKey);
+      const max = Math.max(1, Number(process.env.FD_MEMORY_REEMBED_MAX_PAGES ?? 2000));
+      const rows = root.db.db.prepare(
+        "SELECT path, title, body FROM pages WHERE type IN ('fact','experience') ORDER BY updated_at DESC LIMIT ?",
+      ).all(max) as Array<{ path: string; title: string; body: string }>;
+      root.db.db.exec("DELETE FROM page_vectors");
+      let reembedded = 0;
+      let failed = 0;
+      let model = "";
+      const BATCH = 32;
+      for (let i = 0; i < rows.length; i += BATCH) {
+        const batch = rows.slice(i, i + BATCH);
+        const texts = batch.map((r) => `${r.title}\n${String(r.body ?? "").replace(/\s+/g, " ").slice(0, 800)}`);
+        try {
+          const out = await sidecarEmbed(process.env, texts, fetch);
+          model = out.model || model;
+          for (let j = 0; j < batch.length; j++) {
+            const vec = out.vectors[j];
+            if (!vec || !out.model) { failed += 1; continue; }
+            const guarded = root.db.setPageVectorGuarded(batch[j].path, out.model, new Float32Array(vec));
+            if (guarded.written) reembedded += 1; else failed += 1;
+          }
+        } catch {
+          failed += batch.length;
+        }
+      }
+      noteVectorEvent("reembed_runs");
+      noteVectorEvent("reembedded_pages", reembedded);
+      console.log(`[reembed] ${rootKey}: model=${model || "?"} reembedded=${reembedded} failed=${failed} (cap=${max})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ rootKey, model, reembedded, failed, cap: max, deleted_previous: true }));
     }
 
     // Memory report for one root: the grants that reach into it (with their
