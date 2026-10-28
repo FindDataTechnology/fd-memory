@@ -34,12 +34,12 @@ test("annotations: layer, confidence, date present on every line", () => {
 test("open handoffs section renders and survives a tight budget", () => {
   const out = renderDigest({
     items: [item({ id: "exp_big", title: "很长的经验".repeat(200) })],
-    handoffs: [{ id: "abcdef123456", summary: "未完成的巡检交接", to_agent: "spider-heal", created_at: "2026-10-24T01:00:00.000Z" }],
+    handoffs: [{ id: "abcdef123456", summary: "未完成的巡检交接", to_agent: "site-heal", created_at: "2026-10-24T01:00:00.000Z" }],
     budgetTokens: 120,
     now: NOW,
   });
   assert.match(out, /### 待认领交接/);
-  assert.match(out, /abcdef12\] 未完成的巡检交接（→ spider-heal，2026-10-24）/);
+  assert.match(out, /abcdef12\] 未完成的巡检交接（→ site-heal，2026-10-24）/);
   // hard cap honored
   assert.ok(estimateTokens(out) <= 120 + 40, `digest within budget+slack, got ${estimateTokens(out)}`);
 });

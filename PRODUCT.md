@@ -23,7 +23,7 @@ Not a vector store (raw recall never sees the session file), and not a chat fram
 - **Product type:** long-term working-memory service, agentic infrastructure (not a consumer assistant, not a data lake)
 - **Run modes:** single-process Node service (`fd-memory serve`), all layers included; optional Python/LLM sidecar for hybrid retrieval/distillation
 - **Fundamentals:** markdown truth wiki + derived SQLite indexes; token authority by family (runner / platform / person / deployment/pod); root isolation per owner; supersede-aware L2; echo dedup; full-scan vector + field-weighted keyword recall; dual-dimension notes
-- **Built on it (internal):** 壹座 平台、万星（微信）、集群与 cron 引擎、agent 会话
+- **Built on it (internal):** agent work platform, IM bridge, cluster and cron engine, agent sessions — deployer-side context, not part of the OSS surface
 - **Design home:** Chinese-first. zh-CN leads every surface; en is readable but secondary, never the lead.
 - **Packaging reality:** multi-root memory per user/agent/pack; a public OSS build path exists (`Dockerfile` + `npm pack`; decided 2026-10-26 the public package name is `@finddatatechnology/yongyi`).
 
@@ -40,12 +40,12 @@ Confirmed constraints:
 
 ## Brand Commitments
 
-Name canon: **永忆（YongYi）** — owner choice on 2026-10-26 as fd-memory's public brand. Package name corrected to `@finddatatechnology/yongyi` on 2026-10-27 (publish org follows the owner's npm account, not the dsh scope). `fd-memory` stays as the internal code root and Docker image during transition; public surfaces use 永忆 first. License MIT. Typeface/identity are new (no reuse of paas/Platform).
+Name canon: **永忆（YongYi）** — owner choice on 2026-10-26 as fd-memory's public brand. Package name corrected to `@finddatatechnology/yongyi` on 2026-10-27 (publish org follows the owner's npm account, not the runtime scope). `fd-memory` stays as the internal code root and Docker image during transition; public surfaces use 永忆 first. License MIT. Typeface/identity are new (no reuse of deployer-side identity assets).
 
 ## Evidence on Hand
 
 - Working product in production: digest face, MCP faces, write-trigger distillation, echo dedup, supersede-aware read faces, full-scan vector retrieval, field-weighted keywords — live behind metrics at `/admin/metrics`.
-- Documentation: `CLAUDE.md` (architecture), `README.md` + MIT license, `docs/eval-continue.md` (19-scenario eval runbook, headroom win 100%), `docs/federation-recipe.md`, `docs/spike-hook-wire.md`, `docs/registry-maintenance.md` (release log).
+- Documentation: `README.md` + MIT license, `docs/DEPLOYMENT.md` (self-hosting tutorial), `docs/eval-continue.md` (eval runbook, headroom win 100%), `docs/federation-recipe.md`, `docs/spike-hook-wire.md`.
 - Specification: `openspec/changes/` + `openspec/specs/` (fleet-memory, memory-distiller, memory-federation, chat-memory, memory-eval) — binding requirements with scenario-level acceptance.
 - Tests: 70+ units + production witnesses in `src/test/` and `scripts/`.
 - Absences the build must not invent: no logo yet, no product screenshots of the website, no press voices, no prices, no benchmarked endpoints.

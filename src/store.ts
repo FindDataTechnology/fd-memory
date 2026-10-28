@@ -62,7 +62,7 @@ export class StoreRoot {
     } catch {
       try {
         execFileSync("git", ["init", "-q"], { cwd: this.wikiDir, stdio: "ignore" });
-        execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@finddata"], { stdio: "ignore" });
+        execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@localhost"], { stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "config", "user.name", "fd-memory"], { stdio: "ignore" });
         this.gitAvailable = true;
       } catch {

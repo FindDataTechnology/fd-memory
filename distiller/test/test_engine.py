@@ -42,8 +42,8 @@ def test_c1_repaired_parse_recovers_damaged_json():
 
 
 def test_sanitize_ports_four_classes():
-    out = engine.sanitize("key sk-abcdefghijklmnop123456 bearer abcdefghijklmnop password: \"hunter2secret\"")
-    assert "sk-abcdefghijklmnop" not in out
+    out = engine.sanitize("key sk-abcdefghijklmnop123456 bearer abcdefghijklmnop password: \"hunter2secret\"")  # leak-check:allow
+    assert "sk-abcdefghijklmnop" not in out  # leak-check:allow
     assert "bearer [REDACTED]" in out
     assert "hunter2secret" not in out
 
@@ -96,11 +96,11 @@ class FactDraft:
 
 
 def test_subject_equal_paths():
-    assert engine.subject_equal("HKCCR.ccs.TencentYun.COM / PAAS / Agent ", "hkccr.ccs.tencentyun.com/paas/agent")
+    assert engine.subject_equal("Registry-Example.IO / Team-A / Agent ", "registry-example.io/team-a/agent")
     assert engine.subject_equal("web/src/pages/UsageTable.tsx", "web/src/pages/UsageTable.tsx ")
     assert not engine.subject_equal("web/src/pages/UsageTable.tsx", "web/src/pages/UsageDetail.tsx")
     # S1 drifted pair: path 1 must NOT equate (that is path 2's job)
-    assert not engine.subject_equal("cheap-2 deploy/agent-api", "cheap-2 上的 deploy/agent-api (namespace serving)")
+    assert not engine.subject_equal("node-a deploy/svc-gateway", "node-a 上的 deploy/svc-gateway (namespace serving)")
 
 
 def fake_provider(responses):
@@ -137,8 +137,8 @@ def test_subject_judge_merges_drifted_pair():
     judge_json = '{"matches": [{"i": 0, "j": 0, "same": true, "reason": "同一车道仅措辞不同"}]}'
     provider, calls = fake_provider(['{"ops": {}}', judge_json])
     rec = Rec()
-    drafts = [FactDraft("cheap-2 上的 deploy/agent-api (namespace serving) 恢复", "cheap-2 deploy/agent-api 车道")]
-    cands = [{"id": "fact_old9", "kind": "fact", "task": "cheap-2 deploy/agent-api 车道 403 排查", "search_keys": [], "solution": "", "boundary_envs": ""}]
+    drafts = [FactDraft("node-a 上的 deploy/svc-gateway (namespace serving) 恢复", "node-a deploy/svc-gateway 车道")]
+    cands = [{"id": "fact_old9", "kind": "fact", "task": "node-a deploy/svc-gateway 车道 403 排查", "search_keys": [], "solution": "", "boundary_envs": ""}]
     out = asyncio.run(engine.reconcile_facts(provider, rec, drafts, cands, ["session:s2"], "d-p/a"))
     assert out[0]["supersedes"] == ["fact_old9"]
     assert any(c["stage"] == "distill_subject_judge" for c in calls)

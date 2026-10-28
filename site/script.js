@@ -151,7 +151,7 @@
     { t: "如何验收记忆系统的 own 与 shared 分区作用域", kind: "cyan", tag: "L2·experience" },
     { t: "舰队里怎么汇报状态和派发任务（report_status · dispatch）", kind: "cyan", tag: "L2·experience" },
     { t: "周报口径（用户要求长期记住）", kind: "live", tag: "L1·note" },
-    { t: "部署目标已改为 cheap-8（cheap-4 退役）", kind: "live", tag: "L1·note → superseded" },
+    { t: "部署目标已改为 node-b（node-a 退役）", kind: "live", tag: "L1·note → superseded" },
     { t: "收到 v2 巡检口径接替 v1", kind: "old", tag: "fact_new supersedes fact_old" },
     { t: "如何监控 GitHub 组织仓库的 star 与 issue 动态", kind: "cyan", tag: "L2·experience" },
     { t: "执行每日 mission-protocol 巡检第 17 轮", kind: "cyan", tag: "L2·experience" }

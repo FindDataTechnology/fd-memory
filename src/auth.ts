@@ -182,7 +182,7 @@ export class TokenStore {
   // owner_key = store rootKey: u-<user> for persons, d-<packId> per deployed
   // pack (packIds are unique per deployer by the serving plane's singleton
   // deployment key, so per-root == per-owner at v1 scale). A guardrail for
-  // visibility, not a billing ledger (sub2api stays the billing truth).
+  // visibility, not a billing ledger (external billing lanes keep their own truth).
 
   distillBudgetUsed(ownerKey: string, day: string): { tokens: number; llm_calls: number } {
     const row = this.db

@@ -34,8 +34,8 @@ function toolsFor(store: TokenStore, data: string, ns: string, kind: "deployment
   return { scope, root, call };
 }
 
-test("eval v0: spider-heal cluster handoff recall", () => {
-  const fx = loadFixture("spider-heal-cluster.json");
+test("eval v0: site-heal cluster handoff recall", () => {
+  const fx = loadFixture("site-heal-cluster.json");
   const data = tmpData();
   try {
     const store = new TokenStore(join(data, "tokens.db"), "pepper");
@@ -48,9 +48,9 @@ test("eval v0: spider-heal cluster handoff recall", () => {
       return r;
     });
     for (const e of fx.capture_events as CaptureEvent[]) {
-      ingest.ingest("d-" + fx.pack, "spider-heal", [e], { principal: "runner:eval", scope: `d/${fx.pack}/spider-heal` });
+      ingest.ingest("d-" + fx.pack, "site-heal", [e], { principal: "runner:eval", scope: `d/${fx.pack}/site-heal` });
     }
-    const member = toolsFor(store, data, `d/${fx.pack}/spider-heal`, "deployment");
+    const member = toolsFor(store, data, `d/${fx.pack}/site-heal`, "deployment");
     member.call("memory_handoff_begin", { ...fx.handoff, target: fx.handoff.project });
 
     // Recall: task-derived queries must surface the handoff page in top-5.

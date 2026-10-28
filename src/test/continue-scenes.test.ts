@@ -8,7 +8,7 @@ import { validateScenes, ContinueScene } from "../continue-scenes.js";
 function scene(over: Partial<ContinueScene> = {}): ContinueScene {
   return {
     id: "s01",
-    source: { root: "d-KkCie7NlrHluo4LiKPnn0w", project: "spider-heal" },
+    source: { root: "d-demo-01", project: "site-heal" },
     review: "reviewed",
     boundary_at: "2026-10-24T00:00:00.000Z",
     task: "继续处理上次的爬虫自愈任务：先汇报当前结论，再给出下一步动作。",
@@ -30,7 +30,7 @@ function note(ok: boolean) {
 
 test("a full valid set passes", () => {
   const scenes: ContinueScene[] = [];
-  for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
+  for (const project of ["site-heal", "web", "planner"]) {
     for (let i = 0; i < 4; i++) {
       const s = scene({ id: `${project}-${i}`, source: { root: "d-x", project } });
       if (i === 0) s.history.notes = [note(true)];
@@ -43,7 +43,7 @@ test("a full valid set passes", () => {
 
 test("set without note scenes is refused (L1 recall lane must stay covered)", () => {
   const scenes: ContinueScene[] = [];
-  for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
+  for (const project of ["site-heal", "web", "planner"]) {
     for (let i = 0; i < 4; i++) scenes.push(scene({ id: `${project}-${i}`, source: { root: "d-x", project } }));
   }
   const v = validateScenes(scenes);
@@ -54,7 +54,7 @@ test("set without note scenes is refused (L1 recall lane must stay covered)", ()
 test("malformed note is refused; notes-only history counts as non-empty", () => {
   const base = () => {
     const scenes: ContinueScene[] = [];
-    for (const project of ["spider-heal", "wx-alpha", "mission-planner"]) {
+    for (const project of ["site-heal", "web", "planner"]) {
       for (let i = 0; i < 4; i++) {
         const s = scene({ id: `${project}-${i}`, source: { root: "d-x", project } });
         if (i === 0) s.history.notes = [note(true)];

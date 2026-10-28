@@ -35,11 +35,11 @@ test("okf round-trip keeps extension keys verbatim", () => {
 
 test("sanitize redacts four classes", () => {
   const out = sanitize(
-    `key sk-abcdefghijklmnop123456 and ghp_` + "a".repeat(40) +
-    ` bearer abcdefghijklmnop and password: "hunter2secret" ` +
+    `key sk-abcdefghijklmnop123456 and ghp_` + "a".repeat(40) + // leak-check:allow
+    ` bearer abcdefghijklmnop and password: "hunter2secret" ` + // leak-check:allow
     `-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----`,
   );
-  assert.ok(!out.includes("sk-abcdefghijklmnop"));
+  assert.ok(!out.includes("sk-abcdefghijklmnop")); // leak-check:allow
   assert.ok(!out.includes("ghp_"));
   assert.ok(!out.includes("bearer abcdefghijklmnop"));
   assert.ok(!out.includes("hunter2secret"));
@@ -52,8 +52,8 @@ test("store roots isolate owners physically", () => {
   try {
     const a = new StoreRoot(data, "d-packA--agent1");
     const b = new StoreRoot(data, "d-packB--agent2");
-    a.beginHandoff("default", "dsh", { summary: "owner A secret summary 舰队" });
-    b.beginHandoff("default", "dsh", { summary: "owner B" });
+    a.beginHandoff("default", "runner", { summary: "owner A secret summary 舰队" });
+    b.beginHandoff("default", "runner", { summary: "owner B" });
     assert.equal(a.db.openHandoffs().length, 1);
     assert.equal(b.db.openHandoffs().length, 1);
     assert.notEqual(a.rootDir, b.rootDir);
@@ -69,7 +69,7 @@ test("reindex rebuilds derived db without touching wiki truth", () => {
   const data = tmpData();
   try {
     const root = new StoreRoot(data, "d-p--a");
-    root.beginHandoff("default", "dsh", { summary: "舰队记忆 reindex probe" });
+    root.beginHandoff("default", "runner", { summary: "舰队记忆 reindex probe" });
     const wikiFile = (rel: string) => readFileSync(join(root.wikiDir, rel), "utf8");
     const rel = root.db.searchPages("reindex probe")[0].path;
     const before = wikiFile(rel);
@@ -184,8 +184,8 @@ test("capture ingest lands observations + session page + ledger, sanitized", () 
       return r;
     });
     const events: CaptureEvent[] = [
-      { event: "session-start", session_id: "sess-1", agent: "dsh" },
-      { event: "user-prompt-submit", session_id: "sess-1", summary: "fix the bug sk-abcdefghijklmnop123456" },
+      { event: "session-start", session_id: "sess-1", agent: "runner" },
+      { event: "user-prompt-submit", session_id: "sess-1", summary: "fix the bug sk-abcdefghijklmnop123456" }, // leak-check:allow
       { event: "post-tool-use", session_id: "sess-1", tool_name: "Write", tool_input: "wrote check-links.mjs" },
       { event: "session-end", session_id: "sess-1" },
     ];
@@ -653,8 +653,8 @@ test("migrate-v2: moves wiki verbatim, carries observations/handoffs, keeps back
     const store = new TokenStore(join(data, "tokens.db"), "pepper");
     store.mint("deployment", "d/packM/爬虫自愈修复 Agent");
     const oldRoot = new StoreRoot(data, "d-packM--爬虫自愈修复 Agent");
-    oldRoot.beginHandoff("default", "spider-heal", { summary: "首轮排障结论 heal-x" });
-    oldRoot.db.addObservation({ session_id: "s-old", agent: "spider-heal", event: "stop", tool: null, summary: "旧观测 legacy obs", created_at: new Date().toISOString(), project: "default" });
+    oldRoot.beginHandoff("default", "site-heal", { summary: "首轮排障结论 heal-x" });
+    oldRoot.db.addObservation({ session_id: "s-old", agent: "site-heal", event: "stop", tool: null, summary: "旧观测 legacy obs", created_at: new Date().toISOString(), project: "default" });
     oldRoot.db.db.exec("ALTER TABLE handoffs DROP COLUMN to_agent; ALTER TABLE observations DROP COLUMN project;");
     const oldWikiPath = join(oldRoot.wikiDir, "default", "handoffs");
     const [handoffFile] = readdirSync(oldWikiPath).filter((f) => f.endsWith(".md"));

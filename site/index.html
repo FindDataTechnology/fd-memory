@@ -140,11 +140,11 @@
     </header>
 
     <figure class="supersede-demo" aria-label="接替示例">
-      <figcaption>生产 evidence：两个版本的部署目标简述</figcaption>
+      <figcaption>示例 evidence：一条接替关系（虚构）</figcaption>
       <div class="sup-lanes">
         <div class="sup-row sup-old">
           <span class="sup-state sup-retired">v1 · 已接替</span>
-          <span class="sup-text">部署目标 cheap-4，所有演示流量走 cheap-4。</span>
+          <span class="sup-text">部署目标 node-a，所有演示流量走 node-a。</span>
         </div>
         <div class="sup-arrow" aria-hidden="true">
           <span class="sup-arrow-label">superseded by</span>
@@ -152,7 +152,7 @@
         </div>
         <div class="sup-row sup-new">
           <span class="sup-state sup-live">v2 · 当前</span>
-          <span class="sup-text">更正：部署目标已改为 cheap-8，cheap-4 退役，所有演示流量改走 cheap-8。</span>
+          <span class="sup-text">更正：部署目标已改为 node-b，node-a 退役，所有演示流量改走 node-b。</span>
         </div>
       </div>
     </figure>
@@ -237,6 +237,7 @@ curl http://127.0.0.1:4000/healthz  # → {"status":"ok"}</code></pre>
     <span>永忆（YongYi）· fd-memory 品牌化名</span>
     <span class="foot-right">
       <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/README.md">README</a> ·
+      <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/docs/DEPLOYMENT.md">部署教程</a> ·
       <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/LICENSE">LICENSE</a> ·
       <a href="https://github.com/FindDataTechnology/fd-memory/blob/master/docs/eval-continue.md">evidence report</a>
     </span>

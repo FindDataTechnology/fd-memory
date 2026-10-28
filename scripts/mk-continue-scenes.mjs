@@ -7,7 +7,7 @@
 //
 // usage:
 //   node scripts/mk-continue-scenes.mjs --dump /tmp/fdm-scenes-dump.json \
-//     --project spider-heal --at 2026-10-24T08:00:00Z --id sh-1
+//     --project serve --at 2026-10-24T08:00:00Z --id sh-1
 // Task and expected_background are HUMAN-authored afterwards (edit the JSON,
 // set review:"reviewed" once the sanitization pass is eyeballed).
 

@@ -1,0 +1,90 @@
+{
+  "kind": "cluster-turn",
+  "source": "合成夹具：site-heal 集群回合（虚构数据，2026-10）",
+  "pack": "fxpack0002FfEeDdCcBbAa",
+  "cluster_project": "cluster-site-heal",
+  "owner": "u/eval-owner@example.com",
+  "capture_events": [
+    {
+      "event": "session-start",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "summary": "集群回合开始：站点 5xx 自愈排障"
+    },
+    {
+      "event": "user-prompt-submit",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "summary": "目标站点批量 5xx，定位故障分组并给出自愈动作"
+    },
+    {
+      "event": "pre-tool-use",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "tool_name": "list_sites",
+      "summary": "{\"scope\":\"all\"}"
+    },
+    {
+      "event": "post-tool-use",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "tool_name": "list_sites",
+      "summary": "142 站点，9 个 5xx 分组（分组 G7 连续 3 轮）"
+    },
+    {
+      "event": "pre-tool-use",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "tool_name": "run_checks",
+      "summary": "{\"group\":\"G7\",\"depth\":2}"
+    },
+    {
+      "event": "post-tool-use",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "tool_name": "run_checks",
+      "summary": "G7 上游 DNS 解析超时；本地缓存命中率 12%"
+    },
+    {
+      "event": "stop",
+      "session_id": "srv-wx-turn-1",
+      "agent": "site-heal",
+      "summary": "G7 自愈动作：切备用 DNS + 清缓存重放；重试策略每 300s 最多 3 次"
+    }
+  ],
+  "handoff": {
+    "project": "shared",
+    "from_agent": "site-heal",
+    "summary": "G7 分组 5xx 根因是上游 DNS 超时；已切备用 DNS 并清缓存重放，重试策略每 300s 最多 3 次。",
+    "open_questions": [
+      "备用 DNS 的解析延迟是否稳定"
+    ],
+    "next_steps": [
+      "观察 G7 两轮",
+      "若复发改用本地 hosts 兜底"
+    ],
+    "files_touched": []
+  },
+  "queries": [
+    {
+      "q": "G7 分组 5xx",
+      "expect_hit": true
+    },
+    {
+      "q": "上游 DNS 超时",
+      "expect_hit": true
+    },
+    {
+      "q": "重试策略每 300s",
+      "expect_hit": true
+    },
+    {
+      "q": "清缓存重放",
+      "expect_hit": true
+    },
+    {
+      "q": "完全无关的词汇zzz",
+      "expect_hit": false
+    }
+  ]
+}

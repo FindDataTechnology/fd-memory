@@ -34,7 +34,7 @@ const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.m
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
 const ARMS = ["none", "titles", "digest"];
 const SYSTEM_BASE =
-  "你是一台长期独立运行的工作 agent（壹座/萬星部署）。现在开启一个全新会话。用户给出本轮任务；请直接给出你的执行计划与第一步动作（可含要执行的命令/工具调用），除非任务本身要求，不要向用户询问可自行获得的背景。";
+  "你是一台长期独立运行的工作 agent（自部署）。现在开启一个全新会话。用户给出本轮任务；请直接给出你的执行计划与第一步动作（可含要执行的命令/工具调用），除非任务本身要求，不要向用户询问可自行获得的背景。";
 
 function arg(name) {
   const i = process.argv.indexOf(`--${name}`);
@@ -48,8 +48,8 @@ const TOKEN_LIMIT = Number(process.env.EVAL_TOKEN_LIMIT ?? 600_000);
 async function chat(model, messages, { maxTokens = 1600, temperature = 0 } = {}) {
   if (spent >= TOKEN_LIMIT) throw new Error(`token limit reached (${spent}/${TOKEN_LIMIT}) — run aborted, partial state kept`);
   // transient lane failures (503/502/429) get 3 attempts with backoff — a
-  // single blip must not kill a multi-minute run (production lane jitter is
-  // on record, ledger §15.30)
+  // single blip must not kill a multi-minute run (production lanes jitter;
+  // keep the retry budget generous)
   let lastErr;
   for (let attempt = 0; attempt < 5; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, Math.min(30_000, 3000 * 3 ** (attempt - 1))));
@@ -185,7 +185,7 @@ async function vectorize(root, project, scene) {
 
 // -- injection blocks ----------------------------------------------------------
 function titlesBlock(root, project) {
-  // verbatim cluster hook-① shape (paas server/cron-runner.js): top-5 recent
+  // verbatim cluster hook-① shape (platform cron runner): top-5 recent
   // pages as `- title（YYYY-MM-DD）`, appended to the task prompt.
   const pages = root.db.recentPages(5, [project]);
   if (!pages.length) return null;

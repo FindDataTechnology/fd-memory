@@ -135,11 +135,12 @@ scripts/
 distiller/             # Python sidecar（LLM/嵌入调用——可以装起来也可以不装）
 
 测试：`npm test`，70+ 单测（全部内置、无网络、mock sidecar）。
-评估套件跑：`node scripts/eval-continue.mjs`（19 场景，判定门：headroom win ≥70% + 全集非劣 ≥70% + note-depth delta ≥1 分）。
+评估套件跑：`node scripts/eval-continue.mjs`（21 合成场景，判定门：headroom win ≥70% + 全集非劣 ≥70% + note-depth delta ≥1 分）。
 ```
 
 ## 文档
 
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — 部署教程（裸机/Docker/systemd/compose/K8s、反代路径封禁、备份升级、安全清单）
 - [`docs/eval-continue.md`](docs/eval-continue.md) — 继续性评估 runbook（场景形状、门禁、当前成绩）
 - [`docs/federation-recipe.md`](docs/federation-recipe.md) — 多 deployment 联邦与跨 deployment 记忆访问
 - [`docs/spike-hook-wire.md`](docs/spike-hook-wire.md) — HTML 写入 hook 的开发思路（后续方向）
@@ -150,7 +151,7 @@ distiller/             # Python sidecar（LLM/嵌入调用——可以装起来�
 - [x] 内部硬编码为零（src/ 无内部 IP/秘密/内部项目名）
 - [ ] 公开 CI 通到公开镜像仓库（ghcr.io / Docker Hub）
 - [ ] L0-L2 公开开发文档（当前 docs 是生产 runbook，面向运维）
-- [ ] 公开 NPM 包（fd-memory 当前 `private: true`，准备作为 `@finddatatechnology/yongyi`）
+- [x] 公开 NPM 包（已发布 `@finddatatechnology/yongyi`，`yongyi --help`）
 
 ## License
 

@@ -325,10 +325,10 @@ export class DistillScheduler {
       }
 
       const audit = { principal: "distiller:scheduler", scope: `${rootKey}/${project}` };
-      // Patrol-echo dedup (2026-10-26 audit): cron-heavy roots distilled the
-      // same "ran the round patrol" narrative every round — mission-planner
-      // burned 605k tokens/day producing 277 near-identical L2 pages. The
-      // engine sees candidates but never self-dedupes, so the write face does:
+      // Patrol-echo dedup: cron-heavy roots can distill the same "ran the
+      // round patrol" narrative every round — one deployment burned 600k+
+      // tokens/day producing near-identical L2 pages. The engine sees
+      // candidates but never self-dedupes, so the write face does:
       // a new L2 whose title shares the first 16 chars with an existing page
       // of the same kind supersedes it (files persist; the read face retires
       // the old page via the supersededIds filters).

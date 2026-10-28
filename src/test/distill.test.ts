@@ -100,7 +100,7 @@ test("candidates: keyword-ranked top-k, superseded and forgotten never offered",
     const root = new StoreRoot(data, "d-packC");
     root.writeDistillPage("agentA", "experience", { id: "exp_dns", engine: "e", task: "DNS 超时排障", search_keys: ["dns"], solution: "切备用 DNS", sources: [], supersedes: [] });
     root.writeDistillPage("agentA", "experience", { id: "exp_dns2", engine: "e", task: "DNS 超时排障（新）", search_keys: ["dns"], solution: "切备用+清缓存", sources: [], supersedes: ["exp_dns"] });
-    root.writeDistillPage("agentA", "experience", { id: "exp_billing", engine: "e", task: "余额 403 排查", search_keys: ["billing"], solution: "查 sub2api", sources: [], supersedes: [] });
+    root.writeDistillPage("agentA", "experience", { id: "exp_billing", engine: "e", task: "余额 403 排查", search_keys: ["billing"], solution: "查面板余额", sources: [], supersedes: [] });
     const gone = root.writeDistillPage("agentA", "experience", { id: "exp_gone", engine: "e", task: "DNS 超时但已遗忘", search_keys: ["dns"], solution: "old", sources: [], supersedes: [] });
     root.forgetPage(gone);
 
