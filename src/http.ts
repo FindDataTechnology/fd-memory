@@ -821,32 +821,55 @@ export class Service {
       const rows = root.db.db.prepare(
         "SELECT path, title, body FROM pages WHERE type IN ('fact','experience') ORDER BY updated_at DESC LIMIT ?",
       ).all(max) as Array<{ path: string; title: string; body: string }>;
-      root.db.db.exec("DELETE FROM page_vectors");
-      let reembedded = 0;
-      let failed = 0;
+      // Compute-then-commit (2026-10-28 production lesson): the first run
+      // deleted the derived store upfront and an upstream 502 left the root
+      // with ZERO vectors. Embed EVERYTHING first; only a fully successful
+      // run swaps the store. A partial failure keeps the old (off-model)
+      // vectors — degraded recall beats no recall.
       let model = "";
-      const BATCH = 32;
+      const built: Array<{ path: string; vector: Float32Array }> = [];
+      let failed = 0;
+      const BATCH = 16;
       for (let i = 0; i < rows.length; i += BATCH) {
         const batch = rows.slice(i, i + BATCH);
         const texts = batch.map((r) => `${r.title}\n${String(r.body ?? "").replace(/\s+/g, " ").slice(0, 800)}`);
         try {
           const out = await sidecarEmbed(process.env, texts, fetch);
-          model = out.model || model;
+          if (!out.model) { failed += batch.length; continue; }
+          model = out.model;
           for (let j = 0; j < batch.length; j++) {
             const vec = out.vectors[j];
-            if (!vec || !out.model) { failed += 1; continue; }
-            const guarded = root.db.setPageVectorGuarded(batch[j].path, out.model, new Float32Array(vec));
-            if (guarded.written) reembedded += 1; else failed += 1;
+            if (vec) built.push({ path: batch[j].path, vector: new Float32Array(vec) });
+            else failed += 1;
           }
         } catch {
           failed += batch.length;
+          if (!model) {
+            // The very first batch failing usually means the lane is down —
+            // keep the old store rather than half-rebuilding.
+            noteVectorEvent("reembed_runs");
+            console.warn(`[reembed] ${rootKey}: embed lane down at batch ${i / BATCH} — old vectors KEPT`);
+            res.writeHead(200, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ rootKey, model: "", reembedded: 0, failed, cap: max, committed: false, note: "embed lane unavailable; existing vectors kept" }));
+          }
         }
+      }
+      if (!built.length) {
+        noteVectorEvent("reembed_runs");
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ rootKey, model: "", reembedded: 0, failed, cap: max, committed: false, note: "nothing embeddable; existing vectors kept" }));
+      }
+      root.db.db.exec("DELETE FROM page_vectors");
+      let reembedded = 0;
+      for (const b of built) {
+        const guarded = root.db.setPageVectorGuarded(b.path, model, b.vector);
+        if (guarded.written) reembedded += 1; else failed += 1;
       }
       noteVectorEvent("reembed_runs");
       noteVectorEvent("reembedded_pages", reembedded);
-      console.log(`[reembed] ${rootKey}: model=${model || "?"} reembedded=${reembedded} failed=${failed} (cap=${max})`);
+      console.log(`[reembed] ${rootKey}: model=${model || "?"} reembedded=${reembedded} failed=${failed} (cap=${max}, committed=${reembedded > 0})`);
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ rootKey, model, reembedded, failed, cap: max, deleted_previous: true }));
+      return void res.end(JSON.stringify({ rootKey, model, reembedded, failed, cap: max, committed: reembedded > 0 }));
     }
 
     // Memory report for one root: the grants that reach into it (with their
