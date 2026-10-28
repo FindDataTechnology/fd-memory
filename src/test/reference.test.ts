@@ -165,6 +165,29 @@ test("tagging lane: 打标预算门 + AI 写 tags + 人工位不被覆写 + 游�
   assert.equal(tagCalls.length, callCountBefore);
 });
 
+test("/pages/write 建页：幂等 slug + 平台带 rootKey", async () => {
+  __resetEmbedGate();
+  const { svc, server, base } = await svcServer(tmpData());
+  try {
+    const tokens = svc as unknown as { tokens: { mint(k: string, ns: string, l?: string): { token: string } } };
+    const person = tokens.tokens.mint("person", "u/tester").token;
+    const platform = tokens.tokens.mint("platform", "*").token;
+    const H = { authorization: `Bearer ${person}`, "content-type": "application/json" };
+    const res1 = await fetch(`${base}/pages/write`, { method: "POST", headers: H, body: JSON.stringify({ project: "default", type: "reference", title: "标准合同模板 v2", body: "法务模板", source_ref: "resource:a1", slug: "tok1" }) });
+    assert.equal(res1.status, 201);
+    const out1 = (await res1.json()) as { path: string };
+    assert.equal(out1.path, "default/references/tok1.md");
+    // 平台带 rootKey 也同效
+    const res2 = await fetch(`${base}/pages/write?rootKey=${encodeURIComponent("u-tester")}`, { method: "POST", headers: { authorization: `Bearer ${platform}`, "content-type": "application/json" }, body: JSON.stringify({ project: "default", type: "reference", title: "另一篇", body: "x", source_ref: "resource:b2", slug: "tok2" }) });
+    assert.equal(res2.status, 201);
+    // reference 缺 source_ref 400
+    const resBad = await fetch(`${base}/pages/write`, { method: "POST", headers: H, body: JSON.stringify({ project: "default", type: "reference", title: "bad", body: "x" }) });
+    assert.equal(resBad.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
 test("/digest reference 渲染为名份引用", async () => {
   __resetEmbedGate();
   const { svc, server, base } = await svcServer(tmpData());

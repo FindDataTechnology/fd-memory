@@ -419,6 +419,46 @@ export class Service {
       return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
     }
 
+    if (path === "/pages/write" && req.method === "POST") {
+      const rootKeyParam = url.searchParams.get("rootKey");
+      let wRoot: StoreRoot;
+      let principal: string;
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        if (!rootKeyParam) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "rootKey_required" })); }
+        wRoot = this.rootForKey(rootKeyParam);
+        principal = `${scope.kind}:${scope.tokenId}`;
+      } else if (scope.kind === "person") {
+        if (rootKeyParam) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" })); }
+        wRoot = this.rootFor(scope);
+        principal = `person:${scope.tokenId}`;
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const body = await this.body<{ project?: unknown; type?: unknown; title?: unknown; body?: unknown; tags?: unknown; tier?: unknown; source_ref?: unknown; origin?: unknown; slug?: unknown }>(req);
+      const project = String(body.project ?? "default");
+      const type = String(body.type ?? "note");
+      const dir = type === "reference" ? "references" : type === "note" ? "notes" : null;
+      if (!dir) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "unknown_page_type" })); }
+      const title = String(body.title ?? "").trim();
+      if (!title) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "title_required" })); }
+      const extra: Record<string, unknown> = {};
+      if (type === "reference") {
+        const sourceRef = String(body.source_ref ?? "").trim();
+        if (!sourceRef) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "reference_requires_source_ref" })); }
+        extra.source_ref = sourceRef;
+      }
+      if (Array.isArray(body.tags)) extra.tags = body.tags.map(String).slice(0, 5);
+      const tier = String(body.tier ?? "draft");
+      if (["draft", "stable", "canonical"].includes(tier)) extra.tier = tier;
+      if (body.origin) extra.origin = String(body.origin);
+      const slug = String(body.slug ?? randomUUID().slice(0, 8));
+      const rel = `${project}/${dir}/${slug}.md`;
+      const relOut = wRoot.writePage(project, dir, slug, newPage(type, title, String(body.body ?? ""), extra), { principal, scope: `${project}/${rel}` });
+      res.writeHead(201, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ path: relOut, created: true }));
+    }
+
     // ── /pages/mutate (add-unified-memory-and-outputs): the single-writer
     // gesture face for tier/tags. Write master lives here (gesture UIs and
     // capture handlers never touch the index directly); every mutation lands
