@@ -69,7 +69,11 @@ async def tag_items(provider: LLMProvider, items: list[dict]) -> dict:
     )
     llm_calls: list[dict] = []
     tokens = 0
-    resp = await provider.complete(prompt=prompt, max_tokens=1200, audit_stage="reference_tag")
+    # 1200 was the observed completion ceiling for a single item on a chatty
+    # model (production probe 2026-10-28: completion_tokens=1200 exactly, body
+    # truncated → empty results, tokens still billed). Items ride 12 per call,
+    # so the ceiling must hold a list of them, not one.
+    resp = await provider.complete(prompt=prompt, max_tokens=4000, audit_stage="reference_tag")
     texto = getattr(resp, "content", "") or ""
     tokens = int(getattr(resp, "prompt_tokens", 0) or 0) + int(getattr(resp, "completion_tokens", 0) or 0)
     llm_calls.append({"kind": "tag", "tokens": tokens})
