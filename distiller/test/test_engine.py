@@ -155,3 +155,42 @@ def test_fact_cap_drops_with_audit():
     assert any(c.get("stage") == "fact_cap" and "dropped" in c.get("warning", "") for c in rec.calls)
     # merged drafts keep their slots (both supersedes present or merged-first ordering)
     assert all(e["supersedes"] or i >= 0 for i, e in enumerate(out))
+
+
+# ── 2026-10-28 production finding: /tag burned an LLM call and returned nothing ─
+#
+# engine.tag_items() called repair_json() (which returns a JSON *string*) and
+# then asserted isinstance(parsed, list) — false for every response, so the
+# endpoint answered {"results": []} while still paying ~1.3k tokens per call.
+# Production ran a day with zero tags written.
+
+def test_tag_items_returns_results_for_plain_json():
+    import asyncio as _asyncio
+    provider, calls = make_provider(['[{"idx": 0, "tags": ["行业政策", "跨境电商"], "tier": "stable"}]'])
+    out = _asyncio.run(engine.tag_items(provider, [{"title": "跨境电商政策盯梢周报", "summary": "三条政策", "current_tags": [], "current_tier": "draft", "corrections": ""}]))
+    assert out["results"] == [{"idx": 0, "tags": ["行业政策", "跨境电商"], "tier": "stable"}], out
+    assert len(calls) == 1
+
+
+def test_tag_items_repairs_fenced_and_dirty_json():
+    import asyncio as _asyncio
+    dirty = '好的：\n```json\n[{"idx": 0, "tags": ["合同"], "tier": "stable"},]\n```'
+    provider, _ = make_provider([dirty])
+    out = _asyncio.run(engine.tag_items(provider, [{"title": "签约合同流程", "summary": "正式签约", "current_tags": []}]))
+    assert out["results"], f"dirty JSON must still yield results: {out}"
+    assert out["results"][0]["tags"] == ["合同"]
+
+
+def test_tag_items_accepts_wrapped_object():
+    import asyncio as _asyncio
+    provider, _ = make_provider(['{"results": [{"idx": 0, "tags": ["图"], "tier": "draft"}]}'])
+    out = _asyncio.run(engine.tag_items(provider, [{"title": "图表试验", "summary": "草稿"}]))
+    assert out["results"][0]["tags"] == ["图"], out
+
+
+def test_tag_items_caps_tags_and_rejects_unknown_tier():
+    import asyncio as _asyncio
+    provider, _ = make_provider(['[{"idx": 0, "tags": ["a","b","c","d","e","f","g"], "tier": "legendary"}]'])
+    out = _asyncio.run(engine.tag_items(provider, [{"title": "x", "summary": "y"}]))
+    assert len(out["results"][0]["tags"]) == engine.TAG_MAX
+    assert out["results"][0]["tier"] == "draft", "unknown tier degrades to draft"

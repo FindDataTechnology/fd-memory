@@ -74,8 +74,20 @@ async def tag_items(provider: LLMProvider, items: list[dict]) -> dict:
     tokens = int(getattr(resp, "prompt_tokens", 0) or 0) + int(getattr(resp, "completion_tokens", 0) or 0)
     llm_calls.append({"kind": "tag", "tokens": tokens})
     text = texto
+    # json_repair.repair_json() returns a JSON *string* (its callers elsewhere in
+    # this file hand that string to a text parser). Treating it as an already
+    # parsed object here made `isinstance(parsed, list)` false for every
+    # response, so /tag answered {"results": []} while still burning a full
+    # LLM call — production tagged nothing for a day (2026-10-28).
     try:
-        parsed = repair_json(str(text).strip()) if isinstance(text, str) else text
+        raw = str(text).strip()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = json.loads(repair_json(raw))
+        if isinstance(parsed, dict):
+            # Tolerate a wrapper object from a chattier model.
+            parsed = parsed.get("results") or parsed.get("items") or []
         if not isinstance(parsed, list):
             raise ValueError("tag result is not a list")
     except Exception:
