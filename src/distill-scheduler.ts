@@ -151,10 +151,72 @@ export class DistillScheduler {
   }
 
   // Force a project through now (tests); respects inflight + backoff.
+  // Tagging lane (add-unified-memory-and-outputs D5): propose tags/tier for
+  // reference pages under the same per-owner daily-budget gate. Corrections
+  // (修正： notes) feed the prompt as the owner's vocabulary; results land as
+  // AI-proposed frontmatter (never overwrite human-set tags/tier).
+  private async tagPass(root: StoreRoot, rootKey: string, project: string, state: { tag_cursor?: string } | null): Promise<void> {
+    const cursor = state?.tag_cursor ?? "";
+    const pending = root.db.referencesNeedingTags(project, cursor, 12);
+    if (pending.length === 0) return;
+    const day = new Date().toISOString().slice(0, 10);
+    const used = this.opts.tokens.distillBudgetUsed(rootKey, day);
+    if (used.tokens >= this.dailyLimit()) return;
+    const corr = root.db.correctionsAfter(project, "", 10).map((c) => `${c.title}: ${c.body}`).slice(0, 6).join("\n");
+    const items = pending.map((p, i) => ({ idx: i, title: p.title, summary: p.body, current_tags: JSON.parse(p.tags || "[]"), current_tier: p.tier, corrections: corr }));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/tag`, {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+        body: JSON.stringify({ scope: `${rootKey}/${project}`, items }), signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) { this.log.warn(`[tag] ${rootKey}/${project}: sidecar ${res.status}`); return; }
+    const out = (await res.json()) as { results: Array<{ idx: number; tags: string[]; tier: string }>; tokens: number; errors: string[] };
+    if (out.errors?.length) this.log.warn(`[tag] ${rootKey}/${project}: ${out.errors.slice(0, 2).join("; ")}`);
+    const audit = { principal: "distiller:tag", scope: `${rootKey}/${project}` };
+    let tagged = 0;
+    for (const r of out.results ?? []) {
+      const p = pending[r.idx];
+      if (!p) continue;
+      const page = root.readPageByRel(p.path);
+      if (!page) continue;
+      const fm: Record<string, unknown> = { ...page.frontmatter };
+      if (String(fm.tags_origin ?? "") === "human") { /* human wins */ }
+      else { fm.tags = (r.tags ?? []).slice(0, 5); fm.tags_origin = "ai"; }
+      const cur = String(fm.tier ?? "draft");
+      const want = String(r.tier ?? "draft");
+      if (String(fm.tier_origin ?? "") !== "human") {
+        if ((cur === "draft" && (want === "stable" || want === "canonical")) || (cur === "stable" && want === "canonical")) {
+          fm.tier = want === "canonical" ? "stable" : want; // canonical 永仅经人类/信号
+          fm.tier_origin = "ai";
+        }
+      }
+      const dir = p.path.split("/")[1];
+      const slug = p.path.split("/").pop()!.replace(/\.md$/, "");
+      root.writePage(project, dir, slug, { frontmatter: fm, body: page.body } as never, audit);
+      tagged++;
+    }
+    const spentTotal = Number(out.tokens ?? 0) || 0;
+    if (spentTotal > 0) this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, 1);
+    const lastTs = pending[pending.length - 1].updated_at;
+    root.db.upsertDistillState(project, { tag_cursor: lastTs });
+    if (tagged) this.log.log(`[tag] ${rootKey}/${project}: tagged=${tagged}/${pending.length} tokens=${spentTotal}`);
+  }
+
   async distillNow(rootKey: string, project: string): Promise<void> {
     const key = DistillScheduler.key(rootKey, project);
     if (this.inflight.has(key)) return;
     await this.distillOne(rootKey, project);
+    // Tagging lane: reference 页打标独立于蒸馏结果（即便该 roots/project
+    // 当次无 obs/handoffs/notes 素材也要给 unsettled reference 打标）。
+    const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
+    const state = root.db.getDistillState(project);
+    await this.tagPass(root, rootKey, project, state ?? null);
   }
 
   private fallbackScan(): void {

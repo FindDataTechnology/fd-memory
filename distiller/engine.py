@@ -38,6 +38,63 @@ from json_repair import repair_json
 ENGINE = "engine:hy-memory/0244ebe"
 
 EMBED_MODEL = os.environ.get("MEMORY_EMBED_MODEL", "Qwen/Qwen3-Embedding-8B")
+
+# Unified memory & outputs (add-unified-memory-and-outputs): tagging lane —
+# propose <=5 tags and a tier candidate for reference pages, learning the
+# owner's correction vocabulary. JSON repaired at the boundary like /distill.
+TAG_MAX = 5
+TAG_TIERS = ("draft", "stable", "canonical")
+
+
+async def tag_items(provider: LLMProvider, items: list[dict]) -> dict:
+    if not items:
+        return {"results": [], "tokens": 0, "llm_calls": [], "errors": []}
+    payload = []
+    for i, it in enumerate(items[:12]):
+        payload.append({
+            "idx": i,
+            "title": str(it.get("title") or "")[:200],
+            "summary": str(it.get("summary") or "")[:400],
+            "current_tags": list(it.get("current_tags") or [])[:TAG_MAX],
+            "corrections": str(it.get("corrections") or "")[:400],
+            "current_tier": str(it.get("current_tier") or "draft"),
+        })
+    prompt = (
+        "你是记忆系统的打标器。给每个 reference 产出："
+        "最多 5 个语义 tags 与一个 tier 候选（draft|stable|canonical，"
+        "canonical 仅在明显已定稿/被分享/已被引用时给，否则保守为 stable 或保持 draft）。"
+        "如果给出了用户以往修正用过的词汇表，tags 优先借用那份词表。"
+        "只回 JSON 数组，无其它文字："
+        '[{"idx": 0, "tags": ["..."], "tier": "stable"}]\n\n' + json.dumps(payload, ensure_ascii=False)
+    )
+    llm_calls: list[dict] = []
+    tokens = 0
+    resp = await provider.complete(prompt=prompt, max_tokens=1200, audit_stage="reference_tag")
+    texto = getattr(resp, "content", "") or ""
+    tokens = int(getattr(resp, "prompt_tokens", 0) or 0) + int(getattr(resp, "completion_tokens", 0) or 0)
+    llm_calls.append({"kind": "tag", "tokens": tokens})
+    text = texto
+    try:
+        parsed = repair_json(str(text).strip()) if isinstance(text, str) else text
+        if not isinstance(parsed, list):
+            raise ValueError("tag result is not a list")
+    except Exception:
+        parsed = []
+    results = []
+    for r in parsed:
+        try:
+            idx = int(r.get("idx"))
+            tags = [str(t).strip() for t in (r.get("tags") or []) if str(t).strip()][:TAG_MAX]
+            tier_in = str(r.get("tier") or "")
+            tier = tier_in if tier_in in TAG_TIERS else "draft"
+            if 0 <= idx < len(items):
+                results.append({"idx": idx, "tags": tags, "tier": tier})
+        except Exception:
+            continue
+    return {"results": results, "tokens": tokens, "llm_calls": llm_calls, "errors": []}
+
+
+
 EMBED_BATCH_MAX = 64
 
 

@@ -33,6 +33,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/embed":
             self.handle_embed()
             return
+        if self.path == "/tag":
+            self.handle_tag()
+            return
         if self.path != "/distill":
             self._json(404, {"error": "not_found"})
             return
@@ -57,6 +60,34 @@ class Handler(BaseHTTPRequestHandler):
                 "llm_calls": [], "tokens": 0,
                 "errors": [f"{type(e).__name__}: {str(e)[:300]}"],
             })
+
+    def handle_tag(self):
+        expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
+        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+            self._json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("content-length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._json(400, {"error": "invalid_body"})
+            return
+        items = body.get("items") or []
+
+        async def run():
+            recorder = engine.CallRecorder()
+            provider = engine.LLMProvider(engine.MemoryConfig())
+            recorder.wrap(provider)
+            result = await engine.tag_items(provider, items)
+            result["llm_calls"] = recorder.calls
+            result["errors"] = result.get("errors", []) + recorder.errors
+            return result
+
+        try:
+            self._json(200, asyncio.run(run()))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._json(200, {"results": [], "tokens": 0, "llm_calls": [], "errors": [f"{type(e).__name__}: {str(e)[:300]}"]})
 
     def handle_embed(self):
         expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")

@@ -154,6 +154,15 @@ function loadScene(scene, dataDir) {
   // Recency backfill: indexPage stamps updated_at at load time (all notes in
   // one burst = same ms), which makes the digest L1 "recent 3" cut arbitrary
   // and the old-note ablation meaningless — restore the fixture's timestamps.
+  // Reference 页（add-unified-memory-and-outputs eval 场景）: seed 薄索引
+  // 页，digest 名份车道在生产同款代码下读（只不过这里借 route 读面镜像）。
+  for (const r of scene.history.references ?? []) {
+    const rel = root.writePage(project, "references", r.id, newPage("reference", r.title, r.summary ?? "", { source_ref: r.source_ref ?? "resource:fixture", tags: r.tags ?? [], tier: r.tier ?? "draft" }), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
+    if (r.updated_at) {
+      root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(r.updated_at, rel);
+      root.db.db.prepare("UPDATE pages_fts SET updated_at=? WHERE path=?").run(r.updated_at, rel);
+    }
+  }
   for (const n of scene.history.notes ?? []) {
     const rel = root.writePage(project, "notes", n.id, newPage("note", n.title, n.body), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
     root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(n.updated_at, rel);
@@ -218,7 +227,16 @@ async function digestBlock(root, project, scene) {
       confidence: null, updated_at: p.updated_at,
     };
   });
-  const allItems = [...items, ...noteItems];
+  // Reference 名份车道（add-unified-memory-and-outputs）：与生产 /digest
+  // 同规则——citation-by-name（name-only）条目排在 L2/note 之前，
+  // canonical 顺位在前；草稿不 query 命中不入。
+  const refs = scene.task.trim() ? root.db.queryReferences(project, scene.task, Math.min(3, Math.max(1, Math.floor(k / 2)))) : root.db.queryReferences(project, "", Math.min(3, Math.max(1, Math.floor(k / 2))));
+  const refItems = refs.map((p) => ({
+    id: p.path, layer: "L2", kind: "reference", title: `见资料库《${p.title}》`,
+    excerpt: String(p.body ?? "").replace(/\s+/g, " ").trim().slice(0, 120),
+    confidence: null, updated_at: p.updated_at,
+  }));
+  const allItems = [...refItems, ...items, ...noteItems];
   // mirror the production /digest assembly (open-handoffs cap at 3,
   // digest-lane starvation fix) so eval conclusions extrapolate
   // mirror the production recency gate (48h): "待认领" = actionable now

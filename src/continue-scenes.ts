@@ -36,6 +36,18 @@ export interface ScenePage {
 // L1 note pages (add-chat-memory-injection): the chat lane's write-back face —
 // the digest arm must prove recall of note-shaped background too, because
 // notes are what person-token MCP writes actually produce.
+// Reference 薄索引页（add-unified-memory-and-outputs eval 场景）：tier/tags
+// 与 digest 名份车道的测量对象。
+export interface SceneReference {
+  id: string;
+  title: string;
+  summary: string;
+  source_ref: string;
+  tags: string[];
+  tier?: string;
+  updated_at?: string;
+}
+
 export interface SceneNote {
   id: string;
   title: string;
@@ -54,6 +66,7 @@ export interface ContinueScene {
     observations: SceneObservation[];
     handoffs: SceneHandoff[];
     pages: ScenePage[];
+    references?: SceneReference[];
     notes?: SceneNote[];
   };
 }
@@ -82,7 +95,8 @@ export function validateScenes(scenes: ContinueScene[]): SceneValidation {
     if (!s.task || s.task.trim().length < 10) errors.push(`${s.id}: 续作任务缺失或过短`);
     if (!Array.isArray(s.expected_background) || s.expected_background.length < 2) errors.push(`${s.id}: 期望背景集合 <2 条，无法判重推导`);
     const notes = s.history?.notes ?? [];
-    if (!s.history?.pages?.length && !s.history?.handoffs?.length && !notes.length) errors.push(`${s.id}: 前史为空（无 L2 页、交接，也无 note）`);
+    const refs = s.history?.references ?? [];
+    if (!s.history?.pages?.length && !s.history?.handoffs?.length && !notes.length && !refs.length) errors.push(`${s.id}: 前史为空（无 L2 页、交接，也无 note）`);
     if (notes.length) {
       noteScenes += 1;
       for (const n of notes) {

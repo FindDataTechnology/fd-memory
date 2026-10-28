@@ -17,6 +17,7 @@ import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
 import { noteDigestRung, noteEmbedSample, metricsSnapshot } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
+import { newPage } from "./okf.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -366,6 +367,19 @@ export class Service {
       // Empty/no-match query → pure recency, byte-identical to before.
       const matched = q.trim() ? dRoot.db.queryNotes(project, q, 3) : [];
       const matchedPaths = new Set(matched.map((p) => p.path));
+      // Reference lane (add-unified-memory-and-outputs): thin index entries
+      // for library/output artifacts render as citation-by-name lines (「见
+      // 资料库《title》— summary」) — never the body. Caps mirror the notes
+      // segment; canonical rides first under budget pressure (renderer keeps
+      // array order).
+      const k_refs = Math.min(3, Math.max(1, Math.floor(k / 2)));
+      const refs = q.trim() ? dRoot.db.queryReferences(project, q, k_refs) : dRoot.db.queryReferences(project, "", k_refs);
+      const refItems: DigestItem[] = refs.map((p) => ({
+        id: p.path, layer: "L2" as const, kind: "reference",
+        title: `见资料库《${p.title}》`,
+        excerpt: String(p.body ?? "").replace(/\s+/g, " ").trim().slice(0, 120),
+        confidence: null, updated_at: p.updated_at,
+      }));
       const merged = [
         ...matched,
         ...dRoot.db.recentNotes(project, NOTES_LIMIT).filter((p) => !matchedPaths.has(p.path)),
@@ -392,7 +406,7 @@ export class Service {
       const HANDOFF_MAX_AGE_MS = Number(process.env.FD_MEMORY_DIGEST_HANDOFF_MAX_AGE_H ?? 48) * 3600_000;
       const freshEnough = (iso: string) => Date.now() - Date.parse(iso) < HANDOFF_MAX_AGE_MS;
       const handoffs = dRoot.db.openHandoffs([project]).filter((h) => freshEnough(h.created_at)).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
-      const allItems = [...items, ...noteItems];
+      const allItems = [...refItems, ...items, ...noteItems];
       const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
       const rendered = (digest.match(/〔L/g) ?? []).length;
       const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
@@ -403,6 +417,61 @@ export class Service {
       console.log(`[digest] ${logRoot}:${project} rung=${modelNote ? "keyword" : "vector"} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
+    }
+
+    // ── /pages/mutate (add-unified-memory-and-outputs): the single-writer
+    // gesture face for tier/tags. Write master lives here (gesture UIs and
+    // capture handlers never touch the index directly); every mutation lands
+    // frontmatter + index + audit + a correction note the tagging lane reads.
+    if (path === "/pages/mutate" && req.method === "POST") {
+      const rootKeyParam = url.searchParams.get("rootKey");
+      let mRoot: StoreRoot;
+      let principal: string;
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        if (!rootKeyParam) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "rootKey_required" })); }
+        mRoot = this.rootForKey(rootKeyParam);
+        principal = `${scope.kind}:${scope.tokenId}`;
+      } else if (scope.kind === "person") {
+        if (rootKeyParam) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" })); }
+        mRoot = this.rootFor(scope);
+        principal = `person:${scope.tokenId}`;
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const body = await this.body<{ path?: unknown; op?: unknown; origin?: unknown; tier?: unknown; tags?: unknown }>(req);
+      const rel = String(body.path ?? "");
+      const op = String(body.op ?? "");
+      const origin = String(body.origin ?? "human");
+      if (!["set_tier", "set_tags"].includes(op)) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "unknown_op", allowed: ["set_tier", "set_tags"] })); }
+      const page = mRoot.readPageByRel(rel);
+      if (!page) { res.writeHead(404, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "not_found" })); }
+      const seg = rel.split("/")[0];
+      const project = seg === "shared" ? "shared" : seg;
+      const changes: string[] = [];
+      const fm: Record<string, unknown> = { ...page.frontmatter };
+      if (op === "set_tier") {
+        const tier = String(body.tier ?? "");
+        if (!["draft", "stable", "canonical"].includes(tier)) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "invalid_tier" })); }
+        if (String(page.frontmatter.tier ?? "draft") !== tier) { changes.push(`tier: ${String(page.frontmatter.tier ?? "draft")} → ${tier}`); fm.tier = tier; fm.tier_origin = origin; }
+      }
+      if (op === "set_tags") {
+        if (!Array.isArray(body.tags)) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "tags_must_be_array" })); }
+        const next = body.tags.map(String).slice(0, 5);
+        const prev = Array.isArray(page.frontmatter.tags) ? (page.frontmatter.tags as unknown[]).map(String) : [];
+        if (JSON.stringify(prev) !== JSON.stringify(next)) { changes.push(`tags: [${prev.join(", ")}] → [${next.join(", ")}]`); fm.tags = next; fm.tags_origin = origin; }
+      }
+      if (changes.length === 0) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ path: rel, changed: false }));
+      }
+      const newPg = { frontmatter: fm, body: page.body };
+      mRoot.writePage(project, rel.split("/")[1], rel.split("/").pop()!.replace(/\.md$/, ""), newPg as never, { principal, scope: `${project}/${rel}` });
+      // Correction note — the tagging lane's vocabulary feed (title prefix is
+      // the machine marker; never a user's own note).
+      mRoot.writePage(project, "notes", randomUUID().slice(0, 8), newPage("note", `修正：${rel}`, changes.join("\n"), { origin, correction_of: rel }), { principal, scope: `${project}/${rel}` });
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ path: rel, changed: true, changes }));
     }
 
     // ── /memory + /forget (add-memory-distiller, memory-visibility): the
@@ -443,12 +512,28 @@ export class Service {
       const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? 50)));
       const offset = Math.max(0, Number(url.searchParams.get("offset") ?? 0));
       const projects = projectFilter ? [projectFilter] : null;
-      const layerOf = (type: string) => (type === "observation" ? "L0" : type === "fact" || type === "experience" ? "L2" : "L1");
+      // Unified-memory variant: tier/tag filters (composable with scope/layer/
+      // time); a reference page reports L2 like facts/experiences; every item
+      // carries tier/tags/source_ref (absent values degrade to empty, never
+      // breaking older rows whose columns read as empty/NULL).
+      const tierFilter = url.searchParams.get("tier");
+      const tagsWanted = (url.searchParams.getAll("tag") ?? []).flatMap((v) => String(v).split(",")).map((t) => t.trim()).filter(Boolean);
+      const layerOf = (type: string) => (type === "observation" ? "L0" : type === "fact" || type === "experience" || type === "reference" ? "L2" : "L1");
       const inWindow = (ts: string) => (!since || ts >= since) && (!until || ts <= until);
+      const matchTag = (raw: string | null) => {
+        if (!tagsWanted.length) return true;
+        let arr: string[] = [];
+        try { arr = JSON.parse(raw || "[]") as string[]; } catch { /* malformed */ }
+        return tagsWanted.some((t) => arr.includes(t));
+      };
       const pages = root.db
         .recentPages(500, projects)
-        .filter((p) => (!layer || layerOf(p.type) === layer) && inWindow(p.updated_at))
-        .map((p) => ({ path: p.path, title: p.title, project: p.project, layer: layerOf(p.type), sources: JSON.parse(p.sources || "[]"), ts: p.updated_at }));
+        .filter((p) => (!layer || layerOf(p.type) === layer) && inWindow(p.updated_at) && (!tierFilter || p.tier === tierFilter) && matchTag(p.tags))
+        .map((p) => ({
+          path: p.path, title: p.title, project: p.project, layer: layerOf(p.type),
+          sources: JSON.parse(p.sources || "[]"), tags: JSON.parse(p.tags || "[]"), tier: p.tier || "draft",
+          source_ref: p.source_ref ?? null, type: p.type, ts: p.updated_at,
+        }));
       const obs = root.db
         .recentObservations(500, projects)
         .filter((o) => (!layer || layer === "L0") && inWindow(o.created_at))

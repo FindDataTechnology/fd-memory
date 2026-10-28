@@ -122,11 +122,27 @@ export class RootDb {
     if (!pageCols.has("supersedes")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN supersedes TEXT NOT NULL DEFAULT '[]'");
     }
+    // Unified memory & outputs (add-unified-memory-and-outputs): reference
+    // pages carry tags/tier/source_ref — thin index entries for library and
+    // output artifacts; bodies never live here.
+    if (!pageCols.has("tags")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!pageCols.has("tier")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN tier TEXT NOT NULL DEFAULT 'draft'");
+    }
+    if (!pageCols.has("source_ref")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN source_ref TEXT");
+    }
     // u-root distillation (add-u-root-distillation): notes ride their own
     // string cursor (updated_at), mirroring handoff_cursor.
     const dsCols = this.columnsOf("distill_state");
     if (!dsCols.has("note_cursor")) {
       this.db.exec("ALTER TABLE distill_state ADD COLUMN note_cursor TEXT NOT NULL DEFAULT ''");
+    }
+    // Unified memory & outputs: tagging-lane cursor for reference pages.
+    if (!dsCols.has("tag_cursor")) {
+      this.db.exec("ALTER TABLE distill_state ADD COLUMN tag_cursor TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -136,15 +152,19 @@ export class RootDb {
 
   // -- pages / FTS -----------------------------------------------------------
 
-  indexPage(project: string, relPath: string, type: string, title: string, body: string, meta?: { sources?: string[]; supersedes?: string[] }): void {
+  indexPage(project: string, relPath: string, type: string, title: string, body: string, meta?: { sources?: string[]; supersedes?: string[]; tags?: string[]; tier?: string; source_ref?: string | null }): void {
     const sources = JSON.stringify(meta?.sources ?? []);
     const supersedes = JSON.stringify(meta?.supersedes ?? []);
+    const tags = JSON.stringify(meta?.tags ?? []);
+    const tier = meta?.tier ?? "draft";
+    const sourceRef = meta?.source_ref ?? null;
     this.db.prepare(
-      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes) VALUES (?,?,?,?,?,?,?,?)
+      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
          title=excluded.title, body=excluded.body, updated_at=excluded.updated_at,
-         sources=excluded.sources, supersedes=excluded.supersedes`,
-    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes);
+         sources=excluded.sources, supersedes=excluded.supersedes,
+         tags=excluded.tags, tier=excluded.tier, source_ref=excluded.source_ref`,
+    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes, tags, tier, sourceRef);
     this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
@@ -204,11 +224,11 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string }> {
+  recentPages(limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null }> {
     const pf = projectFilterSql(projects, "f.project");
     return this.db
-      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes FROM pages_fts f JOIN pages p ON p.path = f.path${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY f.updated_at DESC LIMIT ?`)
-      .all(...pf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string }>;
+      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref FROM pages_fts f JOIN pages p ON p.path = f.path${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY f.updated_at DESC LIMIT ?`)
+      .all(...pf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null }>;
   }
 
   // -- observations ----------------------------------------------------------
@@ -257,12 +277,12 @@ export class RootDb {
 
   // -- distill state (add-memory-distiller) -----------------------------------
 
-  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; note_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
+  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; note_cursor: string; tag_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
     return this.db.prepare("SELECT * FROM distill_state WHERE project=?").get(project) as never;
   }
 
-  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; note_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
-    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", note_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
+  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; note_cursor?: string; tag_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
+    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", note_cursor: "", tag_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
     const next = {
       ...cur,
       ...patch,
@@ -329,6 +349,52 @@ export class RootDb {
       try { for (const id of JSON.parse(r.supersedes) as string[]) ids.add(id); } catch { /* malformed supersedes — ignore row */ }
     }
     return ids;
+  }
+
+  // Reference pages (add-unified-memory-and-outputs): thin index entries for
+  // library/output artifacts. Recall = keyword+tags scoring with a tier boost,
+  // drafts admitted only when they explicitly match the query (spec: budget
+  // limited → canonical > stable > draft).
+  queryReferences(project: string, queryFor: string, limit = 3): Array<{ path: string; title: string; body: string; updated_at: string; tags: string; tier: string; source_ref: string | null; score: number }> {
+    const rows = this.db
+      .prepare("SELECT path, title, body, updated_at, tags, tier, source_ref FROM pages WHERE project=? AND type='reference' ORDER BY updated_at DESC LIMIT 200")
+      .all(project) as Array<{ path: string; title: string; body: string | null; updated_at: string; tags: string; tier: string; source_ref: string | null }>;
+    const terms = String(queryFor ?? "").toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((t) => t.length >= 2);
+    const boost = (tier: string) => (tier === "canonical" ? 2 : tier === "stable" ? 1 : 0);
+    return rows
+      .map((r) => {
+        let tagsArr: string[] = [];
+        try { tagsArr = JSON.parse(r.tags ?? "[]") as string[]; } catch { /* malformed */ }
+        const hay = `${r.title} ${String(r.body ?? "")} ${tagsArr.join(" ")}`.toLowerCase();
+        let kw = 0;
+        for (const t of terms) if (hay.includes(t)) kw++;
+        const isDraft = !r.tier || r.tier === "draft";
+        if (terms.length > 0 && isDraft && kw === 0) return null; // drafts must earn their slot
+        if (terms.length > 0 && kw === 0 && r.tier !== "canonical") return null;
+        return { ...r, body: r.body ?? "", score: kw * 2 + boost(r.tier) };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null)
+      .sort((a, b) => b.score - a.score || (a.updated_at < b.updated_at ? 1 : -1))
+      .slice(0, limit);
+  }
+
+  // Corrections the user or an AI assistant made to tags/tier — written as
+  // notes with a machine-recognisable title prefix so the tagging lane can
+  // learn the owner's vocabulary (memory-distiller spec: corrections feed
+  // later tag suites).
+  correctionsAfter(project: string, cursor: string, limit = 50): Array<{ path: string; title: string; body: string; updated_at: string }> {
+    return this.db
+      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' AND title LIKE '修正：%' AND updated_at>? ORDER BY updated_at LIMIT ?")
+      .all(project, cursor, limit) as never;
+  }
+
+  // Tagging lane (add-unified-memory-and-outputs): reference pages whose
+  // tags have not been settled by a human and are past the tag cursor — the
+  // engine proposes tags/tier for these exactly once per marker.
+  referencesNeedingTags(project: string, cursor: string, limit = 12): Array<{ path: string; title: string; body: string; updated_at: string; tags: string; tier: string; source_ref: string | null }> {
+    return this.db
+      .prepare("SELECT path, title, body, updated_at, tags, tier, source_ref FROM pages WHERE project=? AND type='reference' AND updated_at>? AND (tags IS NULL OR tags='[]') ORDER BY updated_at LIMIT ?")
+      .all(project, cursor, limit) as never;
   }
 
   distinctProjects(): string[] {

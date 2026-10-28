@@ -105,6 +105,9 @@ export class StoreRoot {
     this.db.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? slug), page.body, {
       sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
       supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
+      tags: Array.isArray(page.frontmatter.tags) ? (page.frontmatter.tags as string[]).map(String).slice(0, 5) : [],
+      tier: ["draft", "stable", "canonical"].includes(String(page.frontmatter.tier)) ? String(page.frontmatter.tier) : "draft",
+      source_ref: page.frontmatter.source_ref != null ? String(page.frontmatter.source_ref) : null,
     });
     if (audit) this.audit(audit, rel, "page_write");
     this.snapshotSoon(`page: ${rel}`);

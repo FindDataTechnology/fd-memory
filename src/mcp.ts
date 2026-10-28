@@ -241,13 +241,38 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
       description: "Write a durable note page — default into your own area, target 'shared' into the pack's shared area. Use it whenever the user explicitly asks you to remember something, or you learn a preference/fact worth carrying into later sessions; recent notes are recalled automatically at later session starts.",
       inputSchema: {
         type: "object",
-        properties: { title: { type: "string" }, body: { type: "string" }, ...targetProps },
+        properties: {
+          title: { type: "string" },
+          body: { type: "string" },
+          // Unified memory & outputs: reference pages point at library/output
+          // artifacts. type defaults to "note"; "reference" requires
+          // source_ref and caps tags at five; tier is draft|stable|canonical.
+          type: { type: "string" },
+          tags: { type: "array", items: { type: "string" } },
+          tier: { type: "string" },
+          source_ref: { type: "string" },
+          origin: { type: "string" },
+          ...targetProps,
+        },
         required: ["title", "body"],
       },
       handler: (args) => {
         const w = writeProject(args.target);
         if (w.error) return w.error;
-        const rel = root.writePage(w.project!, "notes", randomUUID().slice(0, 8), newPage("note", String(args.title), String(args.body)), auditOf(w.project!));
+        const type = String(args.type ?? "note");
+        const dir = type === "reference" ? "references" : type === "note" ? "notes" : null;
+        if (!dir) return err(`unknown_page_type: ${type}`);
+        const extra: Record<string, unknown> = {};
+        if (type === "reference") {
+          const sourceRef = String(args.source_ref ?? "").trim();
+          if (!sourceRef) return err("reference_requires_source_ref");
+          extra.source_ref = sourceRef;
+          if (Array.isArray(args.tags)) extra.tags = args.tags.map(String).slice(0, 5);
+          const tier = String(args.tier ?? "draft");
+          if (["draft", "stable", "canonical"].includes(tier)) extra.tier = tier;
+          if (args.origin) extra.origin = String(args.origin);
+        }
+        const rel = root.writePage(w.project!, dir, randomUUID().slice(0, 8), newPage(type, String(args.title), String(args.body), extra), auditOf(w.project!));
         notifyWrite(w.project!);
         return text({ path: rel, source: sourceOf(w.project!) });
       },
