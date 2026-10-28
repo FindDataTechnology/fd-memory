@@ -1,0 +1,87 @@
+{
+  "kind": "serving-turn",
+  "source": "合成夹具：Planner serving 回合（虚构数据，2026-10）",
+  "pack": "fxpack0001AaBbCcDdEeF",
+  "agents": [
+    {
+      "agent_id": "planner",
+      "events": [
+        {
+          "event": "user-prompt-submit",
+          "session_id": "srv-day-turn-1",
+          "agent": "planner",
+          "summary": "规划下季度数据源接入计划：P0 两个源，P1 三个源"
+        },
+        {
+          "event": "pre-tool-use",
+          "session_id": "srv-day-turn-1",
+          "agent": "planner",
+          "tool_name": "query_market",
+          "summary": "{\"q\":\"数据源 接入\"}"
+        },
+        {
+          "event": "post-tool-use",
+          "session_id": "srv-day-turn-1",
+          "agent": "planner",
+          "tool_name": "query_market",
+          "summary": "P0：舆情源 alpha、行情源 beta；P1：三份区域报告源"
+        },
+        {
+          "event": "stop",
+          "session_id": "srv-day-turn-1",
+          "agent": "planner",
+          "summary": "P0 两源先行灰度，P1 观察一月后接入"
+        }
+      ],
+      "private_note": {
+        "title": "planner 私有评估",
+        "body": "灰度切流比例内部讨论：10% 起步，私有结论不进共享区"
+      }
+    },
+    {
+      "agent_id": "reporter",
+      "events": [
+        {
+          "event": "user-prompt-submit",
+          "session_id": "srv-day-turn-2",
+          "agent": "reporter",
+          "summary": "把季度接入计划写成周报初稿"
+        },
+        {
+          "event": "stop",
+          "session_id": "srv-day-turn-2",
+          "agent": "reporter",
+          "summary": "周报初稿完成：P0 两源灰度章节 + P1 待办清单"
+        }
+      ],
+      "private_note": {
+        "title": "reporter 私有草稿",
+        "body": "措辞草稿：接入进度条设计，私有不外发"
+      }
+    }
+  ],
+  "shared_page": {
+    "title": "季度接入计划（共享）",
+    "body": "P0 舆情源 alpha 与行情源 beta 先行灰度；P1 三份区域报告源延后一月评估。"
+  },
+  "queries": [
+    {
+      "agent": "planner",
+      "q": "灰度",
+      "expect_hit": true,
+      "allow_shared": true
+    },
+    {
+      "agent": "reporter",
+      "q": "灰度 私有评估",
+      "expect_hit": false,
+      "note": "reporter 不得命中 planner 私有结论"
+    },
+    {
+      "agent": "reporter",
+      "q": "周报初稿",
+      "expect_hit": true,
+      "allow_shared": true
+    }
+  ]
+}

@@ -1,0 +1,503 @@
+[
+  {
+    "id": "sh-1",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-24T08:00:00.000Z",
+    "task": "继续修 /digest 中文短查询的召回问题——先定 FTS5 分词器参数，再重建索引。",
+    "expected_background": [
+      "CJK 短查询默认分词器召回差，已定论改用 trigram（此前「默认分词器已够用」的判断被更正）",
+      "索引重建后要补跑 reembed 才能回填向量车道",
+      "search_keys 命中回归测试有一条 open handoff 待认领"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a1", "event": "post-tool-use", "tool": "bash", "summary": "sqlite> SELECT count(*) FROM pages_fts WHERE pages_fts MATCH '灰度'; → 0（默认分词器不分中文词）", "created_at": "2026-10-22T09:12:00.000Z" },
+        { "session_id": "fx-serve-a1", "event": "pre-tool-use", "tool": "bash", "summary": "{\"command\":\"npm test 2>&1 | tail -5\"}", "created_at": "2026-10-22T09:15:00.000Z" },
+        { "session_id": "fx-serve-a1", "event": "stop", "summary": "换 trigram 后 2-3 字短查询全部命中；回归 21/21 绿", "created_at": "2026-10-22T09:31:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-sh1-1", "summary": "给 search_keys 命中补一条三词短查询回归断言", "next_steps": "在 digest-lane 测试里加 3 字 CJK 查询用例；跑 npm test 全绿后收口", "to_agent": null, "state": "open", "created_at": "2026-10-23T07:00:00.000Z" }
+      ],
+      "pages": [
+        { "id": "f-sh1-0", "kind": "fact", "task": "CJK 查询用 FTS5 默认 unicode61 分词器即可正常工作", "search_keys": ["unicode61", "分词器", "CJK"], "solution": "实测不成立，已被 f-sh1-1 更正。", "updated_at": "2026-10-21T10:00:00.000Z", "supersedes": [] },
+        { "id": "f-sh1-1", "kind": "fact", "task": "CJK 短查询召回必须用 trigram 分词器；unicode61 只对拉丁词形有效", "search_keys": ["trigram", "CJK", "召回"], "solution": "重建 pages_fts 用 trigram；重建后向量车道需 reembed 回填，否则混合检索只剩词法一路。", "updated_at": "2026-10-22T09:30:00.000Z", "supersedes": ["f-sh1-0"] }
+      ]
+    }
+  },
+  {
+    "id": "sh-2",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-25T02:00:00.000Z",
+    "task": "上次查了 /capture 大正文被拒的根因，这次接着落地可配置的 body 上限和对应的 413 错误文案。",
+    "expected_background": [
+      "capture 正文上限当前写死 256KB，计划改为 FD_MEMORY_MAX_BODY 环境变量",
+      "错误码已定用 413 而不是 400（400 留给请求形制错误）",
+      "上一场结论：写面与读面限额要分两道闸，不共用"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a2", "event": "user-prompt-submit", "summary": "512KB 的正文推 /capture，服务直接断连，连状态码都没有", "created_at": "2026-10-24T13:40:00.000Z" },
+        { "session_id": "fx-serve-a2", "event": "post-tool-use", "tool": "bash", "summary": "grep -n 'body' src/http.ts | head → 256*1024 写死在两处（capture 与 mcp 读面）", "created_at": "2026-10-24T13:44:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-sh2-1", "summary": "FD_MEMORY_MAX_BODY 默认 256KB，capture/mcp 两闸分开取值", "next_steps": "改 src/http.ts；README 环境变量表补行", "to_agent": "serve-bot", "state": "claimed", "created_at": "2026-10-24T14:02:00.000Z" }
+      ],
+      "pages": [
+        { "id": "e-sh2-1", "kind": "experience", "task": "capture 大正文被拒的排查路径", "search_keys": ["capture", "413", "body", "断连"], "solution": "先分清断连层级：边缘反代截断 vs 服务主动拒。用 1KB/257KB/512KB 三档复测定位阈值来源；服务侧限额改动必须连同读面一起过一遍回归。", "updated_at": "2026-10-24T14:05:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "sh-3",
+    "source": { "root": "d-fx-distill-02", "project": "distill" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-25T09:00:00.000Z",
+    "task": "接着调 distiller 的 /tag 批处理：上一批 12 条出现截断，重新核批大小与输出预算。",
+    "expected_background": [
+      "/tag 空结果的根因是完成上限给太低，批量列表撞上限即截断",
+      "批大小维持 12 条，单次输出预算从保守值上调",
+      "owner 日预算 600k tokens 口径不变，批预算按当日剩余量扣减"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-distill-b1", "event": "post-tool-use", "tool": "curl", "summary": "POST /tag 12 条 → results 为空，usage.completion_tokens 恰等于输出上限", "created_at": "2026-10-24T21:10:00.000Z" },
+        { "session_id": "fx-distill-b1", "event": "stop", "summary": "上调输出预算后同批 12/12 有结果；token 消耗回到正常水位", "created_at": "2026-10-24T21:26:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "e-sh3-1", "kind": "experience", "task": "/tag 空结果先查截断而不是解析", "search_keys": ["tag", "截断", "空结果", "完成上限"], "solution": "判据：completion_tokens 恰好等于上限而结果为空 = 截断；先加预算复跑再动解析代码。", "updated_at": "2026-10-24T21:28:00.000Z", "supersedes": [] },
+        { "id": "f-sh3-1", "kind": "fact", "task": "distill 日预算 600k tokens/owner，批预算从当日剩余量扣", "search_keys": ["预算", "600k"], "solution": "超限即冷却，次日续跑；冷却不记失败。", "updated_at": "2026-10-23T08:00:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "sh-4",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-23T06:00:00.000Z",
+    "task": "继续把 CLI 自举链的示例写全：bootstrap token 发 person token，person 再发 deployment token，示例里要带上作用域树。",
+    "expected_background": [
+      "bootstrap token 是一次性的，首次铸造后必须立即升级成 platform 根",
+      "person token 绑 owner 命名空间，deployment token 绑 d/<pack>/<agent> 形状",
+      "作用域继承规则已写进 auth 模块，示例只需照抄不再新增语义"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a3", "event": "post-tool-use", "tool": "cli", "summary": "./dist/index.js token mint --kind bootstrap → 一次性 token 打印成功", "created_at": "2026-10-22T05:30:00.000Z" },
+        { "session_id": "fx-serve-a3", "event": "stop", "summary": "自举三段链（bootstrap→platform→person/deployment）手工复跑全通", "created_at": "2026-10-22T05:52:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-sh4-1", "kind": "fact", "task": "token 作用域树：platform→person→deployment，deployment 形如 d/<pack>/<agent>", "search_keys": ["token", "作用域", "bootstrap"], "solution": "bootstrap 仅能铸第一枚 platform；之后全部从 platform 派生。", "updated_at": "2026-10-22T05:55:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "mp-1",
+    "source": { "root": "d-fx-planner-07", "project": "planner" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-25T01:00:00.000Z",
+    "task": "晨巡：查一遍超 48 小时未认领的 handoff，汇总给 owner 一条消息。",
+    "expected_background": [
+      "handoff 只有 open 且在 48h 窗内才进 digest（老化门）",
+      "上一轮巡检出 planner 项目有 2 条超窗 open handoff",
+      "owner 口径：按项目汇总，不逐条贴清单"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-planner-c1", "event": "user-prompt-submit", "summary": "巡：handoff 老化情况", "created_at": "2026-10-25T00:31:00.000Z" },
+        { "session_id": "fx-planner-c1", "event": "post-tool-use", "tool": "memory_query", "summary": "open handoffs=2，created_at 分别 -52h 与 -60h，均被 48h 老化门挡在读面外", "created_at": "2026-10-25T00:32:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-mp1-1", "summary": "G7 观察项到期：确认备用方案是否需要立页面", "next_steps": "到期未认领即改 cancelled 并记录", "to_agent": null, "state": "open", "created_at": "2026-10-23T02:00:00.000Z" },
+        { "id": "h-mp1-2", "summary": "reembed 车道观察：重建后首批向量是否齐", "next_steps": "对比 pages 数与 vectors 数", "to_agent": null, "state": "open", "created_at": "2026-10-23T09:40:00.000Z" }
+      ],
+      "pages": [
+        { "id": "e-mp1-1", "kind": "experience", "task": "handoff 老化饿死的处理路径", "search_keys": ["handoff", "48h", "老化", "饿死"], "solution": "超窗未认领 = 议题大概率已失效：归并 cancelled 并在周报留一行，不无限漂着。", "updated_at": "2026-10-24T23:50:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "mp-2",
+    "source": { "root": "d-fx-planner-07", "project": "planner" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T08:00:00.000Z",
+    "task": "接着做数据源接入计划：P0 两源灰度满一周，写评审纪要并更新共享页。",
+    "expected_background": [
+      "P0 舆情源 alpha 与行情源 beta 灰度一周未触发回退条件",
+      "P1 三份区域报告源延后一个月再评估",
+      "引用页顺位规则：canonical 进名份车道，draft 不进"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-planner-c2", "event": "user-prompt-submit", "summary": "P0 两源灰度满周，出评审结论", "created_at": "2026-10-26T07:10:00.000Z" },
+        { "session_id": "fx-planner-c2", "event": "stop", "summary": "评审通过：alpha/beta 转全量，P1 维持延后观察", "created_at": "2026-10-26T07:40:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-mp2-1", "kind": "fact", "task": "灰度起步 10%，一周无异常即转全量", "search_keys": ["灰度", "10%", "全量"], "solution": "回退条件：错误率或延迟连续两窗超标。", "updated_at": "2026-10-25T06:00:00.000Z", "supersedes": [] }
+      ],
+      "references": [
+        { "id": "r-mp2-a", "title": "季度接入计划（共享）", "summary": "P0 舆情源 alpha 与行情源 beta 先行灰度；P1 三份区域报告源延后一月评估。", "source_ref": "resource:quarter-plan", "tags": ["计划", "P0", "P1"], "tier": "canonical", "updated_at": "2026-10-20T08:00:00.000Z" },
+        { "id": "r-mp2-b", "title": "P1 候选源清单（草稿）", "summary": "三份区域报告源的口径对比草稿，未定稿。", "source_ref": "resource:p1-shortlist", "tags": ["P1", "草稿"], "tier": "draft", "updated_at": "2026-10-24T08:00:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "mp-3",
+    "source": { "root": "d-fx-planner-07", "project": "planner" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T16:01:00.000Z",
+    "task": "任务巡检：按每日协议先读活跃任务状态再分派；无活跃任务则只回一句「巡检：空」。",
+    "expected_background": [
+      "每日协议动作表语义：先读状态，再按 planning/awaiting/executing/终态分派",
+      "可用路由在案：/healthz、/tasks、/v1/tasks",
+      "连续多轮同一巡检指令的先例（本轮前已 3 轮）"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-day-20261025", "event": "post-tool-use", "tool": "bash", "summary": "curl -s localhost:49375/healthz → {\"status\":\"ok\"}; 任务表空", "created_at": "2026-10-25T16:02:00.000Z" },
+        { "session_id": "fx-day-20261025", "event": "stop", "summary": "巡检：空", "created_at": "2026-10-25T16:02:05.000Z" },
+        { "session_id": "fx-day-20261026", "event": "post-tool-use", "tool": "bash", "summary": "curl -s localhost:49375/healthz → ok; GET /v1/tasks → 0 active", "created_at": "2026-10-26T16:01:10.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-mp3-1", "kind": "fact", "task": "巡检动作表：先 GET 任务状态再按 planning/awaiting/executing/终态分派，空表只回一句结论", "search_keys": ["巡检", "动作表", "分派"], "solution": "连续多轮空巡检时，正确行为是维持一句结论，不扩写探索计划。", "updated_at": "2026-10-24T16:05:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "mp-4",
+    "source": { "root": "d-fx-distill-02", "project": "distill" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-27T03:00:00.000Z",
+    "task": "digest 注入段还是超预算：按 1500 token 预算继续裁，先看 L1 note 段的占比。",
+    "expected_background": [
+      "预算超标主因是 note 摘录过长（旧值 400 字）",
+      "note 摘录上限改 100 字的方案已确认",
+      "L2 页摘录 150 字维持不动"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-distill-b2", "event": "post-tool-use", "tool": "bash", "summary": "digest 渲染 token 估算：note 段占 62%", "created_at": "2026-10-26T22:14:00.000Z" },
+        { "session_id": "fx-distill-b2", "event": "stop", "summary": "note 摘录 400→100 后总预算回落达标", "created_at": "2026-10-26T22:35:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "e-mp4-1", "kind": "experience", "task": "digest 预算超标的定位顺序", "search_keys": ["digest", "预算", "note", "摘录"], "solution": "先按段测 token 占比再定裁剪对象：note 段是常见元凶；L2 段动之前先看 excerpt 上限是否已是低位。", "updated_at": "2026-10-26T22:40:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "wx-1",
+    "source": { "root": "d-fx-web-03", "project": "web" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T06:00:00.000Z",
+    "task": "继续打磨 memory-landing 落地页：保持零外部字体，把英文 API 表补齐。",
+    "expected_background": [
+      "落地页自足单文件约束：内联 CSS、系统字体栈、零外部请求",
+      "落地页域名同时是公开 API 入口（/healthz /digest /mcp），页面要交代端点与鉴权形态",
+      "共享设计令牌 --bg/--ink/--cyan/--amber 与主站同源"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-web-d1", "event": "pre-tool-use", "tool": "browser", "summary": "视口 390px 截图对比中英两版", "created_at": "2026-10-25T11:00:00.000Z" },
+        { "session_id": "fx-web-d1", "event": "stop", "summary": "英文表补齐后两版行数一致，无外部请求", "created_at": "2026-10-25T11:20:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-wx1-1", "kind": "fact", "task": "落地页单文件自足：内联样式、系统字体、零外部字体请求", "search_keys": ["landing", "单文件", "字体"], "solution": "新增区块一律内联，不引外链资源。", "updated_at": "2026-10-25T11:25:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "wx-2",
+    "source": { "root": "d-fx-web-03", "project": "web" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-24T10:00:00.000Z",
+    "task": "官网移动端溢出修复：grid 子项里放长 URL 的那块要收住。",
+    "expected_background": [
+      "根因：grid 子项 min-width:auto 被长 URL 撑破",
+      "修法：子项 min-width:0 + 长串 overflow-wrap",
+      "修复在 390px 视口实测通过"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-web-d2", "event": "user-prompt-submit", "summary": "移动端页脚链接把布局顶宽了", "created_at": "2026-10-24T09:10:00.000Z" },
+        { "session_id": "fx-web-d2", "event": "post-tool-use", "tool": "browser", "summary": "min-width:0 后 390px 无横向滚动", "created_at": "2026-10-24T09:42:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "e-wx2-1", "kind": "experience", "task": "移动端横向溢出的定位路径", "search_keys": ["grid", "min-width", "溢出", "移动端"], "solution": "先查 grid/flex 子项最小尺寸语义（auto 会被长不可断串撑破），再决定是收子项还是换断词策略。", "updated_at": "2026-10-24T09:50:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "wx-3",
+    "source": { "root": "d-fx-web-03", "project": "web" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-28T04:00:00.000Z",
+    "task": "官网换版：重算 site 文件的 sha256 出补给单，边缘换完做线上复核。",
+    "expected_background": [
+      "补给单形态：按文件列内容 sha256 前 16 位",
+      "边缘从仓库直拉原文落静态目录，按哈希校验后才切换",
+      "换后复核用标题 grep 与样式令牌 grep 两条命令"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-web-d3", "event": "pre-tool-use", "tool": "bash", "summary": "{\"command\":\"sha256sum site/index.html site/style.css site/script.js\"}", "created_at": "2026-10-27T22:30:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-wx3-1", "summary": "补给单发出后待边缘换版复核", "next_steps": "curl 首页 grep 标题；curl 样式 grep 世界令牌", "to_agent": null, "state": "open", "created_at": "2026-10-27T22:40:00.000Z" }
+      ],
+      "pages": []
+    }
+  },
+  {
+    "id": "wx-4",
+    "source": { "root": "d-fx-web-03", "project": "web" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-25T07:00:00.000Z",
+    "task": "课程构建门又红了：按双语成对规则诊断，缺哪侧补哪侧。",
+    "expected_background": [
+      "构建门要求 zh/en 同 slug 双件齐，缺一即拦",
+      "英文页在无语言前缀的根路径，中文在 /zh 前缀下",
+      "正文体字段不得再带一层 frontmatter，否则页顶出现第二块元数据"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-web-d4", "event": "post-tool-use", "tool": "ci", "summary": "twins gate FAIL: course x 缺 en 件", "created_at": "2026-10-25T06:12:00.000Z" },
+        { "session_id": "fx-web-d4", "event": "stop", "summary": "补 en 件后构建转绿", "created_at": "2026-10-25T06:44:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "e-wx4-1", "kind": "experience", "task": "内容门红了的三步诊断", "search_keys": ["双语", "构建门", "frontmatter"], "solution": "先读门报错指向的规则名（twins/语言层/字段形制），再对照仓内清单，最后才动正文；别一上来改文案。", "updated_at": "2026-10-25T06:50:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "note-1",
+    "source": { "root": "u-demo@example.local", "project": "ops" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-25T00:30:00.000Z",
+    "task": "继续本周备份：按纪律判断恢复演练这周要不要跑。",
+    "expected_background": [
+      "sqlite 快照每日一份，副本另存第二介质；恢复演练先校验文件校验和",
+      "周报口径：结论在前证据在后，逐条不超过 5 行",
+      "note 车道由会话写面回写，是 L1 而非 L2"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-ops-e1", "event": "user-prompt-submit", "summary": "这周恢复演练排期定不定", "created_at": "2026-10-24T12:00:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [],
+      "notes": [
+        { "id": "n1a", "title": "备份纪律", "body": "sqlite 快照每日一行；副本必须落第二介质。恢复演练前先校验文件校验和，校验不过不称「可恢复」。", "updated_at": "2026-10-18T02:00:00.000Z" },
+        { "id": "n1b", "title": "周报口径（用户要求长期记住）", "body": "按项目汇总，逐条不超过 5 行；结论在前，证据在后。不要流水账。", "updated_at": "2026-10-24T12:30:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "note-2",
+    "source": { "root": "d-fx-ship-02", "project": "ship" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T09:30:00.000Z",
+    "task": "发新版本：先过发布检查清单，评测不能跳。",
+    "expected_background": [
+      "发布前必须跑全量 npm test + eval-continue 校准，结果记录进发布台账",
+      "npm files 字段必须含 dist，否则发出去是空壳",
+      "bin 入口要带 shebang，否则全局安装即废"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-ship-f1", "event": "user-prompt-submit", "summary": "准备发 0.2.x，列一下发布前清单", "created_at": "2026-10-26T08:00:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [],
+      "notes": [
+        { "id": "n2a", "title": "发布纪律", "body": "发布前 npm test 全量 + eval-continue 各跑一遍；两笔结果都要进发布台账，缺一不发。", "updated_at": "2026-10-21T07:00:00.000Z" },
+        { "id": "n2b", "title": "npm 发包两坑", "body": "files 只列 README → 空壳包；bin 无 shebang → 全局装完不能用。两条都在发布台账留了改法。", "updated_at": "2026-10-25T15:00:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "note-3",
+    "source": { "root": "u-demo@example.local", "project": "distill" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-27T01:15:00.000Z",
+    "task": "接着调 distiller 车道：先回忆日预算上限，再定这轮批预算。",
+    "expected_background": [
+      "owner 日预算 600k tokens，批预算从当日剩余量扣",
+      "超限即冷却次日续跑，不记失败",
+      "预算口径这条是 note（L1），不在 L2 页里"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-ops-e2", "event": "user-prompt-submit", "summary": "今天还剩多少预算，能不能开 12 条一批", "created_at": "2026-10-27T00:50:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-note3-1", "kind": "fact", "task": "冷却策略：超限当日停、次日续，不计入失败", "search_keys": ["冷却", "超限", "失败"], "solution": "失败桶只收错误，不收预算冷却。", "updated_at": "2026-10-25T09:00:00.000Z", "supersedes": [] }
+      ],
+      "notes": [
+        { "id": "n3", "title": "distill 预算纪律", "body": "日预算 600k tokens/owner；批预算从当日剩余量扣，超限即冷却次日续跑。", "updated_at": "2026-10-23T08:30:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "ref-1",
+    "source": { "root": "d-fx-web-03", "project": "web" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-27T05:00:00.000Z",
+    "task": "digest 名份车道：验证 draft 引用页不进查询命中、canonical 进，把用例固化。",
+    "expected_background": [
+      "名份规则：canonical 顺位在前进，draft 不进查询命中",
+      "引用页是薄索引：正文只留摘要与出处，不复制内容",
+      "设计系统与补给手册各有一枚 canonical 引用在案"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-web-d5", "event": "post-tool-use", "tool": "bash", "summary": "queryReferences(project,'补给',3) → 只出 canonical 件，draft 未进", "created_at": "2026-10-27T04:20:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-ref1-1", "kind": "fact", "task": "名份车道：canonical 进位、draft 不进查询命中", "search_keys": ["canonical", "draft", "名份"], "solution": "digest 渲染处 name-only 条目排 L2/note 前。", "updated_at": "2026-10-26T10:00:00.000Z", "supersedes": [] }
+      ],
+      "references": [
+        { "id": "r-ref-a", "title": "设计系统 DESIGN.md 索引", "summary": "官网视觉谱系与设计令牌出处索引页。", "source_ref": "resource:design", "tags": ["设计", "令牌"], "tier": "canonical", "updated_at": "2026-10-20T08:00:00.000Z" },
+        { "id": "r-ref-b", "title": "补给运行手册索引", "summary": "静态站换版与哈希校验流程的出处索引。", "source_ref": "resource:supply", "tags": ["补给", "校验"], "tier": "canonical", "updated_at": "2026-10-22T08:00:00.000Z" },
+        { "id": "r-ref-c", "title": "文案改稿（草稿）", "summary": "首页区块措辞改稿草稿。", "source_ref": "resource:copy-draft", "tags": ["草稿"], "tier": "draft", "updated_at": "2026-10-26T08:00:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "rpt-1",
+    "source": { "root": "u-demo@example.local", "project": "ops" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T11:00:00.000Z",
+    "task": "本周汇报收尾：认领 handoff、核对 next_steps 是否闭环。",
+    "expected_background": [
+      "汇报模板三段式：本周产出 / 风险 / 下周计划，每段不超过 3 行",
+      "上一条 handoff 已被 cancelled（议题失效），本轮只剩一条待认领",
+      "cancelled 的 handoff 不占汇报篇幅"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-ops-e3", "event": "stop", "summary": "汇报草稿成形，待认领项只剩 h-rpt-2", "created_at": "2026-10-26T10:20:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-rpt-1", "summary": "旧议题：是否给 reembed 加进度日志", "next_steps": "已被取消：结论是先不加", "to_agent": null, "state": "cancelled", "created_at": "2026-10-19T08:00:00.000Z" },
+        { "id": "h-rpt-2", "summary": "认领：digest 车道回归用例清单", "next_steps": "列 5 条核心回归，标负责人", "to_agent": null, "state": "open", "created_at": "2026-10-26T06:00:00.000Z" }
+      ],
+      "pages": [],
+      "notes": [
+        { "id": "n-rpt-1", "title": "汇报模板（用户要求）", "body": "本周产出 / 风险 / 下周计划三段，各段不超过 3 行；不写流水账。", "updated_at": "2026-10-24T12:35:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "deep-1",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-27T12:00:00.000Z",
+    "task": "person token 轮换收尾：旧 token 宽限窗还没关掉，把停用步骤跑完。",
+    "expected_background": [
+      "轮换方案：先发新 token，旧 token 进 24h 宽限，再吊销",
+      "宽限窗实现按 tokenId 前缀判定",
+      "上一场已发新 token，旧 token 当时仍在宽限期内"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a4", "event": "pre-tool-use", "tool": "bash", "summary": "{\"command\":\"curl -s -X POST localhost:49375/admin/mint -H 'Authorization: Bearer $PLATFORM' -d '{\\\"kind\\\":\\\"person\\\"}'\"}", "created_at": "2026-10-26T11:30:00.000Z" },
+        { "session_id": "fx-serve-a4", "event": "post-tool-use", "tool": "bash", "summary": "新 person token 铸造成功，旧 token 列入 24h 宽限表", "created_at": "2026-10-26T11:31:00.000Z" },
+        { "session_id": "fx-serve-a4", "event": "user-prompt-submit", "summary": "宽限窗内旧 token 还能用吗，什么时候关", "created_at": "2026-10-26T11:45:00.000Z" },
+        { "session_id": "fx-serve-a4", "event": "stop", "summary": "结论：宽限 24h 到点即吊销；吊销前跑一遍读面对照", "created_at": "2026-10-26T11:50:00.000Z" },
+        { "session_id": "fx-serve-a5", "event": "post-tool-use", "tool": "bash", "summary": "旧 token 探测 /digest → 200（宽限期内）", "created_at": "2026-10-27T06:00:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-deep1-1", "summary": "到点执行旧 token 吊销并复核读面", "next_steps": "吊销后旧 token 探测应 401", "to_agent": "serve-bot", "state": "claimed", "created_at": "2026-10-27T06:10:00.000Z" }
+      ],
+      "pages": [
+        { "id": "f-deep1-0", "kind": "fact", "task": "token 轮换后旧 token 立即失效", "search_keys": ["轮换", "旧 token", "失效"], "solution": "早期口径，已被宽限窗方案更正。", "updated_at": "2026-10-19T10:00:00.000Z", "supersedes": [] },
+        { "id": "f-deep1-1", "kind": "fact", "task": "token 轮换采用 24h 宽限窗，按 tokenId 前缀判定，到点吊销", "search_keys": ["轮换", "宽限", "24h"], "solution": "宽限期内新旧并存；吊销即 401。", "updated_at": "2026-10-26T11:52:00.000Z", "supersedes": ["f-deep1-0"] }
+      ]
+    }
+  },
+  {
+    "id": "deep-2",
+    "source": { "root": "d-fx-ship-02", "project": "ship" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-28T02:00:00.000Z",
+    "task": "0.2.x 发包：回忆上次发布缺口，把该补的闸补齐再走清单。",
+    "expected_background": [
+      "上次两笔缺口：files 空壳与 bin 缺 shebang，都已写进缺口台账",
+      "发布纪律要求 npm test + eval-continue 双绿后记台账",
+      "CLI 帮助文案已改品牌名，env 与代码键不动"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-ship-f2", "event": "pre-tool-use", "tool": "bash", "summary": "{\"command\":\"npm pack --dry-run 2>&1 | tail -8\"}", "created_at": "2026-10-27T15:00:00.000Z" },
+        { "session_id": "fx-ship-f2", "event": "post-tool-use", "tool": "bash", "summary": "包内件：dist + README + bin；无空壳迹象", "created_at": "2026-10-27T15:01:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-deep2-1", "summary": "发布台账补一行：本次走过的闸与结果", "next_steps": "npm test/eval 双绿截图入台账", "to_agent": null, "state": "open", "created_at": "2026-10-27T15:10:00.000Z" }
+      ],
+      "pages": [
+        { "id": "e-deep2-1", "kind": "experience", "task": "发包前三连检：files、shebang、帮助面品牌", "search_keys": ["npm", "pack", "shebang", "brand"], "solution": "dry-run 看件单；head -1 查 shebang；--help 出品牌名。三连全过才进发布清单。", "updated_at": "2026-10-27T15:20:00.000Z", "supersedes": [] }
+      ],
+      "notes": [
+        { "id": "n-deep2-1", "title": "发布缺口台账（用户令记住）", "body": "空壳包与坏 shebang 两笔缺口：修法已固化进发布清单，复跑一次 dry-run 即可销账。", "updated_at": "2026-10-27T16:00:00.000Z" }
+      ]
+    }
+  },
+  {
+    "id": "sem-1",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-26T12:00:00.000Z",
+    "task": "确认演示流量当前走哪台部署目标，把拓扑写进共享页。",
+    "expected_background": [
+      "当前部署目标为 node-a，演示流量全部走 node-a",
+      "拓扑页更新要连带补给单复核",
+      "读面按 subject 收敛到最新一条"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a6", "event": "stop", "summary": "部署目标暂维持 node-a 不变", "created_at": "2026-10-25T10:00:00.000Z" }
+      ],
+      "handoffs": [],
+      "pages": [
+        { "id": "f-sem-old", "kind": "fact", "task": "部署目标 node-a，所有演示流量走 node-a", "search_keys": ["部署目标", "node-a", "演示流量"], "solution": "2026-10 确认的现役拓扑（虚构示例数据）。", "updated_at": "2026-10-25T10:10:00.000Z", "supersedes": [] }
+      ]
+    }
+  },
+  {
+    "id": "sem-2",
+    "source": { "root": "d-fx-serve-01", "project": "serve" },
+    "review": "reviewed",
+    "boundary_at": "2026-10-27T12:00:00.000Z",
+    "task": "接新会话继续：部署目标变更后的流量切换完了，复核演示域名健康。",
+    "expected_background": [
+      "部署目标已改为 node-b，node-a 退役，演示流量改走 node-b（f-sem-old 被更正）",
+      "切换后先探 /healthz 确认旧节点下线，再更新补给单",
+      "旧节点下线窗口还挂着一条 open handoff"
+    ],
+    "history": {
+      "observations": [
+        { "session_id": "fx-serve-a7", "event": "post-tool-use", "tool": "bash", "summary": "curl -s https://demo.example/healthz → {\"status\":\"ok\"}（已指 node-b）", "created_at": "2026-10-27T06:00:00.000Z" }
+      ],
+      "handoffs": [
+        { "id": "h-sem2-1", "summary": "旧节点 node-a 下周下线", "next_steps": "下线前最后一次全量读面对照", "to_agent": null, "state": "open", "created_at": "2026-10-27T06:05:00.000Z" }
+      ],
+      "pages": [
+        { "id": "f-sem-new", "kind": "fact", "task": "更正：部署目标已改为 node-b，node-a 退役，所有演示流量改走 node-b", "search_keys": ["部署目标", "node-b", "切换"], "solution": "切换完成态；旧事实 f-sem-old 保留供审计，读面不再出。", "updated_at": "2026-10-27T06:10:00.000Z", "supersedes": ["f-sem-old"] }
+      ],
+      "notes": [
+        { "id": "n-sem2-1", "title": "流量切换纪律", "body": "切换后先探旧端点确认下线，再动补给单；两事不同序会漏。", "updated_at": "2026-10-26T09:00:00.000Z" }
+      ]
+    }
+  }
+]

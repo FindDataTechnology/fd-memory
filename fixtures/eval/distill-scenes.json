@@ -1,0 +1,244 @@
+[
+  {
+    "id": "s01",
+    "scene": "A-arc balance triage",
+    "expect_keywords": [
+      "余额",
+      "lane-gw"
+    ],
+    "sessions": [
+      {
+        "session_id": "srv-eval-s01",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "平台 API 突然 403，帮我查一下是不是余额用尽了"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "probe_models",
+            "summary": "{\"path\":\"/v1/models\",\"max_tokens\":4}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "probe_models",
+            "summary": "200 零花费返回——车道活着"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "check_balance",
+            "summary": "{\"account\":\"platform-test@findmail.com\",\"panel\":\"lane-gw\"}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "check_balance",
+            "summary": "lane-gw 面板显示 INSUFFICIENT_BALANCE，余额 0"
+          },
+          {
+            "event": "stop",
+            "summary": "结论：403 是 lane-gw 余额耗尽，充值即恢复；判据=零花费探针 200 + 面板 INSUFFICIENT_BALANCE"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "s10",
+    "scene": "first agent hits registry tag quota",
+    "expect_keywords": [
+      "tag",
+      "配额"
+    ],
+    "sessions": [
+      {
+        "session_id": "srv-eval-s10",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "镜像推不上去，报错帮我看看"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "registry_tags",
+            "summary": "{\"repo\":\"team-a/agent\"}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "registry_tags",
+            "summary": "registry-A 仓库 tag 数 100/100 已满"
+          },
+          {
+            "event": "stop",
+            "summary": "单仓库 100 tag 配额超限：按 digest 删旧 tag 后配额回收，99→7；清理脚本 /tmp/purge-tags.py"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "s11",
+    "scene": "second agent re-asks the same quota problem — must UPDATE not duplicate ADD",
+    "expect_keywords": [
+      "tag",
+      "配额"
+    ],
+    "dedup_of": "s10",
+    "sessions": [
+      {
+        "session_id": "srv-eval-s11",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "我也撞了推镜像失败，另一个仓库 team-b/gateway 的"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "registry_tags",
+            "summary": "{\"repo\":\"team-b/gateway\"}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "registry_tags",
+            "summary": "同样 100/100 满"
+          },
+          {
+            "event": "stop",
+            "summary": "与已知 tag 配额问题同根因，只是仓库不同：team-b/gateway 也按 digest 清理即可"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "s20a",
+    "scene": "same-subject two sessions — fact must merge into a supersede chain, not accumulate (part 1)",
+    "expect_keywords": [],
+    "fact_merge": false,
+    "sessions": [
+      {
+        "session_id": "srv-eval-s20a",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "G7 分组一直 5xx，看看根因"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "run_checks",
+            "summary": "{\"group\":\"G7\"}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "run_checks",
+            "summary": "上游 DNS 解析超时"
+          },
+          {
+            "event": "stop",
+            "summary": "G7 上游 DNS 超时；切换备用 DNS 后恢复"
+          }
+        ]
+      }
+    ],
+    "no_output_gate": true
+  },
+  {
+    "id": "s20b",
+    "scene": "same-subject two sessions — fact must merge into a supersede chain, not accumulate (part 2)",
+    "expect_keywords": [
+      "DNS"
+    ],
+    "fact_merge": true,
+    "sessions": [
+      {
+        "session_id": "srv-eval-s20b",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "G7 的 DNS 超时问题又出现了一次"
+          },
+          {
+            "event": "pre-tool-use",
+            "tool": "run_checks",
+            "summary": "{\"group\":\"G7\",\"deep\":true}"
+          },
+          {
+            "event": "post-tool-use",
+            "tool": "run_checks",
+            "summary": "确认是 DNS TTL 配置过短"
+          },
+          {
+            "event": "stop",
+            "summary": "G7 上游 DNS 超时复现，根因为 TTL 过短；已调长"
+          }
+        ]
+      }
+    ],
+    "no_output_gate": true
+  },
+  {
+    "id": "s21a",
+    "scene": "subject drift pair — LLM judge must merge the drifted phrasings (part 1)",
+    "expect_keywords": [],
+    "fact_merge": false,
+    "sessions": [
+      {
+        "session_id": "srv-eval-s21a",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "node-a 的 deploy/svc-gateway 调用全 403 了"
+          },
+          {
+            "event": "stop",
+            "summary": "node-a deploy/svc-gateway 车道 403：网关剥头导致，补回 Authorization"
+          }
+        ]
+      }
+    ],
+    "no_output_gate": true
+  },
+  {
+    "id": "s21b",
+    "scene": "subject drift pair — LLM judge must merge the drifted phrasings (part 2)",
+    "expect_keywords": [
+      "svc-gateway"
+    ],
+    "fact_merge": true,
+    "sessions": [
+      {
+        "session_id": "srv-eval-s21b",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "node-a 上的 deploy/svc-gateway (namespace serving) 现在恢复了吗"
+          },
+          {
+            "event": "stop",
+            "summary": "node-a 上的 deploy/svc-gateway (namespace serving) 已恢复，403 消除"
+          }
+        ]
+      }
+    ],
+    "no_output_gate": true
+  },
+  {
+    "id": "s22",
+    "scene": "paraphrase recall — vector path must surface the DNS experience for a wording-disjoint query",
+    "expect_keywords": [],
+    "sessions": [
+      {
+        "session_id": "srv-eval-s22",
+        "events": [
+          {
+            "event": "user-prompt-submit",
+            "summary": "镜像往 registry 推总是被服务器拒绝上传，什么情况"
+          },
+          {
+            "event": "stop",
+            "summary": "registry 上传被拒的排查路径：先看 tag 配额，再看认证头"
+          }
+        ]
+      }
+    ]
+  }
+]
