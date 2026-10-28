@@ -204,3 +204,89 @@ test("/digest reference 渲染为名份引用", async () => {
     server.close();
   }
 });
+
+// ── 2026-10-28 production finding: the tagging hook was unreachable ─────────
+//
+// The only production trigger chain is capture → notifyCapture → drain →
+// distillOne. An earlier fix hung tagPass on distillNow(), which nothing but
+// tests calls — production ran 24h with zero [tag] lines and every tag_cursor
+// empty. These two tests pin the REAL path and the material exclusion that
+// keeps correction notes out of L2.
+
+function schedFixture(data: string, roots: Map<string, StoreRoot>, tagResp: () => Response) {
+  const calls: Array<{ path: string; body: unknown }> = [];
+  // Mutable clock: drain only picks up a notified project once its debounce
+  // window (60s for person roots) has elapsed. Tests advance it explicitly.
+  const clock = { t: Date.now() };
+  return import("../distill-scheduler.js").then(async (schedMod) => {
+    const tokens = new (await import("../auth.js")).TokenStore(join(data, "tokens.db"), "p");
+    const sched = new schedMod.DistillScheduler({
+      roots,
+      openRoot: (k: string) => { const r = roots.get(k); if (!r) throw new Error("no root"); return r; },
+      tokens,
+      env: { ...process.env, FD_MEMORY_DISTILL_ENABLED: "1", FD_MEMORY_DISTILLER_URL: "http://sidecar.stub", DISTILLER_SHARED_TOKEN: "t" } as NodeJS.ProcessEnv,
+      fetchImpl: (async (url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        calls.push({ path: u.replace("http://sidecar.stub", ""), body });
+        if (u.endsWith("/distill")) return { ok: true, status: 200, json: async () => ({ facts: [], experiences: [], llm_calls: [], tokens: 10, errors: [] }) } as Response;
+        if (u.endsWith("/tag")) return tagResp();
+        return { ok: true, status: 200, json: async () => ({ vectors: [], model: "m", tokens: 0, errors: [] }) } as Response;
+      }) as unknown as typeof fetch,
+      now: () => clock.t,
+    });
+    return { sched, calls, clock };
+  });
+}
+
+test("tagging lane rides the PRODUCTION path (drain→distillOne), not just distillNow", async () => {
+  __resetEmbedGate();
+  const data = tmpData();
+  const root = new StoreRoot(join(data, "owners"), "u-tester");
+  const roots = new Map([["u-tester", root]]);
+  root.writePage("default", "references", "t1", newPage("reference", "签约合同流程", "正式签约指南", { source_ref: "resource:lib/a" }));
+  const { sched, calls, clock } = await schedFixture(data, roots, () => ({ ok: true, status: 200, json: async () => ({ results: [{ idx: 0, tags: ["合同"], tier: "stable" }], tokens: 7, errors: [] }) }) as Response);
+
+  // No distillation material exists (no observations/handoffs/notes) — the
+  // old hook placement would have early-returned and never tagged.
+  assert.equal(root.db.recentObservations(10, ["default"]).length, 0, "no observation material");
+
+  // notifyCapture + drain == exactly what capture does in production.
+  sched.notifyCapture("u-tester", "default", [{ event: "session-end" }]);
+  clock.t += 120_000; // past the 60s person-root debounce
+  await sched.drain();
+
+  assert.equal(calls.filter((c) => c.path === "/tag").length, 1, "/tag reached via drain");
+  const page = root.readPageByRel("default/references/t1.md");
+  assert.deepEqual(page?.frontmatter?.tags, ["合同"]);
+  assert.equal(page?.frontmatter?.tags_origin, "ai");
+  // The cursor advanced, so a second drain does not re-tag.
+  const state = root.db.getDistillState("default");
+  assert.ok(state?.tag_cursor, "tag_cursor advanced");
+  clock.t += 120_000;
+  await sched.drain();
+  assert.equal(calls.filter((c) => c.path === "/tag").length, 1, "no re-tag on the next drain");
+});
+
+test("correction notes never become distillation material", async () => {
+  __resetEmbedGate();
+  const data = tmpData();
+  const root = new StoreRoot(join(data, "owners"), "u-tester");
+  const roots = new Map([["u-tester", root]]);
+  root.writePage("default", "notes", "n1", newPage("note", "组合周报口径", "每周五 17:00 出，按持仓加权。"));
+  root.writePage("default", "notes", "c1", newPage("note", "修正：default/references/r1.md", "tags: [旧] → [新]", { origin: "human", correction_of: "r1" }));
+  const { sched, calls, clock } = await schedFixture(data, roots, () => ({ ok: true, status: 200, json: async () => ({ results: [], tokens: 0, errors: [] }) }) as Response);
+
+  sched.notifyCapture("u-tester", "default", [{ event: "session-end" }]);
+  clock.t += 120_000;
+  await sched.drain();
+
+  const distill = calls.find((c) => c.path === "/distill");
+  assert.ok(distill, "distillation ran (the real note gave it material)");
+  const items = (distill.body as { items: Array<{ summary: string }> }).items;
+  assert.equal(items.length, 1, "only the real note is distilled");
+  assert.match(items[0].summary, /组合周报口径/);
+  assert.ok(!items.some((i) => i.summary.includes("修正：")), "the correction note is excluded from raw material");
+  // …but the tagging lane still reads it as vocabulary.
+  assert.equal(root.db.correctionsAfter("default", "", 10).length, 1, "corrections stay queryable for the tag lane");
+});

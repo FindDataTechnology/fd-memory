@@ -212,11 +212,6 @@ export class DistillScheduler {
     const key = DistillScheduler.key(rootKey, project);
     if (this.inflight.has(key)) return;
     await this.distillOne(rootKey, project);
-    // Tagging lane: reference 页打标独立于蒸馏结果（即便该 roots/project
-    // 当次无 obs/handoffs/notes 素材也要给 unsettled reference 打标）。
-    const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
-    const state = root.db.getDistillState(project);
-    await this.tagPass(root, rootKey, project, state ?? null);
   }
 
   private fallbackScan(): void {
@@ -469,7 +464,29 @@ export class DistillScheduler {
       noteDistill(false, 0, 0, String((e as Error)?.message ?? e));
       this.log.warn(`[distill] ${key} failed (cursor kept, backoff ${Math.round(backoff / 1000)}s): ${(e as Error)?.message ?? e}`);
     } finally {
-      this.inflight.delete(key);
+      // Tagging lane (reference pages) rides distillOne, NOT distillNow: the
+      // production trigger chain is capture → notifyCapture → drain →
+      // distillOne, and distillNow is only reached from tests — an earlier
+      // version hung the hook there and production never tagged a single page
+      // (verified 2026-10-28: zero [tag] lines, every tag_cursor empty).
+      // It also runs on the early returns above (no material / budget /
+      // backoff) because a reference page needs no distillation material.
+      try {
+        await this.tagPassSafe(rootKey, project);
+      } finally {
+        this.inflight.delete(key);
+      }
+    }
+  }
+
+  // tagPass with its own root resolution and a hard mute: tagging is a
+  // convenience lane and must never turn a good distillation into a failure.
+  private async tagPassSafe(rootKey: string, project: string): Promise<void> {
+    try {
+      const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
+      await this.tagPass(root, rootKey, project, root.db.getDistillState(project) ?? null);
+    } catch (e) {
+      this.log.warn(`[tag] ${rootKey}/${project}: skipped (${(e as Error)?.message ?? e})`);
     }
   }
 }

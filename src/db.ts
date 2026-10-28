@@ -289,13 +289,18 @@ export class RootDb {
       project,
       updated_at: new Date().toISOString(),
     };
+    // tag_cursor rides this statement too: the column was added by the
+    // tagging lane's migration but never listed here, so every write silently
+    // dropped it and the lane re-tagged the same pages forever (2026-10-28
+    // production: all four cursors read back empty).
     this.db.prepare(
-      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, note_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
-       VALUES (?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, note_cursor, tag_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(project) DO UPDATE SET obs_cursor=excluded.obs_cursor, handoff_cursor=excluded.handoff_cursor, note_cursor=excluded.note_cursor,
+         tag_cursor=excluded.tag_cursor,
          updated_at=excluded.updated_at, last_error=excluded.last_error, last_tokens=excluded.last_tokens,
          gaps=excluded.gaps, next_attempt_at=excluded.next_attempt_at, pending_since=excluded.pending_since`,
-    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
+    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.tag_cursor ?? "", next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
   }
 
   // /digest L1 segment (2026-10-26 benchmark): a type-blind recentPages window
@@ -332,9 +337,15 @@ export class RootDb {
   // u-root distillation (add-u-root-distillation): note pages as distill
   // inputs, cursor = updated_at ISO string (same shape as handoff_cursor);
   // forget/excluded rows drop out of the pages index so they never re-enter.
-  notesAfter(project: string, cursor: string, limit = 120): Array<{ path: string; title: string; body: string; updated_at: string }> {
+  // Correction notes (title prefix 修正：, written by /pages/mutate) are NOT raw
+  // material: they describe the memory's own bookkeeping, and distilling them
+  // produced L2 "facts" like "用户要求把 tier 从 draft 改为 canonical" that then
+  // rode the digest and crowded out real recall. They are excluded by default;
+  // the tagging lane reads them through correctionsAfter() as vocabulary only.
+  notesAfter(project: string, cursor: string, limit = 120, { includeCorrections = false } = {}): Array<{ path: string; title: string; body: string; updated_at: string }> {
+    const gate = includeCorrections ? "" : " AND title NOT LIKE '修正：%'";
     return this.db
-      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' AND updated_at>? ORDER BY updated_at LIMIT ?")
+      .prepare(`SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' AND updated_at>?${gate} ORDER BY updated_at LIMIT ?`)
       .all(project, cursor, limit) as never;
   }
 
