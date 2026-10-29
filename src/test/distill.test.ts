@@ -158,6 +158,12 @@ test("scheduler: success writes pages, advances cursor, bills budget; second run
       if (String(url).endsWith("/embed")) {
         return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
       }
+      // promotion lane (add-tier-promotion-candidates) rides the same stub:
+      // answer "no proposals" rather than the distill payload, or its token
+      // accounting double-books the budget this test asserts on.
+      if (String(url).endsWith("/promote")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
       return { ok: true, status: 200, json: async () => ({
         facts: [{ id: "fact_a", engine: "engine:test/1", statement: "G7 DNS 超时", subject: "G7", sources: ["session:s1"], supersedes: [] }],
         experiences: [{ id: "exp_a", engine: "engine:test/1", task: "5xx 排障", search_keys: ["5xx"], solution: "切 DNS", sources: ["session:s1"], supersedes: [] }],

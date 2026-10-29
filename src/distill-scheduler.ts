@@ -13,7 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
-import { noteDistill, noteVectorEvent } from "./metrics.js";
+import { noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -233,6 +233,82 @@ export class DistillScheduler {
     const lastTs = pending[pending.length - 1].updated_at;
     root.db.upsertDistillState(project, { tag_cursor: lastTs });
     if (tagged) this.log.log(`[tag] ${rootKey}/${project}: tagged=${tagged}/${pending.length} tokens=${spentTotal}`);
+  }
+
+  // Tier promotion lane (add-tier-promotion-candidates D1-D4): ask the
+  // sidecar whether draft pages deserve `stable`, and land the verdict as a
+  // PENDING PROPOSAL — the page's tier is never touched here (spec: AI 提议
+  // 不直接晋级; a human accepts/ignores via /memory/promotions). Rides the
+  // same per-owner daily-budget gate as the tagging lane, its own
+  // promotion_cursor so tag-lane progress cannot starve selection, and an
+  // ignore cooldown so a rejected page is not re-nagged daily.
+  private promotionEnabled(): boolean {
+    // Default ON: the whole point of this lane is that the tier ladder was
+    // empty (draft 99.8%); a switch nobody flips recreates the dead pipe.
+    // Rollback lever = FD_MEMORY_PROMOTION_ENABLED=0 (design Migration).
+    const v = String(this.opts.env?.FD_MEMORY_PROMOTION_ENABLED ?? "1").trim().toLowerCase();
+    return v !== "0" && v !== "false";
+  }
+
+  private promotionCooldownDays(): number {
+    return Number(this.opts.env?.FD_MEMORY_PROMOTION_IGNORE_COOLDAYS ?? 14) || 14;
+  }
+
+  private async promotionPass(root: StoreRoot, rootKey: string, project: string, state: { promotion_cursor?: string } | null): Promise<void> {
+    if (!this.promotionEnabled()) return;
+    const cursor = state?.promotion_cursor ?? "";
+    const pending = root.db.promotionCandidates(project, cursor, 20);
+    if (pending.length === 0) return;
+    const day = new Date().toISOString().slice(0, 10);
+    const used = this.opts.tokens.distillBudgetUsed(rootKey, day);
+    if (used.tokens >= this.dailyLimit()) return; // budget exhausted: stop proposing; existing proposals stay acceptable
+    const items = pending.map((p, i) => ({ idx: i, title: p.title, summary: p.body, current_tier: p.tier }));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/promote`, {
+        method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+        body: JSON.stringify({ scope: `${rootKey}/${project}`, items }), signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) { this.log.warn(`[promo] ${rootKey}/${project}: sidecar ${res.status}`); return; }
+    const out = (await res.json()) as { results: Array<{ idx: number; suggest_tier: string; reason?: string }>; tokens: number; errors: string[] };
+    if (out.errors?.length) this.log.warn(`[promo] ${rootKey}/${project}: ${out.errors.slice(0, 2).join("; ")}`);
+    notePromotion("candidates", pending.length);
+    const cooldownSince = new Date(this.now() - this.promotionCooldownDays() * 86_400_000).toISOString();
+    let proposed = 0;
+    for (const r of out.results ?? []) {
+      if (String(r.suggest_tier ?? "") !== "stable") continue; // "none" = no proposal
+      const p = pending[r.idx];
+      if (!p) continue;
+      // Re-read the page: the judgement was made on a snapshot, the write
+      // lands on the live frontmatter — and the ceiling (stable max) is
+      // enforced HERE too, not only in the sidecar parser (3.3).
+      const page = root.readPageByRel(p.path);
+      if (!page) continue;
+      const fm: Record<string, unknown> = page.frontmatter ?? {};
+      if (String(fm.tier_origin ?? "") === "human") continue; // human slots never get proposals
+      if (String(fm.tier ?? "draft") !== "draft") continue; // settled while we were judging
+      if (root.db.tierProposalIgnoredWithin(project, p.path, cooldownSince)) continue; // D4 cooldown
+      // The ceiling at landing: only a stable proposal is ever stored — the
+      // filter above already drops "none", and anything the sidecar somehow
+      // returns above stable collapses here (3.3), never onto the page.
+      root.db.upsertTierProposal(project, p.path, {
+        proposed_tier: "stable",
+        reason: String(r.reason ?? "").slice(0, 240),
+        proposed_at: new Date().toISOString(),
+      });
+      proposed++;
+    }
+    const spentTotal = Number(out.tokens ?? 0) || 0;
+    if (spentTotal > 0) this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, 1);
+    const lastTs = pending[pending.length - 1].updated_at;
+    root.db.upsertDistillState(project, { promotion_cursor: lastTs });
+    notePromotion("proposed", proposed);
+    if (proposed) this.log.log(`[promo] ${rootKey}/${project}: proposed=${proposed}/${pending.length} tokens=${spentTotal}`);
   }
 
   async distillNow(rootKey: string, project: string): Promise<void> {
@@ -500,6 +576,7 @@ export class DistillScheduler {
       // backoff) because a reference page needs no distillation material.
       try {
         await this.tagPassSafe(rootKey, project);
+        await this.promotionPassSafe(rootKey, project);
       } finally {
         this.inflight.delete(key);
       }
@@ -514,6 +591,17 @@ export class DistillScheduler {
       await this.tagPass(root, rootKey, project, root.db.getDistillState(project) ?? null);
     } catch (e) {
       this.log.warn(`[tag] ${rootKey}/${project}: skipped (${(e as Error)?.message ?? e})`);
+    }
+  }
+
+  // promotionPass with the same posture as tagPassSafe (tasks 3.2): a
+  // promotion failure is a warning line, never a distillation failure.
+  private async promotionPassSafe(rootKey: string, project: string): Promise<void> {
+    try {
+      const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
+      await this.promotionPass(root, rootKey, project, root.db.getDistillState(project) ?? null);
+    } catch (e) {
+      this.log.warn(`[promo] ${rootKey}/${project}: skipped (${(e as Error)?.message ?? e})`);
     }
   }
 }

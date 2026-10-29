@@ -36,6 +36,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/tag":
             self.handle_tag()
             return
+        if self.path == "/promote":
+            self.handle_promote()
+            return
         if self.path != "/distill":
             self._json(404, {"error": "not_found"})
             return
@@ -79,6 +82,37 @@ class Handler(BaseHTTPRequestHandler):
             provider = engine.LLMProvider(engine.MemoryConfig())
             recorder.wrap(provider)
             result = await engine.tag_items(provider, items)
+            result["llm_calls"] = recorder.calls
+            result["errors"] = result.get("errors", []) + recorder.errors
+            return result
+
+        try:
+            self._json(200, asyncio.run(run()))
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            self._json(200, {"results": [], "tokens": 0, "llm_calls": [], "errors": [f"{type(e).__name__}: {str(e)[:300]}"]})
+
+    def handle_promote(self):
+        # Tier promotion (add-tier-promotion-candidates): same skeleton as
+        # /tag — shared token, recorder accounting, failures come back as a
+        # structured 200 (never a 500 the scheduler has to guess about).
+        expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
+        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+            self._json(401, {"error": "unauthorized"})
+            return
+        length = int(self.headers.get("content-length", 0))
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            self._json(400, {"error": "invalid_body"})
+            return
+        items = body.get("items") or []
+
+        async def run():
+            recorder = engine.CallRecorder()
+            provider = engine.LLMProvider(engine.MemoryConfig())
+            recorder.wrap(provider)
+            result = await engine.promote_items(provider, items)
             result["llm_calls"] = recorder.calls
             result["errors"] = result.get("errors", []) + recorder.errors
             return result

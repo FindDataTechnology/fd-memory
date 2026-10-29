@@ -93,9 +93,17 @@ export class RootDb {
       CREATE TABLE IF NOT EXISTS page_vectors (
         page_rel TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS tier_proposals (
+        project TEXT NOT NULL, page_rel TEXT NOT NULL,
+        proposed_tier TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+        proposed_by TEXT NOT NULL DEFAULT 'ai', proposed_at TEXT NOT NULL,
+        accepted_at TEXT, ignored_at TEXT,
+        PRIMARY KEY (project, page_rel)
+      );
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
         handoff_cursor TEXT NOT NULL DEFAULT '', note_cursor TEXT NOT NULL DEFAULT '',
+        tag_cursor TEXT NOT NULL DEFAULT '', promotion_cursor TEXT NOT NULL DEFAULT '',
         updated_at TEXT,
         last_error TEXT, last_tokens INTEGER NOT NULL DEFAULT 0,
         gaps INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
@@ -143,6 +151,11 @@ export class RootDb {
     // Unified memory & outputs: tagging-lane cursor for reference pages.
     if (!dsCols.has("tag_cursor")) {
       this.db.exec("ALTER TABLE distill_state ADD COLUMN tag_cursor TEXT NOT NULL DEFAULT ''");
+    }
+    // Tier promotion lane (add-tier-promotion-candidates): its own cursor so
+    // the tagging lane advancing tag_cursor never starves promotion picks.
+    if (!dsCols.has("promotion_cursor")) {
+      this.db.exec("ALTER TABLE distill_state ADD COLUMN promotion_cursor TEXT NOT NULL DEFAULT ''");
     }
   }
 
@@ -277,12 +290,12 @@ export class RootDb {
 
   // -- distill state (add-memory-distiller) -----------------------------------
 
-  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; note_cursor: string; tag_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
+  getDistillState(project: string): { project: string; obs_cursor: number; handoff_cursor: string; note_cursor: string; tag_cursor: string; promotion_cursor: string; updated_at: string | null; last_error: string | null; last_tokens: number; gaps: number; next_attempt_at: number; pending_since: number | null } | undefined {
     return this.db.prepare("SELECT * FROM distill_state WHERE project=?").get(project) as never;
   }
 
-  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; note_cursor?: string; tag_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
-    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", note_cursor: "", tag_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
+  upsertDistillState(project: string, patch: { obs_cursor?: number; handoff_cursor?: string; note_cursor?: string; tag_cursor?: string; promotion_cursor?: string; last_error?: string | null; last_tokens?: number; gaps?: number; next_attempt_at?: number; pending_since?: number | null }): void {
+    const cur = this.getDistillState(project) ?? { project, obs_cursor: 0, handoff_cursor: "", note_cursor: "", tag_cursor: "", promotion_cursor: "", updated_at: null, last_error: null, last_tokens: 0, gaps: 0, next_attempt_at: 0, pending_since: null };
     const next = {
       ...cur,
       ...patch,
@@ -292,15 +305,18 @@ export class RootDb {
     // tag_cursor rides this statement too: the column was added by the
     // tagging lane's migration but never listed here, so every write silently
     // dropped it and the lane re-tagged the same pages forever (2026-10-28
-    // production: all four cursors read back empty).
+    // production: all four cursors read back empty). promotion_cursor learns
+    // from the same trap: listed in CREATE/migration/patch AND here, or the
+    // promotion lane re-proposes forever.
     this.db.prepare(
-      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, note_cursor, tag_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO distill_state (project, obs_cursor, handoff_cursor, note_cursor, tag_cursor, promotion_cursor, updated_at, last_error, last_tokens, gaps, next_attempt_at, pending_since)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(project) DO UPDATE SET obs_cursor=excluded.obs_cursor, handoff_cursor=excluded.handoff_cursor, note_cursor=excluded.note_cursor,
          tag_cursor=excluded.tag_cursor,
+         promotion_cursor=excluded.promotion_cursor,
          updated_at=excluded.updated_at, last_error=excluded.last_error, last_tokens=excluded.last_tokens,
          gaps=excluded.gaps, next_attempt_at=excluded.next_attempt_at, pending_since=excluded.pending_since`,
-    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.tag_cursor ?? "", next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
+    ).run(next.project, next.obs_cursor, next.handoff_cursor, next.note_cursor, next.tag_cursor ?? "", next.promotion_cursor ?? "", next.updated_at, next.last_error, next.last_tokens, next.gaps, next.next_attempt_at, next.pending_since);
   }
 
   // /digest L1 segment (2026-10-26 benchmark): a type-blind recentPages window
@@ -406,6 +422,68 @@ export class RootDb {
     return this.db
       .prepare("SELECT path, title, body, updated_at, tags, tier, source_ref FROM pages WHERE project=? AND type='reference' AND updated_at>? AND (tags IS NULL OR tags='[]') ORDER BY updated_at LIMIT ?")
       .all(project, cursor, limit) as never;
+  }
+
+  // Tier promotion lane (add-tier-promotion-candidates): pages that still sit
+  // at draft and may deserve stable. Covers the distilled L2 types (fact,
+  // experience) plus reference — NOT gated on "has no tags" (a tagged page can
+  // still be promotion-worthy), and excludes pages already at stable/canonical
+  // so the lane never re-proposes settled pages. Own cursor so the tagging
+  // lane's progress cannot starve this selection.
+  promotionCandidates(project: string, cursor: string, limit = 20): Array<{ path: string; type: string; title: string; body: string; updated_at: string; tags: string; tier: string }> {
+    return this.db
+      .prepare(`SELECT path, type, title, body, updated_at, tags, tier FROM pages
+                WHERE project=? AND type IN ('fact','experience','reference') AND tier='draft' AND updated_at>?
+                ORDER BY updated_at LIMIT ?`)
+      .all(project, cursor, limit) as never;
+  }
+
+  // -- tier proposals (add-tier-promotion-candidates) -------------------------
+  // AI promotion judgement lands HERE as a pending proposal, never on the
+  // page itself: pages are markdown truth, proposals are derived state a
+  // human accepts (tier flips, origin becomes human) or ignores (cooldown
+  // keeps the lane from re-nagging the same page, design D4).
+
+  upsertTierProposal(project: string, pageRel: string, p: { proposed_tier: string; reason: string; proposed_by?: string; proposed_at: string }): void {
+    this.db.prepare(
+      `INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at, accepted_at, ignored_at)
+       VALUES (?,?,?,?,?,?,NULL,NULL)
+       ON CONFLICT(project, page_rel) DO UPDATE SET proposed_tier=excluded.proposed_tier, reason=excluded.reason,
+         proposed_by=excluded.proposed_by, proposed_at=excluded.proposed_at, accepted_at=NULL, ignored_at=NULL`,
+    ).run(project, pageRel, p.proposed_tier, p.reason, p.proposed_by ?? "ai", p.proposed_at);
+  }
+
+  tierProposal(project: string, pageRel: string): { project: string; page_rel: string; proposed_tier: string; reason: string; proposed_by: string; proposed_at: string; accepted_at: string | null; ignored_at: string | null } | undefined {
+    return this.db.prepare("SELECT * FROM tier_proposals WHERE project=? AND page_rel=?").get(project, pageRel) as never;
+  }
+
+  // Proposals a human can still act on: unread face for the owner surface
+  // (spec: 提议必须人可见可批). Page columns ride along so the UI never has
+  // to N+1 per proposal; the tier re-check means a page settled by other
+  // means drops off the face even if its row lingers.
+  pendingTierProposals(project: string, limit = 50): Array<{ page_rel: string; proposed_tier: string; reason: string; proposed_by: string; proposed_at: string; title: string; type: string; current_tier: string }> {
+    return this.db
+      .prepare(`SELECT p.page_rel, p.proposed_tier, p.reason, p.proposed_by, p.proposed_at,
+                       pg.title, pg.type, pg.tier AS current_tier
+                FROM tier_proposals p JOIN pages pg ON pg.path = p.page_rel
+                WHERE p.project=? AND p.accepted_at IS NULL AND p.ignored_at IS NULL AND pg.tier='draft'
+                ORDER BY p.proposed_at DESC LIMIT ?`)
+      .all(project, limit) as never;
+  }
+
+  tierProposalIgnoredWithin(project: string, pageRel: string, sinceIso: string): boolean {
+    const r = this.db
+      .prepare("SELECT 1 AS hit FROM tier_proposals WHERE project=? AND page_rel=? AND ignored_at IS NOT NULL AND ignored_at>?")
+      .get(project, pageRel, sinceIso) as { hit?: number } | undefined;
+    return Boolean(r?.hit);
+  }
+
+  acceptTierProposal(project: string, pageRel: string, at: string): void {
+    this.db.prepare("UPDATE tier_proposals SET accepted_at=? WHERE project=? AND page_rel=? AND accepted_at IS NULL AND ignored_at IS NULL").run(at, project, pageRel);
+  }
+
+  ignoreTierProposal(project: string, pageRel: string, at: string): void {
+    this.db.prepare("UPDATE tier_proposals SET ignored_at=? WHERE project=? AND page_rel=? AND accepted_at IS NULL").run(at, project, pageRel);
   }
 
   distinctProjects(): string[] {

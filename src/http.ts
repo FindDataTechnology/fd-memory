@@ -15,7 +15,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -619,6 +619,112 @@ export class Service {
       const items = [...pages, ...obs].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(offset, offset + limit);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ items, offset, limit }));
+    }
+
+    // ── /memory/promotions (add-tier-promotion-candidates D2): the 待确认
+    // face. AI promotion judgements NEVER change a page directly — they land
+    // here as proposals; a human accepts (tier flips, origin becomes human)
+    // or ignores (cooldown keeps the lane from re-nagging). Root resolution
+    // mirrors /memory: persons see their own root, the platform seam names a
+    // rootKey explicitly, agents are refused.
+
+    const promoRoot = (rootKeyGiven?: string): { root?: StoreRoot; principal?: string; err?: string; status?: number } => {
+      const rootKeyParam = rootKeyGiven ?? url.searchParams.get("rootKey");
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        if (!rootKeyParam) return { err: "rootKey_required", status: 400 };
+        return { root: this.rootForKey(rootKeyParam), principal: `${scope.kind}:${scope.tokenId}` };
+      }
+      if (scope.kind === "person") {
+        if (rootKeyParam) return { err: "rootKey_is_platform_seam_only", status: 400 };
+        const r = this.rootFor(scope);
+        return { root: r, principal: `person:${scope.tokenId}` };
+      }
+      return { err: "person_token_required", status: 403 };
+    };
+
+    if (path === "/memory/promotions" && req.method === "GET") {
+      const rr = promoRoot();
+      const proot = rr.root;
+      if (!proot) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const projectFilter = url.searchParams.get("scope");
+      const projects = projectFilter ? [projectFilter] : proot.db.distinctProjects();
+      const proposals = projects
+        .flatMap((p) => proot.db.pendingTierProposals(p, 50).map((x) => ({ ...x, project: p })))
+        .sort((a, b) => (a.proposed_at < b.proposed_at ? 1 : -1))
+        .map((x) => ({
+          path: x.page_rel, project: x.project, type: x.type, title: x.title,
+          current_tier: x.current_tier, proposed_tier: x.proposed_tier,
+          reason: x.reason, proposed_by: x.proposed_by, proposed_at: x.proposed_at,
+        }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ proposals }));
+    }
+
+    if (path === "/memory/promotions/accept" && req.method === "POST") {
+      const body = await this.body<{ path?: string; rootKey?: string }>(req);
+      const rr = promoRoot(String(body.rootKey ?? ""));
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const principal = rr.principal ?? "unknown";
+      const rel = String(body.path ?? "");
+      const seg = rel.split("/")[0];
+      const project = seg === "shared" ? "shared" : seg;
+      const prop = root.db.tierProposal(project, rel);
+      if (!prop || prop.accepted_at || prop.ignored_at) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "proposal_not_found" }));
+      }
+      const page = root.readPageByRel(rel);
+      if (!page) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "not_found" }));
+      }
+      if (String(page.frontmatter?.tier ?? "draft") !== "draft") {
+        // settled elsewhere while pending — the proposal is moot, drop it from
+        // the face without touching the page.
+        root.db.acceptTierProposal(project, rel, new Date().toISOString());
+        res.writeHead(409, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "stale", tier: String(page.frontmatter?.tier ?? "draft") }));
+      }
+      // The ceiling again at the human seam: this face applies at most
+      // `stable` — even a corrupted proposal row naming canonical lands as
+      // stable. canonical stays a pure human gesture via /pages/mutate,
+      // never reachable from the promotion face.
+      const want = prop.proposed_tier === "canonical" ? "stable" : prop.proposed_tier;
+      const fm: Record<string, unknown> = { ...page.frontmatter, tier: want, tier_origin: "human" };
+      root.writePage(project, rel.split("/")[1], rel.split("/").pop()!.replace(/\.md$/, ""), { frontmatter: fm, body: page.body } as never, { principal, scope: `${project}/${rel}` });
+      root.db.acceptTierProposal(project, rel, new Date().toISOString());
+      notePromotion("accepted");
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ path: rel, tier: want, tier_origin: "human" }));
+    }
+
+    if (path === "/memory/promotions/ignore" && req.method === "POST") {
+      const body = await this.body<{ path?: string; rootKey?: string }>(req);
+      const rr = promoRoot(String(body.rootKey ?? ""));
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const rel = String(body.path ?? "");
+      const seg = rel.split("/")[0];
+      const project = seg === "shared" ? "shared" : seg;
+      const prop = root.db.tierProposal(project, rel);
+      if (!prop || prop.accepted_at || prop.ignored_at) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "proposal_not_found" }));
+      }
+      root.db.ignoreTierProposal(project, rel, new Date().toISOString());
+      notePromotion("ignored");
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ path: rel, ignored: true }));
     }
 
     if (path === "/forget" && req.method === "POST") {

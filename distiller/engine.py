@@ -110,6 +110,74 @@ async def tag_items(provider: LLMProvider, items: list[dict]) -> dict:
     return {"results": results, "tokens": tokens, "llm_calls": llm_calls, "errors": []}
 
 
+# Tier promotion lane (add-tier-promotion-candidates): a second opinion on
+# draft pages — is this worth `stable`? The judgement is ADVISORY: fd-memory
+# stores it as a pending proposal a human accepts or ignores; nothing here
+# changes a page's tier directly. The ceiling lives in the parser, not the
+# prompt: whatever the model says, a suggestion can only ever come out
+# `stable` (canonical is reserved for human gestures / trusted signals).
+PROMOTE_MAX = 20
+
+
+async def promote_items(provider: LLMProvider, items: list[dict]) -> dict:
+    if not items:
+        return {"results": [], "tokens": 0, "llm_calls": [], "errors": []}
+    payload = []
+    for i, it in enumerate(items[:PROMOTE_MAX]):
+        payload.append({
+            "idx": i,
+            "title": str(it.get("title") or "")[:200],
+            "summary": str(it.get("summary") or "")[:400],
+            "current_tier": str(it.get("current_tier") or "draft"),
+        })
+    prompt = (
+        "你是记忆系统的层级晋升评委。判断每个 draft 页是否值得升为 stable："
+        "stable = 内容完整、表述稳定、有复用价值（口径清晰、结论可用）；"
+        "none = 仍是草稿（残缺、过时、一次性、含糊）。"
+        "你只能给 stable 或 none 两种答案；canonical 由人类专属授予，你绝对不给。"
+        "只回 JSON 数组，无其它文字："
+        '[{"idx": 0, "suggest_tier": "stable", "reason": "一句话理由"}]\n\n'
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    llm_calls: list[dict] = []
+    tokens = 0
+    resp = await provider.complete(prompt=prompt, max_tokens=2000, audit_stage="tier_promotion")
+    texto = getattr(resp, "content", "") or ""
+    tokens = int(getattr(resp, "prompt_tokens", 0) or 0) + int(getattr(resp, "completion_tokens", 0) or 0)
+    llm_calls.append({"kind": "promote", "tokens": tokens})
+    try:
+        raw = str(texto).strip()
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = json.loads(repair_json(raw))
+        if isinstance(parsed, dict):
+            parsed = parsed.get("results") or parsed.get("items") or []
+        if not isinstance(parsed, list):
+            raise ValueError("promote result is not a list")
+    except Exception:
+        parsed = []
+    results = []
+    for r in parsed:
+        try:
+            idx = int(r.get("idx"))
+            if not (0 <= idx < len(items[:PROMOTE_MAX])):
+                continue
+            sug = str(r.get("suggest_tier") or r.get("tier") or "").strip().lower()
+            # The cap is enforced HERE, not in the prompt: models say
+            # "canonical" when told not to. Anything above stable collapses
+            # to stable; anything unrecognized collapses to no-proposal.
+            if sug in ("stable", "canonical"):
+                sug = "stable"
+            else:
+                sug = "none"
+            reason = str(r.get("reason") or "").strip()[:240]
+            results.append({"idx": idx, "suggest_tier": sug, "reason": reason})
+        except Exception:
+            continue
+    return {"results": results, "tokens": tokens, "llm_calls": llm_calls, "errors": []}
+
+
 
 EMBED_BATCH_MAX = 64
 

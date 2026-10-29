@@ -194,3 +194,39 @@ def test_tag_items_caps_tags_and_rejects_unknown_tier():
     out = _asyncio.run(engine.tag_items(provider, [{"title": "x", "summary": "y"}]))
     assert len(out["results"][0]["tags"]) == engine.TAG_MAX
     assert out["results"][0]["tier"] == "draft", "unknown tier degrades to draft"
+
+
+# Tier promotion (add-tier-promotion-candidates): /promote parses like /tag,
+# but the ceiling is a hard invariant of the PARSER — the model is never
+# trusted to keep itself below stable.
+
+def test_promote_items_repairs_dirty_output():
+    import asyncio as _asyncio
+    dirty = '结果：\n```json\n[{"idx": 0, "suggest_tier": "stable", "reason": "口径完整"},]\n```'
+    provider, _ = make_provider([dirty])
+    out = _asyncio.run(engine.promote_items(provider, [{"title": "对账口径", "summary": "月末对账差异", "current_tier": "draft"}]))
+    assert out["results"] == [{"idx": 0, "suggest_tier": "stable", "reason": "口径完整"}], out
+
+
+def test_promote_items_demotes_canonical_and_garbage():
+    import asyncio as _asyncio
+    raw = json.dumps([
+        {"idx": 0, "suggest_tier": "canonical", "reason": "永远不该出现"},
+        {"idx": 1, "suggest_tier": "none", "reason": "仍是草稿"},
+        {"idx": 2, "suggest_tier": "legendary", "reason": "乱答"},
+    ])
+    provider, _ = make_provider([raw])
+    items = [{"title": f"p{i}", "summary": "s"} for i in range(3)]
+    out = _asyncio.run(engine.promote_items(provider, items))
+    by_idx = {r["idx"]: r["suggest_tier"] for r in out["results"]}
+    assert by_idx[0] == "stable", "canonical MUST collapse to stable"
+    assert by_idx[1] == "none"
+    assert by_idx[2] == "none", "unknown tiers degrade to no-proposal"
+
+
+def test_promote_items_tolerates_unparseable_output():
+    import asyncio as _asyncio
+    provider, _ = make_provider(["对不起，我无法判断。"])
+    out = _asyncio.run(engine.promote_items(provider, [{"title": "x", "summary": "y"}]))
+    assert out["results"] == []
+    assert out["tokens"] > 0, "the burned call is still accounted"

@@ -31,6 +31,14 @@ const vectors = {
 };
 const startedAt = new Date().toISOString();
 
+// Tier promotion lane (add-tier-promotion-candidates): the proposal face dies
+// quietly if nobody can see it flowing — these counters make "is anyone ever
+// accepting?" a single /admin/metrics read.
+const promotion = { candidates: 0, proposed: 0, accepted: 0, ignored: 0 };
+export function notePromotion(kind: keyof typeof promotion, n = 1): void {
+  promotion[kind] += n;
+}
+
 export function noteDigestRung(rung: "vector" | "keyword" | "cooling" | "empty"): void {
   digestRungs[rung] += 1;
 }
@@ -120,6 +128,7 @@ export function metricsSnapshot(): Record<string, unknown> {
       failure_reasons: reasons,
     },
     distill: { runs: distills.runs, pages: distills.pages, tokens: distills.tokens, failures: distills.failures, last_error: distills.lastError },
+    promotion: { ...promotion },
     vectors: { ...vectors },
   };
 }
@@ -131,6 +140,10 @@ export function __resetMetrics(): void {
   digestRungs.cooling = 0;
   digestRungs.empty = 0;
   embedSamples.length = 0;
+  promotion.candidates = 0;
+  promotion.proposed = 0;
+  promotion.accepted = 0;
+  promotion.ignored = 0;
   distills.runs = 0;
   distills.pages = 0;
   distills.tokens = 0;
