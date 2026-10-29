@@ -15,7 +15,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot, recentEmbedP90 } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -290,32 +290,60 @@ export class Service {
       const budget = Math.min(2000, Math.max(64, Number(url.searchParams.get("budget") ?? 1500) || 1500));
       let modelNote: string | undefined;
       const t0 = Date.now();
-      // Internal deadline (add-u-root-distillation D4): the caller (cell) gives
-      // the whole request ~5s; a slow sidecar embed used to eat all of it and
-      // the entire digest face timed out into the title-list rung. Bound the
-      // embed attempt so keyword recall — still a digest block, with a
-      // model_note — always wins the race inside the caller's budget.
-      const EMBED_DEADLINE_MS = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS ?? 3500);
+      // Per-call embed budget (fix-digest-adaptive-embed-deadline): a fixed
+      // deadline bets the same number every time, so a lane whose latency
+      // drifts between 5s and 13s either wastes the full wait or degrades a
+      // request that would have finished. Derive it from the recent p90 with
+      // headroom, clamped to [floor, cap]. FD_MEMORY_DIGEST_EMBED_DEADLINE_MS
+      // is now the CAP, not a fixed value — an 8000 deployment keeps its
+      // ceiling and simply stops paying it when the lane is fast.
+      const EMBED_DEADLINE_CAP_MS = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_MS ?? 3500);
+      const EMBED_DEADLINE_FLOOR_MS = Math.min(
+        EMBED_DEADLINE_CAP_MS,
+        Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_FLOOR_MS ?? 3000),
+      );
+      // Headroom over p90: a request at the observed 90th percentile should
+      // still succeed, so the budget must sit above it, not on it.
+      const EMBED_DEADLINE_HEADROOM = Number(process.env.FD_MEMORY_DIGEST_EMBED_DEADLINE_HEADROOM ?? 1.5) || 1.5;
+      const embedDeadlineMs = (): number => {
+        const p90 = recentEmbedP90(5);
+        if (p90 == null) return EMBED_DEADLINE_CAP_MS; // too little evidence: stay generous
+        const target = p90 * EMBED_DEADLINE_HEADROOM;
+        return Math.min(EMBED_DEADLINE_CAP_MS, Math.max(EMBED_DEADLINE_FLOOR_MS, Math.round(target)));
+      };
+      // Which failures were OUR deadline rather than the upstream's answer.
+      // Sampling needs this to record the real elapsed time and a stable
+      // reason label, and the note should not claim the lane is down when we
+      // were merely impatient.
+      class EmbedDeadlineExceeded extends Error {}
       const embed = async (texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> => {
         if (embedLaneCoolingDown()) {
           noteEmbedSample({ ms: 0, ok: false, reason: "cooling_down" });
           throw new Error("embed lane cooling down (recent slow streak) — keyword recall");
         }
+        const allowance = embedDeadlineMs();
         let timer: NodeJS.Timeout | undefined;
         const e0 = Date.now();
         try {
           const out = await Promise.race([
             serializeEmbed((t) => sidecarEmbed(process.env, t), texts),
             new Promise<never>((_, rej) => {
-              timer = setTimeout(() => rej(new Error(`embed deadline ${EMBED_DEADLINE_MS}ms exceeded`)), EMBED_DEADLINE_MS);
+              timer = setTimeout(() => rej(new EmbedDeadlineExceeded(`embed deadline ${allowance}ms exceeded`)), allowance);
             }),
           ]);
           noteEmbedOutcome(true);
           noteEmbedSample({ ms: Date.now() - e0, ok: true });
           return out;
         } catch (e) {
+          // Record the REAL elapsed wait, not the budget: `Date.now() - e0` at
+          // this point is what we actually waited, which is what the adaptive
+          // budget needs to learn from. Timeouts get a stable label so the
+          // failure_reasons breakdown separates "we gave up" from "upstream
+          // answered with an error".
+          const elapsed = Date.now() - e0;
+          const isTimeout = e instanceof EmbedDeadlineExceeded;
           noteEmbedOutcome(false);
-          noteEmbedSample({ ms: Date.now() - e0, ok: false, reason: String((e as Error)?.message ?? e) });
+          noteEmbedSample({ ms: elapsed, ok: false, reason: isTimeout ? "timeout" : String((e as Error)?.message ?? e) });
           modelNote = `vector lane unavailable — keyword-only recall (${(e as Error)?.message ?? e})`;
           throw e; // hybridCandidates catches and falls back to keyword
         } finally {

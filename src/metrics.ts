@@ -40,6 +40,17 @@ export function noteEmbedSample(s: EmbedSample): void {
   if (embedSamples.length > EMBED_SAMPLE_CAP) embedSamples.shift();
 }
 
+// Recent successful embed latency, for the adaptive per-call budget
+// (fix-digest-adaptive-embed-deadline). Only successes count: a failed sample
+// is truncated at whatever budget was in force, so feeding it back would make
+// the budget feed on itself (slow → larger budget → larger recorded sample).
+// Returns null when there is too little evidence to be worth adapting to.
+export function recentEmbedP90(minSamples = 5): number | null {
+  const oks = embedSamples.filter((s) => s.ok).map((s) => s.ms).sort((a, b) => a - b);
+  if (oks.length < Math.max(1, minSamples)) return null;
+  return quantile(oks, 0.9);
+}
+
 export type VectorEvent = "mismatch_excluded" | "writes_rejected" | "writes_allowed" | "skipped_no_model" | "reembed_runs" | "reembedded_pages";
 export function noteVectorEvent(kind: VectorEvent, n = 1): void {
   vectors[kind] += n;
