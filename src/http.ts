@@ -15,7 +15,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -52,6 +52,26 @@ export class Service {
   rootFor(scope: Scope): StoreRoot {
     const { rootKey } = namespaceParts(scope.namespace);
     return this.rootForKey(rootKey);
+  }
+
+  // Owner roots present on disk (harden-memory-surfaces): the scale sample
+  // must see roots nobody touched since boot, not just the live cache.
+  discoverOwnerRoots(): string[] {
+    try {
+      return readdirSync(join(this.opts.dataDir, "owners")).filter((d: string) => existsSync(join(this.opts.dataDir, "owners", d, "wiki")));
+    } catch { return []; }
+  }
+
+  // Per-root vector counts for the metrics face. Roots are opened (the cache
+  // is the map; opening is cheap after boot) but NOT scanned for vectors —
+  // vectorCount() is a COUNT(*), never an allPageVectors decode.
+  vectorCountsByRoot(): number[] {
+    const keys = new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()]);
+    const out: number[] = [];
+    for (const key of keys) {
+      try { out.push(this.rootForKey(key).db.vectorCount()); } catch { /* unreadable root — not a metric failure */ }
+    }
+    return out;
   }
 
   rootForKey(rootKey: string): StoreRoot {
@@ -929,6 +949,9 @@ export class Service {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "service_token_required" }));
       }
+      // Vector scale is sampled AT READ TIME: a cached number would report
+      // the state of the last reader, not the store (harden-memory-surfaces).
+      sampleVectorsScale(this.vectorCountsByRoot());
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify(metricsSnapshot()));
     }

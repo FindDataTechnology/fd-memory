@@ -83,6 +83,30 @@ export function noteVectorEvent(kind: VectorEvent, n = 1): void {
   vectors[kind] += n;
 }
 
+// Vector-scale observation (harden-memory-surfaces): the full-scan recall lane
+// (`allPageVectors`) is safe only while per-root vector counts stay inside
+// the measured zone — that fact used to live in a comment. `sampleVectorsScale`
+// is fed per-root counts by the service (open roots + directory discovery)
+// at /admin/metrics time; the thresholds read the SAME env the docs quote.
+const VECTOR_WARN_MAX_PER_ROOT_DEFAULT = 2000; // measured max 304 → ~6.5x headroom
+const VECTOR_WARN_TOTAL_DEFAULT = 10000; // measured global 1065 → ~9x headroom
+function vectorScaleThresholds(): { max_per_root: number; total: number } {
+  const mp = Number(process.env.FD_MEMORY_VECTOR_WARN_MAX_PER_ROOT);
+  const tt = Number(process.env.FD_MEMORY_VECTOR_WARN_TOTAL);
+  return {
+    max_per_root: Number.isFinite(mp) && mp > 0 ? Math.floor(mp) : VECTOR_WARN_MAX_PER_ROOT_DEFAULT,
+    total: Number.isFinite(tt) && tt > 0 ? Math.floor(tt) : VECTOR_WARN_TOTAL_DEFAULT,
+  };
+}
+let vectorsScaleSample = { roots: 0, total: 0, max_root: 0, over_threshold: false, threshold: vectorScaleThresholds() };
+export function sampleVectorsScale(perRootCounts: number[]): void {
+  const t = vectorScaleThresholds();
+  const live = perRootCounts.filter((n) => n > 0);
+  const total = live.reduce((a, b) => a + b, 0);
+  const max = live.length ? Math.max(...live) : 0;
+  vectorsScaleSample = { roots: live.length, total, max_root: max, over_threshold: max > t.max_per_root || total > t.total, threshold: t };
+}
+
 export function noteDistill(ok: boolean, pages: number, tokens: number, error?: string): void {
   if (ok) {
     distills.runs += 1;
@@ -130,6 +154,7 @@ export function metricsSnapshot(): Record<string, unknown> {
     distill: { runs: distills.runs, pages: distills.pages, tokens: distills.tokens, failures: distills.failures, last_error: distills.lastError },
     promotion: { ...promotion },
     vectors: { ...vectors },
+    "vectors.scale": vectorsScaleSample,
   };
 }
 
@@ -144,6 +169,7 @@ export function __resetMetrics(): void {
   promotion.proposed = 0;
   promotion.accepted = 0;
   promotion.ignored = 0;
+  vectorsScaleSample = { roots: 0, total: 0, max_root: 0, over_threshold: false, threshold: vectorScaleThresholds() };
   distills.runs = 0;
   distills.pages = 0;
   distills.tokens = 0;

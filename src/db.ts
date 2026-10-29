@@ -524,6 +524,15 @@ export class RootDb {
     return row ?? null;
   }
 
+  // Scale observation (harden-memory-surfaces D3): the full-scan recall lane
+  // is safe only while per-root vector counts stay in the measured zone.
+  // A COUNT(*) is index-cheap and never decodes a vector — this must not
+  // become an allPageVectors call dressed up as a metric.
+  vectorCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS n FROM page_vectors").get() as { n: number };
+    return Number(row.n) || 0;
+  }
+
   // Consistency guard (2026-10-28): one embedding model per store, enforced at
   // write time. A vector from another model is not "slightly worse recall" —
   // cosine across model spaces is meaningless, and allPageVectors() would hide
