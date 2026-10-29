@@ -91,3 +91,27 @@ test("noteVectorEvent flows into /admin/metrics snapshot", () => {
   assert.equal(snap.vectors.skipped_no_model, 2);
   assert.equal(snap.vectors.reembed_runs, 1);
 });
+
+// 2026-10-29 production finding: /digest with a blank q used to call embed(""),
+// the sidecar answered 400 texts_required, and the caller labelled the whole
+// answer "vector lane unavailable — keyword-only recall". The lane was healthy;
+// the query was empty. An empty query must not reach the embed lane at all.
+test("hybrid recall with a blank query never calls the embed lane", async () => {
+  const { newPage } = await import("../okf.js");
+  const root = makeRoot();
+  root.writePage("default", "facts", "keep1", newPage("fact", "组合周报口径已定", "组合周报口径已定。", {}));
+
+  let embedCalls = 0;
+  const embed = async () => {
+    embedCalls += 1;
+    throw new Error("embed HTTP 400 texts_required");
+  };
+  for (const blank of ["", "   ", "\n\t "]) {
+    const merged = await hybridCandidates({
+      root, project: "default", queryFor: blank, k: 8, embed,
+      log: { warn: () => {} },
+    });
+    assert.ok(Array.isArray(merged), `blank query ${JSON.stringify(blank)} must return keyword candidates`);
+  }
+  assert.equal(embedCalls, 0, "a blank query has no vector to compute — the embed lane must not be called");
+});

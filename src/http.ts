@@ -412,9 +412,14 @@ export class Service {
       const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
       // served-rung line (add-u-root-distillation D4): hit-rate is observable
       // from the logs — vector vs keyword, load, ms. rootKey stays server-side.
+      // A blank query is its own rung (2026-10-29): there is no vector to
+      // compute, so keyword recall is the correct answer rather than a
+      // degradation — counting it as "keyword" would make an idle/empty call
+      // look like a vector-lane incident in the very metric operators gate on.
       const logRoot = scope.kind === "platform" || scope.kind === "runner" ? rootKeyParam : namespaceParts(scope.namespace).rootKey;
-      noteDigestRung(modelNote ? "keyword" : "vector");
-      console.log(`[digest] ${logRoot}:${project} rung=${modelNote ? "keyword" : "vector"} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
+      const rung = !q.trim() ? "empty" : modelNote ? "keyword" : "vector";
+      noteDigestRung(rung);
+      console.log(`[digest] ${logRoot}:${project} rung=${rung} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
     }

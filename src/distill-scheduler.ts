@@ -561,6 +561,13 @@ export async function hybridCandidates(opts: {
   const { root, project, queryFor, k = 8, embed, log } = opts;
   const projects = project === "shared" ? [project] : [project, "shared"];
   const keyword = distillCandidates(root, projects, queryFor);
+  // An empty query has no vector to compute (2026-10-29): the sidecar rejects
+  // blank input with 400 texts_required, and the caller turned that into
+  // "vector lane unavailable — keyword-only recall" — an input-validation
+  // answer reported as an infrastructure outage. That mislabel is how a false
+  // degradation reaches the operator: the lane was fine, the query was empty.
+  // Skip the embed call entirely; keyword recall is the whole answer here.
+  if (!queryFor.trim()) return keyword;
   try {
     const q = await embed([queryFor]);
     if (!q.vectors.length) return keyword;

@@ -11,7 +11,10 @@ export interface EmbedSample {
   reason?: string;
 }
 
-const digestRungs = { vector: 0, keyword: 0, cooling: 0 };
+// `empty` is not a degradation (2026-10-29): a blank query has no vector to
+// compute, so counting it as `keyword` made idle calls look like embed outages
+// in the very ratio operators gate on.
+const digestRungs = { vector: 0, keyword: 0, cooling: 0, empty: 0 };
 const embedSamples: EmbedSample[] = [];
 const EMBED_SAMPLE_CAP = 200;
 const distills = { runs: 0, pages: 0, tokens: 0, failures: 0, lastError: "" as string };
@@ -28,7 +31,7 @@ const vectors = {
 };
 const startedAt = new Date().toISOString();
 
-export function noteDigestRung(rung: "vector" | "keyword" | "cooling"): void {
+export function noteDigestRung(rung: "vector" | "keyword" | "cooling" | "empty"): void {
   digestRungs[rung] += 1;
 }
 
@@ -66,6 +69,9 @@ export function metricsSnapshot(): Record<string, unknown> {
     const k = String(f.reason ?? "unknown").slice(0, 80);
     reasons[k] = (reasons[k] ?? 0) + 1;
   }
+  // `empty` stays out of the denominator: a blank-query digest never had a
+  // vector rung to lose, so counting it would drag vector_ratio down for a
+  // reason that is not an outage.
   const total = digestRungs.vector + digestRungs.keyword + digestRungs.cooling;
   return {
     started_at: startedAt,
@@ -93,6 +99,7 @@ export function __resetMetrics(): void {
   digestRungs.vector = 0;
   digestRungs.keyword = 0;
   digestRungs.cooling = 0;
+  digestRungs.empty = 0;
   embedSamples.length = 0;
   distills.runs = 0;
   distills.pages = 0;

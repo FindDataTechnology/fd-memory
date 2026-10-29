@@ -60,3 +60,21 @@ test("/admin/metrics: service tokens read it; person token refused", async () =>
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// 2026-10-29 production finding: a blank digest query has no vector to compute,
+// so the sidecar answers 400 texts_required and the caller reported it as
+// "vector lane unavailable — keyword-only recall". Counting that as `keyword`
+// made an idle call look like an embed outage in the exact ratio operators
+// gate on. `empty` is its own rung and stays out of the denominator.
+test("blank-query rung does not dilute vector_ratio", () => {
+  __resetMetrics();
+  noteDigestRung("vector");
+  noteDigestRung("vector");
+  noteDigestRung("keyword");
+  noteDigestRung("empty");
+  noteDigestRung("empty");
+  const m = metricsSnapshot() as any;
+  assert.equal(m.digest.empty, 2, "empty rung is counted separately");
+  assert.equal(m.digest.total, 3, "empty must not enter the denominator");
+  assert.equal(m.digest.vector_ratio, 0.667, "ratio reflects only real rung traffic");
+});
