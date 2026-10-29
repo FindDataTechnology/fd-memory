@@ -15,7 +15,7 @@ import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot, recentEmbedP90 } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -308,7 +308,12 @@ export class Service {
       const embedDeadlineMs = (): number => {
         const p90 = recentEmbedP90(5);
         if (p90 == null) return EMBED_DEADLINE_CAP_MS; // too little evidence: stay generous
-        const target = p90 * EMBED_DEADLINE_HEADROOM;
+        // Timeouts prove "at least this long", so they push the budget UP even
+        // though they never enter the p90. Without this the budget collapses
+        // whenever the lane is bimodal: slow calls time out, the success-only
+        // p90 looks fast, and the shrink starves exactly those calls.
+        const provenTooSmall = recentEmbedTimeoutFloor();
+        const target = Math.max(p90 * EMBED_DEADLINE_HEADROOM, provenTooSmall * 1.2);
         return Math.min(EMBED_DEADLINE_CAP_MS, Math.max(EMBED_DEADLINE_FLOOR_MS, Math.round(target)));
       };
       // Which failures were OUR deadline rather than the upstream's answer.

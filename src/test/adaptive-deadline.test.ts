@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import { Service } from "../http.js";
 import { __resetEmbedGate } from "../embed-gate.js";
-import { __resetMetrics, noteEmbedSample, recentEmbedP90, metricsSnapshot } from "../metrics.js";
+import { __resetMetrics, noteEmbedSample, recentEmbedP90, recentEmbedTimeoutFloor, metricsSnapshot } from "../metrics.js";
 
 function tmpData(): string {
   return mkdtempSync(join(tmpdir(), "fdm-adaptivedl-"));
@@ -53,7 +53,12 @@ async function withLane<T>(
   env: Record<string, string>,
   fn: (ctx: { base: string; svc: Service }) => Promise<T>,
 ): Promise<T> {
+  // Both gates are module-level state. Without resetting them, a previous test's
+  // timeout samples raise this test's budget floor, and a leftover cooldown makes
+  // this test skip the lane entirely — failures that read like product bugs but
+  // are test bleed.
   __resetEmbedGate();
+  __resetMetrics();
   const lane = createServer(handler);
   await new Promise<void>((r) => lane.listen(0, "127.0.0.1", () => r()));
   const lanePort = (lane.address() as { port: number }).port;
@@ -177,4 +182,51 @@ test("no samples: budget falls back to the configured cap, never zero", async ()
       assert.equal(d.model_note, undefined, "first call with no samples must not be starved into degrading");
     },
   );
+});
+
+// Real-machine finding (2026-10-29): the success-only p90 made the budget
+// COLLAPSE on a bimodal lane. Half the calls took 2s, half 12s; every slow call
+// timed out, so the sample window only ever saw 2s, the budget ratcheted down
+// to the floor, and the slow half could never be observed again. Timeouts are
+// censored observations — "at least this long" — and must push the budget up.
+test("timeouts push the budget up instead of letting it collapse", () => {
+  __resetMetrics();
+  // Bimodal lane: fast successes + timeouts that were cut at an 8s budget.
+  for (let i = 0; i < 10; i++) noteEmbedSample({ ms: 2000, ok: true });
+  for (let i = 0; i < 10; i++) noteEmbedSample({ ms: 8000, ok: false, reason: "timeout" });
+
+  const p90 = recentEmbedP90(5);
+  assert.equal(p90, 2000, "the success-only p90 looks fast — this is the trap");
+
+  const provenTooSmall = recentEmbedTimeoutFloor();
+  assert.equal(provenTooSmall, 8000, "an 8s timeout proves 8s was not enough");
+
+  // The composed budget must NOT sit near the fast p90.
+  const cap = 8000;
+  const floor = 3000;
+  const target = Math.max(p90! * 1.5, provenTooSmall * 1.2);
+  const budget = Math.min(cap, Math.max(floor, Math.round(target)));
+  assert.equal(budget, cap, "budget stays at the cap — it must not starve the slow half");
+});
+
+test("a single timeout raises the floor without pinning it forever", () => {
+  __resetMetrics();
+  // One historic timeout at 5s, then a sustained fast lane.
+  noteEmbedSample({ ms: 5000, ok: false, reason: "timeout" });
+  for (let i = 0; i < 40; i++) noteEmbedSample({ ms: 300, ok: true });
+
+  const floorFromTimeout = recentEmbedTimeoutFloor();
+  assert.equal(floorFromTimeout, 5000);
+  // The timeout sample ages out of the 200-entry window; until then the budget
+  // is held above 5s, which is the correct reading of "5s was once not enough".
+  const budget = Math.min(8000, Math.max(3000, Math.round(Math.max(300 * 1.5, floorFromTimeout * 1.2))));
+  assert.equal(budget, 6000, "budget respects the proven-too-small floor (5000 × 1.2)");
+});
+
+test("non-timeout failures do not raise the floor", () => {
+  __resetMetrics();
+  // An upstream 500 says nothing about how long a good call would take.
+  noteEmbedSample({ ms: 120, ok: false, reason: "embed HTTP 500" });
+  noteEmbedSample({ ms: 0, ok: false, reason: "cooling_down" });
+  assert.equal(recentEmbedTimeoutFloor(), 0, "only timeouts are censored latency evidence");
 });

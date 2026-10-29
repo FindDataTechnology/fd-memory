@@ -51,6 +51,25 @@ export function recentEmbedP90(minSamples = 5): number | null {
   return quantile(oks, 0.9);
 }
 
+// Timeouts are CENSORED observations, not missing ones (2026-10-29, caught by
+// real-machine verification): a timeout at budget B proves the true latency was
+// AT LEAST B. Dropping them lets the budget collapse — in a bimodal lane (half
+// the calls 2s, half 12s) every slow call times out, so the success-only p90
+// sees 2s, the budget shrinks to 3s, and the slow half can never be observed
+// again. The budget then ratchets downward on evidence that excludes the very
+// requests it is starving.
+// The floor here is the largest recent timeout wait: the budget must never be
+// smaller than a wait we already proved was too small.
+export function recentEmbedTimeoutFloor(): number {
+  let max = 0;
+  for (const s of embedSamples) {
+    if (s.ok) continue;
+    if (String(s.reason ?? "") !== "timeout") continue;
+    if (s.ms > max) max = s.ms;
+  }
+  return max;
+}
+
 export type VectorEvent = "mismatch_excluded" | "writes_rejected" | "writes_allowed" | "skipped_no_model" | "reembed_runs" | "reembedded_pages";
 export function noteVectorEvent(kind: VectorEvent, n = 1): void {
   vectors[kind] += n;
