@@ -39,6 +39,14 @@ export function notePromotion(kind: keyof typeof promotion, n = 1): void {
   promotion[kind] += n;
 }
 
+// Structured-filter usage (add-agent-memory-foundation): whether the metadata
+// lane is actually being consumed — zero over a full day means the structured
+// surface shipped but nobody calls it.
+let metaFilterQueries = 0;
+export function noteMetaFilter(n = 1): void {
+  metaFilterQueries += n;
+}
+
 export function noteDigestRung(rung: "vector" | "keyword" | "cooling" | "empty"): void {
   digestRungs[rung] += 1;
 }
@@ -153,6 +161,7 @@ export function metricsSnapshot(): Record<string, unknown> {
     },
     distill: { runs: distills.runs, pages: distills.pages, tokens: distills.tokens, failures: distills.failures, last_error: distills.lastError },
     promotion: { ...promotion },
+    meta_filter_queries: metaFilterQueries,
     vectors: { ...vectors },
     "vectors.scale": vectorsScaleSample,
   };
@@ -169,6 +178,7 @@ export function __resetMetrics(): void {
   promotion.proposed = 0;
   promotion.accepted = 0;
   promotion.ignored = 0;
+  metaFilterQueries = 0;
   vectorsScaleSample = { roots: 0, total: 0, max_root: 0, over_threshold: false, threshold: vectorScaleThresholds() };
   distills.runs = 0;
   distills.pages = 0;

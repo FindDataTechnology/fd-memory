@@ -376,8 +376,9 @@ test("platform-seam lane: platform token reads/forgets a named rootKey; agents r
     assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${runner}` } })).status, 200);
     // agents refused even with rootKey
     assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${dep}` } })).status, 403);
-    // person with rootKey: rejected (platform-seam only)
-    assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${person}` } })).status, 400);
+    // person with rootKey: oversight lane (add-agent-memory-foundation) —
+    // this person owns no d/ root, so the refusal is a 403 forbidden_root
+    assert.equal((await fetch(base + `/memory?rootKey=d-pk`, { headers: { authorization: `Bearer ${person}` } })).status, 403);
 
     // forget via platform seam: confirm required, then logical delete with audited principal
     const rel = items[0].path;

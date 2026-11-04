@@ -6,8 +6,9 @@
 // default to own (a pod token's default is shared). Grant checks run per
 // call, so revoking a grant narrows the face immediately.
 
-import { StoreRoot, rootKeyForNamespace } from "./store.js";
+import { StoreRoot, rootKeyForNamespace, normalizeMetadata } from "./store.js";
 import { namespaceParts, Scope } from "./auth.js";
+import { PageFilter } from "./db.js";
 import { newPage } from "./okf.js";
 import { randomUUID } from "node:crypto";
 
@@ -37,6 +38,15 @@ function parseSources(raw: unknown): string[] {
     return Array.isArray(v) ? v.map(String) : [];
   } catch {
     return [];
+  }
+}
+
+function parseMetadata(raw: unknown): Record<string, unknown> | undefined {
+  try {
+    const v = JSON.parse(String(raw ?? ""));
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -120,6 +130,42 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
 
   const targetProps = { target: TARGET_SCHEMA };
 
+  // Structured read filter (add-agent-memory-foundation): optional `filter`
+  // object on the query/recent tools. layer maps through the same layerOf the
+  // rows carry; unknown layers are a named error, never a silent match-all.
+  const FILTER_SCHEMA = {
+    type: "object",
+    properties: {
+      metadata: { type: "object", description: "Key/value filter; scalar = equality, array = contains." },
+      since: { type: "string", description: "Inclusive lower bound on write time (ISO)." },
+      until: { type: "string", description: "Inclusive upper bound on write time (ISO)." },
+      layer: { type: "string", enum: ["L0", "L1", "L2"] },
+    },
+    description: "Optional structured filter, composable with the query.",
+  };
+  function readFilter(args: Record<string, unknown>): { filter?: PageFilter; error?: ToolResult } {
+    const raw = args.filter;
+    if (raw === undefined || raw === null) return {};
+    if (typeof raw !== "object" || Array.isArray(raw)) return { error: err("invalid_filter", { reason: "filter must be an object" }) };
+    const src = raw as { metadata?: unknown; since?: unknown; until?: unknown; layer?: unknown };
+    const meta = normalizeMetadata(src.metadata);
+    if (meta === null) return { error: err("invalid_metadata", { reason: "metadata values must be scalars or arrays of scalars" }) };
+    const filter: PageFilter = {};
+    if (meta && Object.keys(meta).length > 0) filter.metadata = meta;
+    if (src.since != null) filter.since = String(src.since);
+    if (src.until != null) filter.until = String(src.until);
+    if (src.layer != null) {
+      const l = String(src.layer);
+      if (!["L0", "L1", "L2"].includes(l)) return { error: err("invalid_filter", { reason: `unknown layer ${l}` }) };
+      // layerOf is derived from type; L0 rows are observations (not pages), so
+      // a page-only filter maps L0 to an empty type set — handled by callers
+      // that also query observations (memory_recent). Here: L2 = the distilled
+      // types, L1 = everything else page-shaped.
+      filter.types = l === "L2" ? ["fact", "experience", "reference"] : l === "L1" ? ["note", "handoff"] : [];
+    }
+    return { filter };
+  }
+
   return [
     {
       name: "memory_handoff_begin",
@@ -190,37 +236,48 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     },
     {
       name: "memory_query",
-      description: "Full-text search across your accessible partitions (each result carries its source).",
-      inputSchema: { type: "object", properties: { q: { type: "string" }, limit: { type: "number" }, ...targetProps }, required: ["q"] },
+      description: "Full-text search across your accessible partitions (each result carries its source). Optional filter: metadata key/values, time window, layer.",
+      inputSchema: { type: "object", properties: { q: { type: "string" }, limit: { type: "number" }, filter: FILTER_SCHEMA, ...targetProps }, required: ["q"] },
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
-        const results = root.db.searchPages(String(args.q), Number(args.limit ?? 20), r.projects).map((row) => ({
+        const f = readFilter(args);
+        if (f.error) return f.error;
+        const results = root.db.searchPages(String(args.q), Number(args.limit ?? 20), r.projects, f.filter).map((row) => ({
           ...row,
           source: sourceOf(row.project),
           layer: layerOf(row.type),
           ...(layerOf(row.type) === "L2" ? { sources: parseSources(row.sources) } : {}),
+          ...(row.metadata ? { metadata: parseMetadata(row.metadata) } : {}),
         }));
         return text({ results });
       },
     },
     {
       name: "memory_recent",
-      description: "Recent pages and observations across your accessible partitions (each row carries its source).",
-      inputSchema: { type: "object", properties: { limit: { type: "number" }, ...targetProps } },
+      description: "Recent pages and observations across your accessible partitions (each row carries its source). Optional filter: metadata key/values, time window, layer.",
+      inputSchema: { type: "object", properties: { limit: { type: "number" }, filter: FILTER_SCHEMA, ...targetProps } },
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
+        const f = readFilter(args);
+        if (f.error) return f.error;
         const limit = Number(args.limit ?? 20);
-        return text({
-          pages: root.db.recentPages(limit, r.projects).map((p) => ({
-            ...p,
-            source: sourceOf(p.project),
-            layer: layerOf(p.type),
-            ...(layerOf(p.type) === "L2" ? { sources: parseSources(p.sources) } : {}),
-          })),
-          observations: root.db.recentObservations(limit, r.projects).map((o) => ({ ...o, source: sourceOf(o.project), layer: "L0" })),
-        });
+        const filter = f.filter ?? {};
+        // L0 rows are observations, not pages: the pages leg drops for an
+        // L0-only ask, and L1/L2 asks never carry observations.
+        const layer = (args.filter as { layer?: string } | undefined)?.layer;
+        const pages = layer === "L0" ? [] : root.db.recentPages(limit, r.projects, filter).map((p) => ({
+          ...p,
+          source: sourceOf(p.project),
+          layer: layerOf(p.type),
+          ...(layerOf(p.type) === "L2" ? { sources: parseSources(p.sources) } : {}),
+          ...(p.metadata ? { metadata: parseMetadata(p.metadata) } : {}),
+        }));
+        const observations = layer === "L2" || layer === "L1"
+          ? []
+          : root.db.recentObservations(limit, r.projects, filter.since, filter.until).map((o) => ({ ...o, source: sourceOf(o.project), layer: "L0" as const }));
+        return text({ pages, observations });
       },
     },
     {
@@ -252,6 +309,9 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           tier: { type: "string" },
           source_ref: { type: "string" },
           origin: { type: "string" },
+          // Structured metadata (add-agent-memory-foundation): machine
+          // addressing rides HERE, never in the title string.
+          metadata: { type: "object", description: "Optional structured key/values (scalars or arrays of scalars) — the structured filter lane reads this." },
           ...targetProps,
         },
         required: ["title", "body"],
@@ -262,7 +322,10 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         const type = String(args.type ?? "note");
         const dir = type === "reference" ? "references" : type === "note" ? "notes" : null;
         if (!dir) return err(`unknown_page_type: ${type}`);
+        const meta = normalizeMetadata(args.metadata);
+        if (meta === null) return err("invalid_metadata", { reason: "metadata must be an object of scalar/array-of-scalar values" });
         const extra: Record<string, unknown> = {};
+        if (meta && Object.keys(meta).length > 0) extra.metadata = meta;
         if (type === "reference") {
           const sourceRef = String(args.source_ref ?? "").trim();
           if (!sourceRef) return err("reference_requires_source_ref");
@@ -277,6 +340,41 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         return text({ path: rel, source: sourceOf(w.project!) });
       },
     },
+    {
+      name: "memory_overview",
+      description: "A self-awareness snapshot of YOUR memory: which partitions your grants can reach, how many pages each holds, and the most recent titles. Read-only, hard-capped, never crosses into partitions you cannot reach.",
+      inputSchema: { type: "object", properties: { recent: { type: "number", description: "Recent titles per partition (default 5, cap 10)." } } },
+      handler: (args) => {
+        const recent = Math.min(10, Math.max(1, Number(args.recent ?? 5) || 5));
+        // Same source of truth as the read faces: readProjects' union for
+        // deploy tokens, the whole root for persons (their grant covers it),
+        // shared-only for pods. Oversight partitions ride separately, tagged.
+        let partitions: Array<{ project: string; source: "own" | "shared" | "owner" | string; pages: number; last_write: string | null; recent: Array<{ path: string; title: string; updated_at: string; layer: string }> }>;
+        if (scope.kind === "person") {
+          const stats = root.db.projectStats();
+          partitions = stats.map((s) => ({
+            project: s.project, source: "owner", pages: Number(s.pages), last_write: s.last_write,
+            recent: root.db.recentPages(recent, [s.project]).map((p) => ({ path: p.path, title: p.title, updated_at: p.updated_at, layer: layerOf(p.type) })),
+          }));
+        } else {
+          const r = readProjects(undefined);
+          if (r.error) return r.error;
+          partitions = (r.projects ?? []).map((project) => {
+            const s = root.db.projectStats([project])[0] ?? { project, pages: 0, last_write: null };
+            return {
+              project, source: sourceOf(project), pages: Number(s.pages), last_write: s.last_write,
+              recent: root.db.recentPages(recent, [project]).map((p) => ({ path: p.path, title: p.title, updated_at: p.updated_at, layer: layerOf(p.type) })),
+            };
+          });
+        }
+        return text({
+          kind: scope.kind,
+          partitions,
+          // Total volume guard: the overview is a compass, not a bulk export.
+          truncated: partitions.length >= 50,
+        });
+      },
+    },
   ];
 }
 
@@ -284,8 +382,10 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
 // face (spec: seven tools) — page writes flow through capture/handoff. Kept
 // here as an internal helper for the HTTP write face used by consolidation
 // tooling later.
-export function writeNotePage(root: StoreRoot, project: string, title: string, body: string): string {
-  return root.writePage(project, "notes", randomUUID().slice(0, 8), newPage("note", title, body));
+export function writeNotePage(root: StoreRoot, project: string, title: string, body: string, metadata?: Record<string, unknown>): string {
+  const extra: Record<string, unknown> = {};
+  if (metadata && Object.keys(metadata).length > 0) extra.metadata = metadata;
+  return root.writePage(project, "notes", randomUUID().slice(0, 8), newPage("note", title, body, extra));
 }
 
 export { rootKeyForNamespace };

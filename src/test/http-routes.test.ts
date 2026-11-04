@@ -64,9 +64,11 @@ test("/digest: scope taxonomy — platform needs rootKey, person must not send i
     assert.equal(a.status, 400);
     assert.equal(((await a.json()) as { error: string }).error, "rootKey_required");
 
+    // person rootKey = the oversight lane (add-agent-memory-foundation):
+    // u-alice owns no d/ root → 403 forbidden_root (existence never leaked)
     const b = await fetch(`${base}/digest?rootKey=d-probe&project=default&q=x`, { headers: json(person) });
-    assert.equal(b.status, 400);
-    assert.equal(((await b.json()) as { error: string }).error, "rootKey_is_platform_seam_only");
+    assert.equal(b.status, 403);
+    assert.equal(((await b.json()) as { error: string }).error, "forbidden_root");
 
     const c = await fetch(`${base}/digest?rootKey=d-probe&project=default&q=x`, { headers: json(agent) });
     assert.equal(c.status, 403);

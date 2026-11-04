@@ -9,13 +9,14 @@ import { join } from "node:path";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { TokenStore, Scope, namespaceParts } from "./auth.js";
-import { StoreRoot } from "./store.js";
+import { StoreRoot, normalizeMetadata } from "./store.js";
+import { PageFilter } from "./db.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 
@@ -103,6 +104,54 @@ export class Service {
     const m = h.match(/^Bearer\s+(.+)$/i);
     if (!m) return null;
     return this.tokens.verify(m[1].trim());
+  }
+
+  // Owner oversight resolution (add-agent-memory-foundation): a person token
+  // naming a d/ rootKey reads through ONLY when the root_owner table binds
+  // that root to them. Binding is a table, never a naming convention; a
+  // non-matching rootKey is the same 403 as any other refusal so existence is
+  // never leaked. Every resolved oversight read is audited by the caller.
+  private oversightResolve(scope: Scope, rootKeyParam: string | null): { root: StoreRoot; rootKey: string } | { error: "rootKey_is_platform_seam_only" | "forbidden" } {
+    if (!rootKeyParam) return { error: "rootKey_is_platform_seam_only" };
+    if (scope.kind !== "person" || !scope.namespace.startsWith("u/")) return { error: "forbidden" };
+    const owner = this.tokens.rootOwnerOf(rootKeyParam);
+    if (!owner || owner !== scope.namespace.slice(2).split("/")[0]) return { error: "forbidden" };
+    return { root: this.rootForKey(rootKeyParam), rootKey: rootKeyParam };
+  }
+
+  // Structured read-filter params (add-agent-memory-foundation): repeated
+  // `meta=key:value` pairs (value parsed as JSON when it parses, else string;
+  // array values take contains semantics), plus since/until/layer — the same
+  // vocabulary /memory already speaks. Empty params → no filter (byte-equal
+  // legacy behavior).
+  private filterParamsOf(url: URL): { filter?: PageFilter; error?: string } {
+    const metas = url.searchParams.getAll("meta");
+    const since = url.searchParams.get("since") ?? undefined;
+    const until = url.searchParams.get("until") ?? undefined;
+    const layer = url.searchParams.get("layer") ?? undefined;
+    if (!metas.length && !since && !until && !layer) return {};
+    const metadata: Record<string, unknown> = {};
+    for (const raw of metas) {
+      const i = raw.indexOf(":");
+      if (i <= 0) return { error: "invalid_meta_param" };
+      const key = raw.slice(0, i).trim();
+      const rawVal = raw.slice(i + 1);
+      let val: unknown = rawVal;
+      try { val = JSON.parse(rawVal); } catch { /* plain string value */ }
+      if (typeof val === "string" && val === "") return { error: "invalid_meta_param" };
+      metadata[key] = val;
+    }
+    const meta = normalizeMetadata(Object.keys(metadata).length ? metadata : undefined);
+    if (meta === null) return { error: "invalid_meta_param" };
+    const filter: PageFilter = {};
+    if (meta && Object.keys(meta).length > 0) filter.metadata = meta;
+    if (since) filter.since = since;
+    if (until) filter.until = until;
+    if (layer) {
+      if (!["L0", "L1", "L2"].includes(layer)) return { error: "invalid_layer" };
+      filter.types = layer === "L2" ? ["fact", "experience", "reference"] : layer === "L1" ? ["note", "handoff"] : [];
+    }
+    return Object.keys(filter).length ? { filter } : {};
   }
 
   private async rawBody(req: IncomingMessage): Promise<string> {
@@ -239,27 +288,60 @@ export class Service {
       const projectOf = (raw: unknown): string => String(raw ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
       const auditOf = (project: string) => ({ principal: `${scope.kind}:${scope.tokenId}`, scope: nsOfProject(project) });
       if (req.method === "GET") {
+        // Owner oversight (add-agent-memory-foundation): person + rootKey reads
+        // a bound deployment root — list/read only, audited, zero write power
+        // anywhere on this face.
+        const rootKeyParam = url.searchParams.get("rootKey");
+        let pRoot: StoreRoot = this.rootFor(scope);
+        if (rootKeyParam) {
+          if (scope.kind !== "person") {
+            res.writeHead(400, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+          }
+          const ov = this.oversightResolve(scope, rootKeyParam);
+          if ("error" in ov) {
+            res.writeHead(ov.error === "rootKey_is_platform_seam_only" ? 400 : 403, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: ov.error === "rootKey_is_platform_seam_only" ? ov.error : "forbidden_root" }));
+          }
+          pRoot = ov.root;
+        }
         const project = projectOf(url.searchParams.get("project"));
         if (!project) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "project_required" }));
         }
-        if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
+        if (!rootKeyParam && !this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
           res.writeHead(403, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "forbidden_project", project }));
         }
+        const fp = this.filterParamsOf(url);
+        if (fp.error) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: fp.error }));
+        }
+        if (fp.filter) noteMetaFilter();
         const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit") ?? 10)));
-        const root = this.rootFor(scope);
+        const pages = pRoot.db.recentPages(limit, [project], fp.filter);
+        if (rootKeyParam) {
+          pRoot.db.addOversightRead(`person:${scope.tokenId}`, rootKeyParam, project, pages.length);
+        }
         res.writeHead(200, { "content-type": "application/json" });
-        return void res.end(JSON.stringify({ project, pages: root.db.recentPages(limit, [project]) }));
+        return void res.end(JSON.stringify({ project, pages }));
       }
-      const body = await this.body<{ project?: string; title?: string; body?: string }>(req);
+      const body = await this.body<{ project?: string; title?: string; body?: string; metadata?: unknown }>(req);
       const project = projectOf(body.project);
       const title = String(body.title ?? "").trim();
       const pageBody = String(body.body ?? "");
       if (!project || !title || !pageBody) {
         res.writeHead(400, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "project_title_body_required" }));
+      }
+      // Structured metadata (add-agent-memory-foundation): optional on this
+      // face; malformed shape is a named 400, never a silent drop.
+      const meta = normalizeMetadata(body.metadata);
+      if (meta === null) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_metadata", reason: "metadata must be an object of scalar/array-of-scalar values" }));
       }
       if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "rw")) {
         res.writeHead(403, { "content-type": "application/json" });
@@ -268,7 +350,7 @@ export class Service {
       const root = this.rootFor(scope);
       // Pages from this face are plain notes — reindex treats them like any
       // other page; the audit row names the platform-seam principal.
-      const rel = writeNotePage(root, project, title, pageBody);
+      const rel = writeNotePage(root, project, title, pageBody, meta && Object.keys(meta).length ? meta : undefined);
       this.auditRoot(root, auditOf(project), rel, "page_write");
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project, path: rel }));
@@ -284,6 +366,7 @@ export class Service {
     if (path === "/digest" && req.method === "GET") {
       const rootKeyParam = url.searchParams.get("rootKey");
       let dRoot: StoreRoot;
+      let oversight = false;
       if (scope.kind === "platform" || scope.kind === "runner") {
         if (!rootKeyParam) {
           res.writeHead(400, { "content-type": "application/json" });
@@ -292,10 +375,19 @@ export class Service {
         dRoot = this.rootForKey(rootKeyParam);
       } else if (scope.kind === "person") {
         if (rootKeyParam) {
-          res.writeHead(400, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+          // Owner oversight (add-agent-memory-foundation): person + rootKey
+          // reads a bound deployment root; the digest stays read-only here by
+          // construction (no write face on /digest).
+          const ov = this.oversightResolve(scope, rootKeyParam);
+          if ("error" in ov) {
+            res.writeHead(403, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "forbidden_root" }));
+          }
+          dRoot = ov.root;
+          oversight = true;
+        } else {
+          dRoot = this.rootFor(scope);
         }
-        dRoot = this.rootFor(scope);
       } else {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "person_token_required" }));
@@ -376,10 +468,26 @@ export class Service {
         }
       };
       const candidates = await hybridCandidates({ root: dRoot, project, queryFor: q, k, embed });
+      // Structured filter (add-agent-memory-foundation): ONE indexed SQL pass
+      // answers "which pages match"; candidates/notes/refs keep only members
+      // of that set. The retrieval lanes stay untouched — the filter narrows
+      // their output before budget rendering, never a full wiki walk.
+      const fp = this.filterParamsOf(url);
+      if (fp.error) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: fp.error }));
+      }
+      if (fp.filter) noteMetaFilter();
+      const filterProjects = project === "shared" ? ["shared"] : [project, "shared"];
+      const allowedPaths = fp.filter ? dRoot.db.filteredPagePaths(filterProjects, fp.filter) : null;
+      const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+      const filteredCandidates = allowedPaths
+        ? candidates.filter((c) => allowedPaths.has(relOf(c, project)) || allowedPaths.has(relOf(c, "shared")))
+        : candidates;
       // Enrich candidates with confidence/updated_at from the page index +
       // frontmatter (render annotations must not depend on the caller).
       const pageMeta = new Map(dRoot.db.recentPages(1000, [project]).map((p) => [p.path, p.updated_at]));
-      const items: DigestItem[] = candidates.map((c) => {
+      const items: DigestItem[] = filteredCandidates.map((c) => {
         let updated_at: string | null = null;
         let confidence: number | null = null;
         for (const p2 of project === "shared" ? ["shared"] : [project, "shared"]) {
@@ -419,14 +527,14 @@ export class Service {
       // doesn't wait for distillation latency), then recency fills the rest.
       // Empty/no-match query → pure recency, byte-identical to before.
       const matched = q.trim() ? dRoot.db.queryNotes(project, q, 3) : [];
-      const matchedPaths = new Set(matched.map((p) => p.path));
-      // Reference lane (add-unified-memory-and-outputs): thin index entries
+      const matchedPaths = new Set(matched.map((p) => p.path));      // Reference lane (add-unified-memory-and-outputs): thin index entries
       // for library/output artifacts render as citation-by-name lines (「见
       // 资料库《title》— summary」) — never the body. Caps mirror the notes
       // segment; canonical rides first under budget pressure (renderer keeps
       // array order).
       const k_refs = Math.min(3, Math.max(1, Math.floor(k / 2)));
-      const refs = q.trim() ? dRoot.db.queryReferences(project, q, k_refs) : dRoot.db.queryReferences(project, "", k_refs);
+      const refs = (q.trim() ? dRoot.db.queryReferences(project, q, k_refs) : dRoot.db.queryReferences(project, "", k_refs))
+        .filter((p) => !allowedPaths || allowedPaths.has(p.path));
       const refItems: DigestItem[] = refs.map((p) => ({
         id: p.path, layer: "L2" as const, kind: "reference",
         title: `见资料库《${p.title}》`,
@@ -435,7 +543,7 @@ export class Service {
       }));
       const merged = [
         ...matched,
-        ...dRoot.db.recentNotes(project, NOTES_LIMIT).filter((p) => !matchedPaths.has(p.path)),
+        ...dRoot.db.recentNotes(project, NOTES_LIMIT).filter((p) => (!matchedPaths.has(p.path)) && (!allowedPaths || allowedPaths.has(p.path))),
       ].slice(0, NOTES_LIMIT);
       const noteItems: DigestItem[] = merged.map((p) => {
         const page = dRoot.readPageByRel(p.path);
@@ -461,6 +569,11 @@ export class Service {
       const handoffs = dRoot.db.openHandoffs([project]).filter((h) => freshEnough(h.created_at)).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
       const allItems = [...refItems, ...items, ...noteItems];
       const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
+      // Oversight audit (add-agent-memory-foundation): one row per supervised
+      // digest read — who, when, root, partitions, how many entries rendered.
+      if (oversight) {
+        try { dRoot.db.addOversightRead(`person:${scope.tokenId}`, rootKeyParam!, project, allItems.length); } catch { /* companion record only */ }
+      }
       const rendered = (digest.match(/〔L/g) ?? []).length;
       const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
       // served-rung line (add-u-root-distillation D4): hit-rate is observable
@@ -593,11 +706,20 @@ export class Service {
         auditScopeBase = rootKeyParam;
       } else if (scope.kind === "person") {
         if (rootKeyParam) {
-          res.writeHead(400, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+          // Owner oversight (add-agent-memory-foundation): person + rootKey
+          // lists a bound deployment root. Read-only face (it always was);
+          // every supervised listing is audited below.
+          const ov = this.oversightResolve(scope, rootKeyParam);
+          if ("error" in ov) {
+            res.writeHead(403, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "forbidden_root" }));
+          }
+          memRoot = ov.root;
+          auditScopeBase = rootKeyParam;
+        } else {
+          memRoot = this.rootFor(scope);
+          auditScopeBase = memRoot.rootDir.split("/").pop()!;
         }
-        memRoot = this.rootFor(scope);
-        auditScopeBase = memRoot.rootDir.split("/").pop()!;
       } else {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "person_token_required" }));
@@ -637,6 +759,11 @@ export class Service {
         .filter((o) => (!layer || layer === "L0") && inWindow(o.created_at))
         .map((o) => ({ path: `${o.project}/${o.session_id}/${o.event}`, title: `${o.event}${o.tool ? " " + o.tool : ""}`, project: o.project, layer: "L0", sources: [], ts: o.created_at }));
       const items = [...pages, ...obs].sort((a, b) => (a.ts < b.ts ? 1 : -1)).slice(offset, offset + limit);
+      // Oversight audit: person + rootKey listings are supervised reads —
+      // one row each, companion-record discipline (never fails the read).
+      if (scope.kind === "person" && rootKeyParam) {
+        try { memRoot.db.addOversightRead(`person:${scope.tokenId}`, rootKeyParam, projectFilter ?? "(all)", items.length); } catch { /* companion */ }
+      }
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ items, offset, limit }));
     }
@@ -924,9 +1051,30 @@ export class Service {
         return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "d/<packId> (pod) | d/<packId>/<agentId> (member)" }));
       }
       if (scope.kind === "platform") {
+        // Extended (add-agent-memory-foundation): platform ALSO mints
+        // deployment member tokens (d/<packId>/<agentId>) — the lane an
+        // agent platform's member materialization uses — and MUST bind
+        // root_owner at that moment (the oversight anchor). Person minting
+        // stays as-is.
+        const segs = ns.slice(2).split("/").filter(Boolean);
+        if (ns.startsWith("d/")) {
+          if (segs.length !== 2 || !segs[0] || !segs[1]) {
+            res.writeHead(400, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "platform deployment mint: d/<packId>/<agentId> with body.owner = u/<user>" }));
+          }
+          const owner = String(body.owner ?? "");
+          if (!owner.startsWith("u/") || owner.split("/").length !== 2 || !owner.slice(2)) {
+            res.writeHead(400, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "owner_required", hint: "deployment mint requires owner = u/<user> (the oversight anchor)" }));
+          }
+          const out = this.tokens.mint("deployment", ns, String(body.label ?? "platform-minted"));
+          this.tokens.bindRootOwner(namespaceParts(ns).rootKey, owner.slice(2), `mint:${out.id}`);
+          res.writeHead(200, { "content-type": "application/json" });
+          return void res.end(JSON.stringify(out));
+        }
         if (!ns.startsWith("u/")) {
           res.writeHead(403, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "cross_family_mint", platform_mints: "u/<user>" }));
+          return void res.end(JSON.stringify({ error: "cross_family_mint", platform_mints: "u/<user> | d/<packId>/<agentId>" }));
         }
         if (ns.split("/").length !== 2 || !ns.slice(2)) {
           res.writeHead(400, { "content-type": "application/json" });
@@ -937,7 +1085,27 @@ export class Service {
         return void res.end(JSON.stringify(out));
       }
       res.writeHead(403, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment|pod", "platform:person"] }));
+      return void res.end(JSON.stringify({ error: "minting_face_forbidden", allowed: ["runner:deployment|pod", "platform:person|deployment"] }));
+    }
+
+    // Explicit owner binding for pre-existing roots (add-agent-memory-
+    // foundation): the idempotent backfill gesture for roots minted before
+    // root_owner existed. Platform-only, first binding wins — a rebind is a
+    // no-op reporting the existing owner, never a silent rewrite.
+    if (path === "/admin/bind-root-owner") {
+      if (scope.kind !== "platform") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "platform_token_required" }));
+      }
+      const rootKey = String(body.rootKey ?? "");
+      const owner = String(body.owner ?? "");
+      if (!rootKey.startsWith("d-") || !owner.startsWith("u/") || owner.split("/").length !== 2 || !owner.slice(2)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_binding", hint: "rootKey = d-<packId>, owner = u/<user>" }));
+      }
+      const out = this.tokens.bindRootOwner(rootKey, owner.slice(2), "admin:bind-root-owner");
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ rootKey, owner, ...out }));
     }
 
     // Operational snapshot (add-memory-metrics): one curl answers "is the
@@ -1059,6 +1227,7 @@ export class Service {
         rootKey,
         grants: this.tokens.grantsForRoot(rootKey),
         recent_writes: root.db.recentWrites(50),
+        oversight_reads: root.db.recentOversightReads(20),
         distill: this.tokens.distillBudgetRows(rootKey),
       }));
     }

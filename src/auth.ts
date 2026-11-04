@@ -114,6 +114,9 @@ export class TokenStore {
       CREATE TABLE IF NOT EXISTS distill_budget (
         owner_key TEXT, day TEXT, tokens INTEGER NOT NULL DEFAULT 0, llm_calls INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (owner_key, day)
+      );
+      CREATE TABLE IF NOT EXISTS root_owner (
+        root_key TEXT PRIMARY KEY, owner_user TEXT NOT NULL, bound_at TEXT NOT NULL, source TEXT
       )`,
     );
     this.backfillDefaultGrants();
@@ -176,6 +179,37 @@ export class TokenStore {
       if (m && (m === "rw" || mode === "r")) return true;
     }
     return false;
+  }
+
+  // -- root ownership (add-agent-memory-foundation) ----------------------------
+  // The structural anchor for owner oversight: which person owns which d/
+  // root, recorded at mint time (platform deployment minting) or via the
+  // explicit admin bind gesture for pre-existing roots. Deliberately a table,
+  // never a naming convention (spec: ownership 判定 MUST NOT 依赖名称约定).
+  // First binding wins and re-binding is idempotent — a rebind that silently
+  // rewrote ownership would be an oversight-bypass primitive.
+  bindRootOwner(rootKey: string, ownerUser: string, source: string): { bound: boolean; existing: string | null } {
+    const clean = safeSegment(rootKey);
+    const row = this.db.prepare("SELECT owner_user FROM root_owner WHERE root_key=?").get(clean) as { owner_user: string } | undefined;
+    if (row) return { bound: false, existing: row.owner_user };
+    this.db.prepare("INSERT INTO root_owner (root_key, owner_user, bound_at, source) VALUES (?,?,?,?)")
+      .run(clean, ownerUser, new Date().toISOString(), source);
+    return { bound: true, existing: null };
+  }
+
+  rootOwnerOf(rootKey: string): string | null {
+    const row = this.db.prepare("SELECT owner_user FROM root_owner WHERE root_key=?").get(rootKey) as { owner_user: string } | undefined;
+    return row?.owner_user ?? null;
+  }
+
+  // The d/ roots a person namespace (u/<user>) may supervise. Empty unless
+  // bindings exist — oversight is opt-in by binding, never ambient.
+  oversightRootKeysFor(userNs: string): string[] {
+    if (!userNs.startsWith("u/")) return [];
+    const user = userNs.slice(2).split("/")[0];
+    if (!user) return [];
+    const rows = this.db.prepare("SELECT root_key FROM root_owner WHERE owner_user=? ORDER BY root_key LIMIT 100").all(user) as Array<{ root_key: string }>;
+    return rows.map((r) => r.root_key);
   }
 
   // -- distill budget (add-memory-distiller) ----------------------------------

@@ -30,6 +30,43 @@ export interface AuditIdentity {
   scope: string;
 }
 
+// Structured metadata validation (add-agent-memory-foundation): keys ≤ 32,
+// values limited to scalars or arrays of scalars (≤ 32 items, each ≤ 256
+// chars). Returns `undefined` for absent input, `null` for INVALID input —
+// callers turn null into a structured 400, never a silent drop.
+const META_MAX_KEYS = 32;
+const META_MAX_ARRAY = 32;
+const META_MAX_VALUE_CHARS = 256;
+
+export function normalizeMetadata(v: unknown): Record<string, unknown> | null | undefined {
+  if (v === undefined || v === null) return v === null ? null : undefined;
+  if (typeof v !== "object" || Array.isArray(v)) return null;
+  const entries = Object.entries(v as Record<string, unknown>);
+  if (entries.length > META_MAX_KEYS) return null;
+  const out: Record<string, unknown> = {};
+  const scalarOk = (x: unknown): boolean =>
+    typeof x === "string" || typeof x === "number" || typeof x === "boolean";
+  for (const [k, val] of entries) {
+    if (!k.trim() || k.length > 64) return null;
+    if (Array.isArray(val)) {
+      if (val.length > META_MAX_ARRAY) return null;
+      const arr: Array<string | number | boolean> = [];
+      for (const item of val) {
+        if (!scalarOk(item)) return null;
+        if (String(item).length > META_MAX_VALUE_CHARS) return null;
+        arr.push(item as string | number | boolean);
+      }
+      out[k] = arr;
+    } else if (scalarOk(val)) {
+      if (String(val).length > META_MAX_VALUE_CHARS) return null;
+      out[k] = val;
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+
 // rootKey mirrors namespaceParts (v2): u/<user>… → u-<user>; d/<packId>[/<agentId>] → d-<packId>.
 export function rootKeyForNamespace(ns: string): string {
   return namespaceParts(ns).rootKey;
@@ -102,12 +139,18 @@ export class StoreRoot {
     const dir = this.ensureProject(project);
     const rel = `${project}/${typeDir}/${slug}.md`;
     writePageFile(join(this.wikiDir, rel), page);
+    // Metadata (add-agent-memory-foundation): the frontmatter is the truth;
+    // the SQLite column is the filterable mirror. Reindex reads the same key.
+    const meta = page.frontmatter.metadata && typeof page.frontmatter.metadata === "object" && !Array.isArray(page.frontmatter.metadata)
+      ? (page.frontmatter.metadata as Record<string, unknown>)
+      : null;
     this.db.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? slug), page.body, {
       sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
       supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
       tags: Array.isArray(page.frontmatter.tags) ? (page.frontmatter.tags as string[]).map(String).slice(0, 5) : [],
       tier: ["draft", "stable", "canonical"].includes(String(page.frontmatter.tier)) ? String(page.frontmatter.tier) : "draft",
       source_ref: page.frontmatter.source_ref != null ? String(page.frontmatter.source_ref) : null,
+      metadata: meta,
     });
     if (audit) this.audit(audit, rel, "page_write");
     this.snapshotSoon(`page: ${rel}`);

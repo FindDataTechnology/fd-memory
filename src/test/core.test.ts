@@ -338,7 +338,7 @@ test("mcp tools: handoff claim-once across agents; scope has no namespace param"
     const names = tools.map((t) => t.name);
     assert.deepEqual(names.sort(), [
       "memory_handoff_accept", "memory_handoff_begin", "memory_handoff_cancel",
-      "memory_handoff_list", "memory_query", "memory_read_page", "memory_recent", "memory_write_page",
+      "memory_handoff_list", "memory_overview", "memory_query", "memory_read_page", "memory_recent", "memory_write_page",
     ]);
     // no tool schema carries a namespace field — scope cannot be overridden
     for (const t of tools) {
@@ -420,7 +420,7 @@ test("http service: auth 401, capture 200, mcp initialize + tools/list round-tri
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
     const tools = (await toolsList.json()).result.tools as unknown as { name: string }[];
-    assert.equal(tools.length, 8);
+    assert.equal(tools.length, 9); // eight legacy + memory_overview (add-agent-memory-foundation)
   } finally {
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
@@ -621,9 +621,14 @@ test("federation: /hook person face + platform minting matrix + idempotency", as
     r = await post("/hook?event=stop&agent=z&cwd=/x&ingest_key=k4", platform, JSON.stringify({ session_id: "s" }));
     assert.equal(r.status, 403);
 
-    const mint = (tok: string, ns: string) => post("/admin/mint", tok, JSON.stringify({ namespace: ns })).then((x) => x.status);
+    const mint = (tok: string, ns: string, owner?: string) => post("/admin/mint", tok, JSON.stringify({ namespace: ns, ...(owner ? { owner } : {}) })).then((x) => x.status);
     assert.equal(await mint(platform, "u/bob"), 200);
-    assert.equal(await mint(platform, "d/p/a"), 403);
+    // add-agent-memory-foundation: platform mints deployment member tokens
+    // WITH a binding owner; without one it is a named 400 (was cross-family
+    // 403 before the oversight anchor existed).
+    assert.equal(await mint(platform, "d/p/a"), 400);
+    assert.equal(await mint(platform, "d/p/a", "u/alice"), 200);
+    assert.equal(svc.tokens.rootOwnerOf("d-p"), "alice");
     assert.equal(await mint(runner, "u/bob"), 403);
     assert.equal(await mint(person, "u/bob"), 403);
 

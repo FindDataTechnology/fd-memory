@@ -65,9 +65,12 @@ test("/digest: permission matrix, degradation, clamps, assembly", async () => {
     const r2 = await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=集群", { headers: { authorization: `Bearer ${platform}` } });
     assert.equal(r2.status, 200);
     assert.equal((await fetch(base + "/digest?project=cluster-42&q=x", { headers: { authorization: `Bearer ${platform}` } })).status, 400);
-    // agent refused even with rootKey; person with rootKey rejected
+    // agent refused even with rootKey; person rootKey resolves the oversight
+    // lane (add-agent-memory-foundation): u-alice owns no d/ root → 403
     assert.equal((await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: { authorization: `Bearer ${dep}` } })).status, 403);
-    assert.equal((await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: H })).status, 400);
+    const unbound = await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: H });
+    assert.equal(unbound.status, 403);
+    assert.equal(((await unbound.json()) as { error: string }).error, "forbidden_root");
 
     // clamps: k=50/budget=99999 clamped server-side, still 200
     const r3 = await fetch(base + "/digest?project=cluster-42&q=集群&k=50&budget=99999", { headers: H });
@@ -105,7 +108,7 @@ test("/digest L1: no-L2 project's recent notes ride with 〔L1·note〕 annotati
     assert.equal(r.status, 200);
     assert.equal(d.items, 0, "no L2 candidates");
     assert.equal(d.notes, 2);
-    assert.match(d.digest, /〔L1·note｜2026-10-2\d〕集群回合 2026-10-25 08:00/);
+    assert.match(d.digest, /〔L1·note｜\d{4}-\d{2}-\d{2}〕集群回合 2026-10-25 08:00/);
     assert.ok(d.digest.includes("数据研究员在位"));
     assert.equal(d.truncated, false);
   } finally {

@@ -43,9 +43,71 @@ export interface WriteRow {
   op: string;
 }
 
+export interface OversightReadRow {
+  ts: string;
+  principal: string;
+  root_key: string;
+  projects: string;
+  hits: number;
+}
+
+// Structured read filter (add-agent-memory-foundation): metadata key/values
+// (array value = contains), a write-time window, and/or a page-type set
+// (callers map layer→types; two layerOf variants exist upstream so the DB
+// layer does not guess). Absent fields are absent clauses — a filter with no
+// fields is no filter.
+export interface PageFilter {
+  metadata?: Record<string, unknown>;
+  since?: string;
+  until?: string;
+  types?: string[];
+}
+
 function projectFilterSql(projects: string[] | null, column: string): { clause: string; args: string[] } {
   if (!projects || projects.length === 0) return { clause: "", args: [] };
   return { clause: ` AND ${column} IN (SELECT value FROM json_each(?))`, args: [JSON.stringify(projects)] };
+}
+
+// Metadata predicate pushed into SQL (spec: 筛选下推到查询层，禁渲染层全量过滤).
+// Scalar values match by equality; arrays match by containment (any element).
+// Missing keys are NULL and never match — a filtered query only ever returns
+// pages that explicitly carry the key.
+type SqlArg = string | number | null;
+
+// node:sqlite rejects boolean bindings outright (SQLInputValue has no
+// boolean) — metadata scalars may be boolean, so the SQL binding normalizes
+// them to 1/0. json_extract on JSON `true`/`false` compares 1/0 correctly.
+function bindable(v: unknown): SqlArg {
+  if (typeof v === "boolean") return v ? 1 : 0;
+  return (v ?? null) as SqlArg;
+}
+
+function metadataFilterSql(filter: PageFilter | undefined, column: string): { clause: string; args: SqlArg[] } {
+  const meta = filter?.metadata;
+  if (!meta || typeof meta !== "object") return { clause: "", args: [] };
+  let clause = "";
+  const args: SqlArg[] = [];
+  for (const [key, value] of Object.entries(meta)) {
+    const path = `'$.${key.replace(/'/g, "''")}'`;
+    if (Array.isArray(value)) {
+      clause += ` AND EXISTS (SELECT 1 FROM json_each(json_extract(${column}, ${path})) je WHERE je.value IN (SELECT value FROM json_each(?)))`;
+      args.push(JSON.stringify(value));
+    } else {
+      clause += ` AND json_extract(${column}, ${path}) = ?`;
+      args.push(bindable(value));
+    }
+  }
+  return { clause, args };
+}
+
+function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null, projectColumn: string, timeColumn: string, typeColumn?: string): { clause: string; args: SqlArg[] } {
+  let clause = projectFilterSql(projects, projectColumn).clause;
+  const args: SqlArg[] = projectFilterSql(projects, projectColumn).args;
+  if (filter?.since) { clause += ` AND ${timeColumn} >= ?`; args.push(filter.since); }
+  if (filter?.until) { clause += ` AND ${timeColumn} <= ?`; args.push(filter.until); }
+  if (filter?.types?.length) { clause += ` AND ${typeColumn ?? "type"} IN (SELECT value FROM json_each(?))`; args.push(JSON.stringify(filter.types)); }
+  const mf = metadataFilterSql(filter, "metadata");
+  return { clause: clause + mf.clause, args: [...args, ...mf.args] };
 }
 
 export class RootDb {
@@ -90,6 +152,9 @@ export class RootDb {
         ts TEXT, principal TEXT, scope TEXT, page_rel TEXT, op TEXT
       );
       CREATE INDEX IF NOT EXISTS writes_ts ON writes(ts);
+      CREATE TABLE IF NOT EXISTS oversight_reads (
+        ts TEXT, principal TEXT, root_key TEXT, projects TEXT, hits INTEGER
+      );
       CREATE TABLE IF NOT EXISTS page_vectors (
         page_rel TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL
       );
@@ -142,6 +207,15 @@ export class RootDb {
     if (!pageCols.has("source_ref")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN source_ref TEXT");
     }
+    // Structured metadata (add-agent-memory-foundation): one JSON column —
+    // the markdown frontmatter is the truth, this is the filterable mirror.
+    // Expression indexes cover the two high-frequency keys; other keys stay
+    // queryable through json_extract without an index.
+    if (!pageCols.has("metadata")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN metadata TEXT");
+      this.db.exec(`CREATE INDEX IF NOT EXISTS pages_meta_kind ON pages(json_extract(metadata, '$.kind'))`);
+      this.db.exec(`CREATE INDEX IF NOT EXISTS pages_meta_member ON pages(json_extract(metadata, '$.memberId'))`);
+    }
     // u-root distillation (add-u-root-distillation): notes ride their own
     // string cursor (updated_at), mirroring handoff_cursor.
     const dsCols = this.columnsOf("distill_state");
@@ -165,19 +239,20 @@ export class RootDb {
 
   // -- pages / FTS -----------------------------------------------------------
 
-  indexPage(project: string, relPath: string, type: string, title: string, body: string, meta?: { sources?: string[]; supersedes?: string[]; tags?: string[]; tier?: string; source_ref?: string | null }): void {
+  indexPage(project: string, relPath: string, type: string, title: string, body: string, meta?: { sources?: string[]; supersedes?: string[]; tags?: string[]; tier?: string; source_ref?: string | null; metadata?: Record<string, unknown> | null }): void {
     const sources = JSON.stringify(meta?.sources ?? []);
     const supersedes = JSON.stringify(meta?.supersedes ?? []);
     const tags = JSON.stringify(meta?.tags ?? []);
     const tier = meta?.tier ?? "draft";
     const sourceRef = meta?.source_ref ?? null;
+    const metadata = meta?.metadata && Object.keys(meta.metadata).length > 0 ? JSON.stringify(meta.metadata) : null;
     this.db.prepare(
-      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
          title=excluded.title, body=excluded.body, updated_at=excluded.updated_at,
          sources=excluded.sources, supersedes=excluded.supersedes,
-         tags=excluded.tags, tier=excluded.tier, source_ref=excluded.source_ref`,
-    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes, tags, tier, sourceRef);
+         tags=excluded.tags, tier=excluded.tier, source_ref=excluded.source_ref, metadata=excluded.metadata`,
+    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes, tags, tier, sourceRef, metadata);
     this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
@@ -188,34 +263,43 @@ export class RootDb {
     this.db.prepare("DELETE FROM pages WHERE path=?").run(relPath);
   }
 
-  searchPages(query: string, limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string }> {
+  searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null }> {
     const pf = projectFilterSql(projects, "p.project");
+    // mf is the FULL page predicate (project + time + type + metadata) built
+    // for the joined columns; pf alone is kept for the observations leg below.
+    const mf = pageFilterSql(filter, projects, "p.project", "p.updated_at", "p.type");
+    // A metadata/time/type filter only ever constrains PAGES — observations
+    // carry none of those columns, so when a filter is present the
+    // observations leg drops out entirely (an unfiltered row leaking through
+    // would be worse than a smaller result set).
+    const hasPageOnlyFilter = Boolean(filter && (filter.metadata || filter.since || filter.until || filter.types?.length));
     const fts = (() => {
       try {
         return this.db
           .prepare(
-            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip
+            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
-             WHERE pages_fts MATCH ?${pf.clause} ORDER BY rank LIMIT ?`,
+             WHERE pages_fts MATCH ?${mf.clause} ORDER BY rank LIMIT ?`,
           )
-          .all(this.ftsQuery(query), ...pf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>;
+          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>;
       } catch {
         return [];
       }
     })();
-    let rows: Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }> = fts;
+    let rows: Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }> = fts;
     if (rows.length === 0) {
       // trigram needs >=3 chars; fall back to LIKE for shorter queries
-      const pfq = projectFilterSql(projects, "project");
+      const pfq = pageFilterSql(filter, projects, "project", "updated_at", "type");
       rows = (
         this.db
           .prepare(
-            `SELECT path, title, project, type, sources, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
+            `SELECT path, title, project, type, sources, metadata, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
              FROM pages WHERE title LIKE ? OR body LIKE ?${pfq.clause} LIMIT ${Math.max(1, limit | 0)}`,
           )
-          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>
+          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>
       );
     }
+    if (hasPageOnlyFilter) return rows.slice(0, limit);
     // observations join the search face (spec: manager-captured observations
     // are searchable) — LIKE scan at v1 scale, FTS promotion later. The
     // synthetic path carries the project prefix so a multi-project root (v2)
@@ -224,11 +308,11 @@ export class RootDb {
     const obs = (
       this.db
         .prepare(
-          `SELECT project || '/' || session_id || '/' || event AS path, coalesce(tool, event) AS title, project, 'observation' AS type, '[]' AS sources,
+          `SELECT project || '/' || session_id || '/' || event AS path, coalesce(tool, event) AS title, project, 'observation' AS type, '[]' AS sources, NULL AS metadata,
              substr(summary, max(1, instr(lower(summary), lower(?)) - 40), 120) AS snippet
            FROM observations WHERE (summary LIKE ? OR tool LIKE ?)${pfo.clause} LIMIT ${Math.max(1, limit | 0)}`,
         )
-        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; snippet: string }>
+        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>
     );
     return [...rows, ...obs].slice(0, limit);
   }
@@ -237,11 +321,32 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null }> {
-    const pf = projectFilterSql(projects, "f.project");
+  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null }> {
+    const mf = pageFilterSql(filter, projects, "f.project", "f.updated_at", "p.type");
     return this.db
-      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref FROM pages_fts f JOIN pages p ON p.path = f.path${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY f.updated_at DESC LIMIT ?`)
-      .all(...pf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null }>;
+      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause} ORDER BY f.updated_at DESC LIMIT ?`)
+      .all(...mf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null }>;
+  }
+
+  // Indexed path set for a filter — the digest face's pushdown helper. Its L2
+  // retrieval reads the wiki (files), so filtering happens on candidate ids;
+  // this query answers "which pages match" in ONE indexed SQL pass so the
+  // candidate filter never becomes a full wiki walk.
+  filteredPagePaths(projects: string[] | null, filter: PageFilter): Set<string> {
+    const mf = pageFilterSql(filter, projects, "project", "updated_at", "type");
+    const rows = this.db
+      .prepare(`SELECT path FROM pages WHERE 1=1${mf.clause}`)
+      .all(...mf.args) as Array<{ path: string }>;
+    return new Set(rows.map((r) => r.path));
+  }
+
+  // Per-partition counts for the overview face (add-agent-memory-foundation):
+  // page count + last write per project, capped by SQL, never a full scan.
+  projectStats(projects?: string[]): Array<{ project: string; pages: number; last_write: string | null }> {
+    const pf = projectFilterSql(projects && projects.length ? projects : null, "project");
+    return this.db
+      .prepare(`SELECT project, COUNT(*) AS pages, MAX(updated_at) AS last_write FROM pages WHERE 1=1${pf.clause} GROUP BY project ORDER BY project LIMIT 50`)
+      .all(...pf.args) as unknown as Array<{ project: string; pages: number; last_write: string | null }>;
   }
 
   // -- observations ----------------------------------------------------------
@@ -258,11 +363,14 @@ export class RootDb {
       .all(sessionId) as unknown as ObservationRow[];
   }
 
-  recentObservations(limit = 50, projects: string[] | null = null): Array<ObservationRow & { project: string }> {
-    const pf = projectFilterSql(projects, "project");
+  recentObservations(limit = 50, projects: string[] | null = null, since?: string, until?: string): Array<ObservationRow & { project: string }> {
+    let clause = projectFilterSql(projects, "project").clause;
+    const args: SqlArg[] = projectFilterSql(projects, "project").args;
+    if (since) { clause += " AND created_at >= ?"; args.push(since); }
+    if (until) { clause += " AND created_at <= ?"; args.push(until); }
     return this.db
-      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project FROM observations${pf.clause ? " WHERE 1=1" + pf.clause : ""} ORDER BY id DESC LIMIT ?`)
-      .all(...pf.args, limit) as unknown as Array<ObservationRow & { project: string }>;
+      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project FROM observations WHERE 1=1${clause} ORDER BY id DESC LIMIT ?`)
+      .all(...args, limit) as unknown as Array<ObservationRow & { project: string }>;
   }
 
   // -- handoffs --------------------------------------------------------------
@@ -598,6 +706,21 @@ export class RootDb {
       .all(limit) as unknown as WriteRow[];
   }
 
+  // -- oversight audit (add-agent-memory-foundation) ---------------------------
+  // One row per owner supervision read: who, when, which root/partitions, how
+  // many hits. Dedicated table (the writes table is page-shaped and has no
+  // hit count); never load-bearing — an audit failure must not fail the read.
+  addOversightRead(principal: string, rootKey: string, projects: string, hits: number): void {
+    this.db.prepare("INSERT INTO oversight_reads (ts, principal, root_key, projects, hits) VALUES (?,?,?,?,?)")
+      .run(new Date().toISOString(), principal, rootKey, projects, Math.max(0, hits | 0));
+  }
+
+  recentOversightReads(limit = 50): OversightReadRow[] {
+    return this.db
+      .prepare("SELECT ts, principal, root_key, projects, hits FROM oversight_reads ORDER BY rowid DESC LIMIT ?")
+      .all(limit) as unknown as OversightReadRow[];
+  }
+
   // -- reindex ---------------------------------------------------------------
 
   // Spool-replay idempotency (add-memory-federation-v1): returns true when
@@ -633,6 +756,11 @@ export class RootDb {
           const meta = {
             sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
             supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
+            // Structured metadata rides the frontmatter truth; malformed rows
+            // degrade to no metadata rather than blocking the rebuild.
+            metadata: page.frontmatter.metadata && typeof page.frontmatter.metadata === "object" && !Array.isArray(page.frontmatter.metadata)
+              ? (page.frontmatter.metadata as Record<string, unknown>)
+              : null,
           };
           this.indexPage(project, rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? entry), page.body, meta);
           count++;
