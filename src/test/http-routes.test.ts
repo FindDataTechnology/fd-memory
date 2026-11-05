@@ -70,9 +70,16 @@ test("/digest: scope taxonomy — platform needs rootKey, person must not send i
     assert.equal(b.status, 403);
     assert.equal(((await b.json()) as { error: string }).error, "forbidden_root");
 
+    // Deployment digest read (add-agent-memory-foundation follow-on): grant-
+    // checked against its own partition; a rootKey param is refused (the
+    // token's namespace IS the root).
     const c = await fetch(`${base}/digest?rootKey=d-probe&project=default&q=x`, { headers: json(agent) });
-    assert.equal(c.status, 403);
-    assert.equal(((await c.json()) as { error: string }).error, "person_token_required");
+    assert.equal(c.status, 400);
+    assert.equal(((await c.json()) as { error: string }).error, "rootKey_is_platform_seam_only");
+    const ownRead = await fetch(`${base}/digest?project=agentA&q=x`, { headers: json(agent) });
+    assert.equal(ownRead.status, 200, "deployment token reads its own partition digest");
+    const foreign = await fetch(`${base}/digest?project=other-member&q=x`, { headers: json(agent) });
+    assert.equal(foreign.status, 403, "grant check refuses partitions outside own+shared");
   } finally { await close(); }
 });
 

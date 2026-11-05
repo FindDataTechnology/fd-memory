@@ -388,6 +388,34 @@ export class Service {
         } else {
           dRoot = this.rootFor(scope);
         }
+      } else if (scope.kind === "deployment" || scope.kind === "pod") {
+        // Deployment/pod digest read (add-agent-memory-foundation follow-on,
+        // add-member-knowledge-profile ladder): a member reads the digest of
+        // ITS OWN partition or the pack's shared partition — grant-checked
+        // like every other data face, no rootKey param (the token's namespace
+        // IS the root). The project name resolves exactly like /pages: own =
+        // the member's agentId, shared = the pack partition.
+        if (rootKeyParam) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+        }
+        const packNs = "d/" + namespaceParts(scope.namespace).rootKey.slice(2);
+        const isPod = scope.kind === "pod";
+        const project = String(url.searchParams.get("project") ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
+        const nsOfProject = (p: string): string => (p === "shared" ? packNs : `${packNs}/${p}`);
+        if (!project) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "project_required" }));
+        }
+        if (isPod && project !== "shared") {
+          res.writeHead(403, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "pod_reads_shared_only" }));
+        }
+        if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
+          res.writeHead(403, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "forbidden_project", project }));
+        }
+        dRoot = this.rootFor(scope);
       } else {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "person_token_required" }));

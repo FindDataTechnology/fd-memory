@@ -65,9 +65,10 @@ test("/digest: permission matrix, degradation, clamps, assembly", async () => {
     const r2 = await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=集群", { headers: { authorization: `Bearer ${platform}` } });
     assert.equal(r2.status, 200);
     assert.equal((await fetch(base + "/digest?project=cluster-42&q=x", { headers: { authorization: `Bearer ${platform}` } })).status, 400);
-    // agent refused even with rootKey; person rootKey resolves the oversight
-    // lane (add-agent-memory-foundation): u-alice owns no d/ root → 403
-    assert.equal((await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: { authorization: `Bearer ${dep}` } })).status, 403);
+    // deployment token refuses a rootKey param (its namespace IS the root —
+    // add-agent-memory-foundation follow-on); person rootKey resolves the
+    // oversight lane: u-alice owns no d/ root → 403
+    assert.equal((await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: { authorization: `Bearer ${dep}` } })).status, 400);
     const unbound = await fetch(base + "/digest?rootKey=u-alice&project=cluster-42&q=x", { headers: H });
     assert.equal(unbound.status, 403);
     assert.equal(((await unbound.json()) as { error: string }).error, "forbidden_root");
