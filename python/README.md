@@ -127,7 +127,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 ## 边界（如实标注）
 
-- **未发布到 PyPI**：包在本仓 `python/` 内可 `pip install -e` 安装使用；上 PyPI 需要发布凭据，属另行批准的步骤。
+- **已发布到 PyPI**（2026-11-08，0.1.0）：`pip install yongyi-agent` 直接装；本仓 `python/` 仍可 `pip install -e` 用于开发。版本发布走 `python -m build` + `twine upload`，发布凭据不进仓、用完即吊销。
 - **实机验证到了哪一层**：三个框架都在隔离环境里对着**真框架**跑过——`langchain-core 1.7.6`（真实 `@tool` 调用、真实 `RunnableLambda` 链）、`llama-index-core 0.14.25`（真实 instrumentation 事件与分派器）、`crewai 1.15.37`（真实事件总线与事件对象）；投递面一律用桩 transport 捕获。也就是说「事件面形状 + 注册方式 + 注销」已实证，**没有**跑真实 LLM 驱动的完整 agent 回合。这条路上抓到三个缺陷，回归钉全部入仓：LangChain 缺事件入口会往宿主日志打 callback 错误；LlamaIndex 的 `CBEventType.TOOL` 在发布版根本不存在（捕获率为零）；CrewAI 的 `bus.off` 是两个位置参数、当装饰器工厂用会让「断开」静默失效。
 - 框架回调签名随版本演进；本包的容忍策略是「缺字段降级 + 异常全吞」，不会因为签名变化弄破宿主，但可能少上报一条观测。
 
