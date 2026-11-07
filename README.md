@@ -129,6 +129,30 @@ yongyi connect mcp --url http://localhost:49375
 
 输出可直接粘贴进任意 MCP 客户端的 JSON 配置片段（服务 URL + 令牌引用方式），不写入任何特定工具的配置文件，也不内嵌明文平台令牌。
 
+### Dify
+
+```bash
+yongyi connect dify --url http://localhost:49375 --as you@example.com
+```
+
+Dify 原生支持 HTTP transport 的 MCP 服务器，所以接入是配置而非适配：命令输出四段配方——① 添加 MCP 服务器的步骤（identifier 钉死 `yongyi`，改名会断掉已有引用）② 认证 header 指引（`Authorization: Bearer …`，令牌从 0600 凭据文件里取，配方正文不出现明文）③ 系统提示词纪律区块（整段粘贴到 Agent 应用）④ 验证清单（工具列表出现 `memory_write_page` / `memory_query` / `memory_recent` / `memory_handoff_begin` / `memory_handoff_list` 即通）。
+
+诚实边界：Dify 没有回合 hook 面，**平台担保的自动捕获在那里不可达**——纪律提示词是 Dify 侧唯一的记忆写路径，记忆靠 agent 自觉写，不是平台担保。
+
+```bash
+yongyi disconnect dify
+```
+
+本命令给出 Dify UI 里的移除步骤并清理本侧凭据；记忆数据一页不动。
+
+### Coze
+
+```bash
+yongyi connect coze --url http://localhost:49375 --as you@example.com
+```
+
+现状结论：**coze-studio 开源版没有 MCP client 能力**，平台侧无法把外部 MCP 服务器挂成工具，因此没有可执行的接入路径（跟踪 issue 见 [coze-dev/coze-studio#7](https://github.com/coze-dev/coze-studio/issues/7)、[#2079](https://github.com/coze-dev/coze-studio/issues/2079)、[#628](https://github.com/coze-dev/coze-studio/issues/628)）。这条命令输出的是侦察结论与备料：端点、身份根、person 令牌都先备好并落到 0600 凭据文件，等平台支持时直接用同一套 URL + 请求头，无需重新铸身份。它**不输出接入步骤，也不宣称已支持**。
+
 ### Portal（人面门户）
 
 服务进程自带 `/portal`：浏览器打开、粘贴 person 令牌即登录，无需任何额外安装。

@@ -6,9 +6,15 @@ import { rootKeyForRef } from "../auth.js";
 import {
   applyClaudeCode,
   applyZcode,
+  cozeDisconnectNotes,
+  cozeRecon,
+  difyDisconnectNotes,
+  difyRecipe,
   disconnectClaudeCode,
   disconnectZcode,
   genericMcpSnippet,
+  renderCozeRecon,
+  renderDifyRecipe,
   type ConnectReport,
   type ConnectTargets,
   type FileWrite,
@@ -30,13 +36,20 @@ export const CONNECT_USAGE = `usage:
   yongyi connect claude-code --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect zcode --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
+  yongyi connect dify --url <service-url> --as <user> [--project P]
+  yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
 const HOOK_HARNESSES = ["claude-code", "zcode"] as const;
 
+// Recipe-shaped harnesses (add-yongyi-connect-dify-coze): the platform is
+// configured through a UI, so connect prints instructions and writes no
+// tool-config files — only the identity binding and its 0600 credential files.
+const RECIPE_HARNESSES = ["dify", "coze"] as const;
+
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "mcp"];
+  return ["claude-code", "zcode", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -101,7 +114,7 @@ export async function runConnect(argv: string[]): Promise<void> {
   const { positionals, flags } = parseArgs(argv, ["url", "as", "project", "dir"]);
   const harness = positionals[0] as Harness | undefined;
   if (!harness || !connectHarnesses().includes(harness)) {
-    console.error(`unknown harness: ${harness ?? "(none)"} — expected claude-code | zcode | mcp\n${CONNECT_USAGE}`);
+    console.error(`unknown harness: ${harness ?? "(none)"} — expected ${connectHarnesses().join(" | ")}\n${CONNECT_USAGE}`);
     process.exit(2);
   }
   const identity = flags.as;
@@ -136,6 +149,33 @@ export async function runConnect(argv: string[]): Promise<void> {
   const creds = loadCredentials(paths.creds);
   const plan = planIdentity({ identity: identity!, harness, creds, dataDir, pepper });
   report.token_reused = plan.reused;
+
+  if ((RECIPE_HARNESSES as readonly string[]).includes(harness)) {
+    // Recipe-shaped platform: no config file to merge, so nothing to write on
+    // the harness side. The identity binding still lands in the 0600 credential
+    // files — the recipe's header line references it, never inlines it.
+    const binding: Binding = {
+      url,
+      namespace: plan.namespace,
+      token: plan.token,
+      project: flags.project ?? "default",
+      bound_at: new Date().toISOString(),
+    };
+    saveIdentity(harness, paths.creds, paths.env, creds, binding, url);
+    console.log(`connected ${harness} → ${report.namespace} (root ${report.rootKey})`);
+    console.log("");
+    const rendered =
+      harness === "dify"
+        ? renderDifyRecipe(difyRecipe({ baseUrl: url, identity: identity!, envVar }))
+        : renderCozeRecon(cozeRecon({ baseUrl: url, identity: identity!, envVar }));
+    console.log(rendered);
+    console.log("");
+    console.log(`  token  ${report.token_reused ? "reused existing person token" : "minted new person token"}`);
+    console.log(`  credentials  ${paths.creds} (0600)`);
+    console.log(`  env          ${paths.env} (0600) — source it to export ${envVar}`);
+    console.log(`  mcp url      ${report.mcp_url}`);
+    return;
+  }
 
   if (harness === "claude-code") {
     report.files = applyClaudeCode(t, url, envVar);
@@ -178,21 +218,53 @@ export function runDisconnect(argv: string[]): void {
   const { positionals } = parseArgs(argv, ["dir"]);
   const harness = positionals[0];
   if (!harness || !connectHarnesses().includes(harness)) {
-    console.error(`unknown harness: ${harness ?? "(none)"} — expected claude-code | zcode | mcp\n${CONNECT_USAGE}`);
+    console.error(`unknown harness: ${harness ?? "(none)"} — expected ${connectHarnesses().join(" | ")}\n${CONNECT_USAGE}`);
     process.exit(2);
   }
   const t = targets({});
+  const yongyiDir = process.env.YONGYI_HOME ?? t.homeDir + "/.yongyi";
+  const paths = credentialPaths(yongyiDir);
   let files: FileWrite[];
   if (harness === "claude-code") {
     files = disconnectClaudeCode(t);
   } else if (harness === "zcode") {
     files = disconnectZcode(t);
+  } else if (harness === "dify") {
+    const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
+    files = dropBinding("dify", paths.creds, paths.env);
+    console.log("disconnected dify (memory data untouched)");
+    console.log("  在 Dify 侧照下列步骤移除（本命令无法代你操作 UI）：");
+    for (const line of difyDisconnectNotes(boundUrl)) console.log(`  - ${line}`);
+    printFileWrites(files);
+    return;
+  } else if (harness === "coze") {
+    files = dropBinding("coze", paths.creds, paths.env);
+    console.log("disconnected coze (memory data untouched)");
+    for (const line of cozeDisconnectNotes()) console.log(`  - ${line}`);
+    printFileWrites(files);
+    return;
   } else {
     console.log("disconnect mcp: nothing to remove — `connect mcp` writes no tool config files.");
     return;
   }
   console.log(`disconnected ${harness} (memory data untouched)`);
   printFileWrites(files);
+}
+
+// Recipe harnesses have no platform-side artifact this CLI wrote, so disconnect
+// only clears our own preparation: the binding row and the exported token line.
+// The person root and every memory page stay untouched (统一语义).
+function dropBinding(harness: Harness, credsPath: string, envPath: string): FileWrite[] {
+  const creds = loadCredentials(credsPath);
+  if (!creds.bindings[harness]) return [{ path: credsPath, action: "unchanged" }];
+  const url = creds.bindings[harness].url;
+  delete creds.bindings[harness];
+  saveCredentials(credsPath, creds);
+  writeEnvFile(envPath, creds, url);
+  return [
+    { path: credsPath, action: "updated" },
+    { path: envPath, action: "updated" },
+  ];
 }
 
 // ── hook ─────────────────────────────────────────────────────────────────────

@@ -16,15 +16,31 @@ import { fileURLToPath } from "node:url";
 import { metricsSnapshot, __resetMetrics } from "../metrics.js";
 import { __resetEmbedGate } from "../embed-gate.js";
 import { Service } from "../http.js";
-import { BLOCK_BEGIN, BLOCK_END, disciplineText } from "../connect/discipline-text.js";
+import { buildTools } from "../mcp.js";
+import { TokenStore, namespaceParts } from "../auth.js";
+import { StoreRoot } from "../store.js";
+import {
+  BLOCK_BEGIN,
+  BLOCK_END,
+  disciplinePoints,
+  disciplineText,
+  platformDisciplineText,
+} from "../connect/discipline-text.js";
 import { removeManagedBlock, upsertManagedBlock } from "../connect/managed-block.js";
 import {
+  COZE_RECON_DATE,
+  COZE_RECON_ISSUES,
+  DIFY_VERIFY_TOOLS,
   applyClaudeCode,
   applyZcode,
+  cozeRecon,
+  difyRecipe,
   disconnectClaudeCode,
   disconnectZcode,
   genericMcpSnippet,
   mcpUrlFor,
+  renderCozeRecon,
+  renderDifyRecipe,
   type ConnectTargets,
 } from "../connect/adapters.js";
 import {
@@ -546,3 +562,145 @@ test("e2e: connect → hook → observe lands under the person root → digest r
 // Note: metricsSnapshot import is exercised by Service boot in the e2e above
 // (reset pair keeps module state clean across the suite).
 void metricsSnapshot;
+
+// ── dify / coze recipes (add-yongyi-connect-dify-coze) ───────────────────────
+// UI-configured platforms: the adapter generates instructions, not files. The
+// facts under test are the ones a user would be misled by if wrong — the
+// pinned identifier, the env-reference header (never a literal token), the
+// shared discipline points, and a verification list that matches the real MCP
+// tool surface.
+
+test("dify: recipe renders all four sections; identifier pinned; header is an env reference", () => {
+  const out = renderDifyRecipe(difyRecipe({ baseUrl: "http://127.0.0.1:49375", identity: "user@example.com", envVar: "YONGYI_TOKEN_DIFY" }));
+  for (const section of ["①", "②", "③", "④"]) assert.ok(out.includes(section), `section ${section} present`);
+  assert.ok(out.includes("identifier yongyi"), "identifier pinned to yongyi");
+  assert.ok(out.includes("http://127.0.0.1:49375/mcp"), "MCP endpoint (streamable-http path)");
+  assert.ok(out.includes("u/user@example.com"), "person root named");
+  assert.ok(out.includes("Authorization: Bearer ${YONGYI_TOKEN_DIFY}"), "header value is an env reference");
+  assert.ok(out.includes("YONGYI_TOKEN_DIFY"), "token command references the exported variable");
+  assert.ok(out.includes("仅支持 HTTP transport"), "transport constraint stated (the one misconfiguration Dify punishes)");
+  assert.ok(/不是平台担保|非平台担保/.test(out), "honesty note: discipline is the only write path here");
+  // Verification list is the tool surface, not prose.
+  for (const tool of DIFY_VERIFY_TOOLS) assert.ok(out.includes(tool), `verification lists ${tool}`);
+});
+
+test("dify: recipe is idempotent (same args → identical output, no timestamp drift)", () => {
+  const args = { baseUrl: "http://127.0.0.1:49375", identity: "user@example.com", envVar: "YONGYI_TOKEN_DIFY" };
+  assert.equal(renderDifyRecipe(difyRecipe(args)), renderDifyRecipe(difyRecipe(args)));
+  assert.deepEqual(difyRecipe(args), difyRecipe(args));
+});
+
+test("dify: discipline is the shared point set with a platform-correct mounting sentence", () => {
+  const recipe = difyRecipe({ baseUrl: "http://127.0.0.1:49375", identity: "user@example.com", envVar: "YONGYI_TOKEN_DIFY" });
+  assert.equal(recipe.discipline, platformDisciplineText, "single source, not a copy");
+  for (const point of disciplinePoints) assert.ok(recipe.discipline.includes(point), "every shared point verbatim");
+  // Dify lists imported tools under its own naming — claiming the harness
+  // prefix would send the agent looking for tools that do not exist.
+  assert.equal(recipe.discipline.includes("mcp__fd-memory__*"), false, "no harness-specific tool prefix");
+  assert.ok(recipe.discipline.includes("memory_*"), "names tools the way Dify shows them");
+  // The harness face is unchanged by this split.
+  assert.ok(disciplineText.startsWith("永忆（fd-memory）已挂载到本 harness"), "hook harness block byte-unchanged");
+  assert.equal(disciplineText, "永忆（fd-memory）已挂载到本 harness；工具名一律为 mcp__fd-memory__*。/ fd-memory is mounted in this harness; its tools are always named mcp__fd-memory__*.\n" + disciplinePoints.join("\n"));
+});
+
+test("dify: verification list matches the live MCP tool surface (no drift either way)", () => {
+  const data = tmp();
+  const store = new TokenStore(join(data, "tokens.db"), "p");
+  const minted = store.mint("person", "u/user@example.com");
+  const scope = store.verify(minted.token)!;
+  const { rootKey } = namespaceParts("u/user@example.com");
+  const tools = buildTools(scope, new StoreRoot(data, rootKey), { allows: () => true });
+  const live = new Set(tools.map((t) => t.name));
+  for (const name of DIFY_VERIFY_TOOLS) assert.ok(live.has(name), `verification names a real tool: ${name}`);
+  // The five listed are the load-bearing ones; the list must not silently
+  // become "everything" or a stale subset of a smaller surface.
+  assert.equal(DIFY_VERIFY_TOOLS.length, 5);
+});
+
+test("coze: honest downgrade — status and issues, never integration steps", () => {
+  const out = renderCozeRecon(cozeRecon({ baseUrl: "http://127.0.0.1:49375", identity: "user@example.com", envVar: "YONGYI_TOKEN_COZE" }));
+  assert.ok(out.includes("暂不支持"), "says unsupported");
+  assert.ok(out.includes("coze-studio 开源版没有 MCP client 能力"), "names the concrete blocker");
+  for (const issue of COZE_RECON_ISSUES) assert.ok(out.includes(issue), `tracks ${issue}`);
+  assert.ok(out.includes(COZE_RECON_DATE), "recon date stamped (staleness is visible)");
+  assert.ok(out.includes("http://127.0.0.1:49375/mcp"), "endpoint prepared");
+  assert.ok(out.includes("u/user@example.com"), "identity prepared");
+  // Negative assertions: no step-shaped text whatsoever.
+  assert.equal(/添加 MCP 服务器|Integrations\s*>\s*Tools|粘贴到/.test(out), false, "no steps");
+  assert.equal(/已支持|接入成功/.test(out), false, "no support claim");
+  const twice = renderCozeRecon(cozeRecon({ baseUrl: "http://127.0.0.1:49375", identity: "user@example.com", envVar: "YONGYI_TOKEN_COZE" }));
+  assert.equal(out, twice, "idempotent");
+});
+
+test("CLI: connect dify prints the four sections with no plaintext token; disconnect dify clears only our preparation", async () => {
+  const home = tmp();
+  const proj = tmp();
+  const data = tmp();
+  const env = cliEnv(home, data);
+
+  const r = await runCli(["connect", "dify", "--url", "http://127.0.0.1:49375", "--as", "user@example.com"], { env, cwd: proj });
+  assert.equal(r.code, 0, r.err);
+  for (const section of ["①", "②", "③", "④"]) assert.ok(r.out.includes(section));
+  assert.ok(r.out.includes("identifier yongyi"));
+  assert.equal(r.out.includes("mcp__fd-memory__*"), false, "does not print the harness-only tool prefix");
+
+  const credsPath = join(home, ".yongyi", "credentials.json");
+  const creds = JSON.parse(readFileSync(credsPath, "utf8")) as { bindings: Record<string, { namespace: string; token: string }> };
+  assert.equal(creds.bindings["dify"].namespace, "u/user@example.com");
+  // leak-check 的凭据形制正则会把「token = <带点变量引用>」判成内联凭据——这里只是取局部量比对。
+  const mintedValue = creds.bindings["dify"].token;
+  assert.ok(mintedValue.length > 8);
+  assert.equal(r.out.includes(mintedValue), false, "person token never printed — the recipe gives the env command instead");
+  assert.equal(statSync(credsPath).mode & 0o777, 0o600);
+  assert.equal(statSync(join(home, ".yongyi", "env")).mode & 0o777, 0o600);
+  assert.ok(readFileSync(join(home, ".yongyi", "env"), "utf8").includes("YONGYI_TOKEN_DIFY"), "env file exports the dify var");
+  // No harness config files: this platform is configured in its own UI.
+  assert.equal(existsSync(join(proj, "CLAUDE.md")), false);
+  assert.equal(existsSync(join(proj, "AGENTS.md")), false);
+
+  // Re-run: same person root reused, nothing re-written elsewhere.
+  const r2 = await runCli(["connect", "dify", "--url", "http://127.0.0.1:49375", "--as", "user@example.com"], { env, cwd: proj });
+  assert.equal(r2.code, 0, r2.err);
+  assert.ok(r2.out.includes("reused existing person token"));
+
+  const d = await runCli(["disconnect", "dify"], { env, cwd: proj });
+  assert.equal(d.code, 0, d.err);
+  assert.ok(d.out.includes("在 Dify 侧"), "points at the UI removal (the CLI cannot click)");
+  assert.ok(d.out.includes("http://127.0.0.1:49375"), "names the endpoint to remove");
+  const after = JSON.parse(readFileSync(credsPath, "utf8")) as { bindings: Record<string, unknown> };
+  assert.equal(after.bindings["dify"], undefined, "our binding cleared");
+  assert.equal(readFileSync(join(home, ".yongyi", "env"), "utf8").includes("YONGYI_TOKEN_DIFY"), false, "exported var dropped");
+});
+
+test("CLI: connect coze states the blocker and prepares credentials; disconnect coze clears them", async () => {
+  const home = tmp();
+  const proj = tmp();
+  const data = tmp();
+  const env = cliEnv(home, data);
+
+  const r = await runCli(["connect", "coze", "--url", "http://127.0.0.1:49375", "--as", "user@example.com"], { env, cwd: proj });
+  assert.equal(r.code, 0, r.err);
+  assert.ok(r.out.includes("暂不支持"));
+  assert.ok(r.out.includes("issues/7"));
+  assert.equal(/添加 MCP 服务器|粘贴到/.test(r.out), false, "no fabricated steps");
+  const credsPath = join(home, ".yongyi", "credentials.json");
+  assert.equal(statSync(credsPath).mode & 0o777, 0o600);
+  assert.ok(readFileSync(join(home, ".yongyi", "env"), "utf8").includes("YONGYI_TOKEN_COZE"), "token prepared for the day it works");
+
+  const d = await runCli(["disconnect", "coze"], { env, cwd: proj });
+  assert.equal(d.code, 0, d.err);
+  assert.ok(d.out.includes("未写入任何平台配置"));
+  const after = JSON.parse(readFileSync(credsPath, "utf8")) as { bindings: Record<string, unknown> };
+  assert.equal(after.bindings["coze"], undefined);
+});
+
+test("CLI: disconnect dify/coze on a never-connected machine is a clean no-op", async () => {
+  const home = tmp();
+  const proj = tmp();
+  const env = cliEnv(home, tmp());
+  for (const h of ["dify", "coze"]) {
+    const d = await runCli(["disconnect", h], { env, cwd: proj });
+    assert.equal(d.code, 0, d.err);
+  }
+  assert.equal(existsSync(join(home, ".yongyi", "credentials.json")), false, "no credential file invented by disconnect");
+});

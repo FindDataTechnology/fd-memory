@@ -15,7 +15,7 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { upsertManagedBlock, removeManagedBlock } from "./managed-block.js";
-import { MCP_SERVER_NAME, managedDisciplineBlock, disciplineText } from "./discipline-text.js";
+import { MCP_SERVER_NAME, managedDisciplineBlock, disciplineText, platformDisciplineText } from "./discipline-text.js";
 import type { Harness } from "./credentials.js";
 
 export interface ConnectTargets {
@@ -258,4 +258,175 @@ export function disconnectZcode(t: ConnectTargets): FileWrite[] {
 // Never touches a tool-specific config file; token stays an env reference.
 export function genericMcpSnippet(baseUrl: string, envVar: string): string {
   return JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: mcpServerEntry(baseUrl, envVar) } }, null, 2);
+}
+
+// ── dify (add-yongyi-connect-dify-coze, D1–D3) ───────────────────────────────
+// Dify is a UI-configured platform: there is no config file to merge into, so
+// this adapter is a RECIPE generator (structured object + terminal renderer).
+// Two facts from the reconnaissance drive the shape:
+//   • Dify speaks HTTP-transport MCP only — our streamable-http endpoint is
+//     natively in shape, so integration is configuration, not code;
+//   • Dify applications reference a server by its `identifier`, and renaming
+//     breaks every existing reference — so the identifier is pinned.
+// Dify has no turn/hook surface, so the platform-guaranteed L0 capture lane is
+// unreachable there: the discipline block is Dify's ONLY memory write path,
+// and the recipe says so instead of pretending otherwise.
+
+export const DIFY_SERVER_IDENTIFIER = "yongyi";
+
+// The tool names a correctly configured Dify tool list must show. Kept as data
+// so a test can cross-check it against the live MCP surface (mcp.ts buildTools)
+// — drift in either direction fails the suite.
+export const DIFY_VERIFY_TOOLS = [
+  "memory_write_page",
+  "memory_query",
+  "memory_recent",
+  "memory_handoff_begin",
+  "memory_handoff_list",
+] as const;
+
+export interface DifyRecipe {
+  identifier: string;
+  serverUrl: string;
+  identity: string;
+  headerName: string;
+  headerValueRef: string; // env reference, never a literal token
+  tokenCommand: string; // how to reveal the header value locally
+  steps: string[];
+  discipline: string;
+  verification: readonly string[];
+  honesty: string;
+}
+
+// The header the user pastes into Dify, as an environment reference. Dify's UI
+// needs the literal value, so the recipe tells the operator how to print it
+// from the 0600 env file instead of embedding it in the recipe text.
+export function difyHeaderValueRef(envVar: string): string {
+  return "Bearer ${" + envVar + "}";
+}
+
+export function difyTokenCommand(envVar: string): string {
+  return `. "\${YONGYI_HOME:-\$HOME/.yongyi}/env" && printf 'Bearer %s\\n' "\${${envVar}}"`;
+}
+
+export function difyRecipe(args: { baseUrl: string; identity: string; envVar: string }): DifyRecipe {
+  const serverUrl = mcpUrlFor(args.baseUrl);
+  return {
+    identifier: DIFY_SERVER_IDENTIFIER,
+    serverUrl,
+    identity: "u/" + args.identity,
+    headerName: "Authorization",
+    headerValueRef: difyHeaderValueRef(args.envVar),
+    tokenCommand: difyTokenCommand(args.envVar),
+    steps: [
+      `Dify 控制台 → Integrations（工具）→ Tools → 添加 MCP 服务器`,
+      `transport 选 HTTP（Dify 仅支持 HTTP transport 的 MCP 服务器），URL 填 ${serverUrl}`,
+      `名称可自定为 fd-memory；identifier 必须为 ${DIFY_SERVER_IDENTIFIER}——Dify 按 identifier 引用服务器，改名会使已有应用的引用失效`,
+    ],
+    discipline: platformDisciplineText,
+    verification: DIFY_VERIFY_TOOLS,
+    honesty:
+      "Dify 没有回合 hook 面：平台担保的自动捕获在此不可达，回合与工具事件不会自动落 L0。上面这段纪律提示词是 Dify 侧唯一的记忆写路径——agent 自觉写，不是平台担保。",
+  };
+}
+
+// Dify's UI is the target; the CLI's job is to say exactly what to click and
+// paste, in an order that works on the first try.
+export function renderDifyRecipe(r: DifyRecipe): string {
+  const lines: string[] = [];
+  lines.push("Dify 接入配方（永忆 / fd-memory）");
+  lines.push(`  服务      ${r.serverUrl}`);
+  lines.push(`  身份根    ${r.identity}`);
+  lines.push(`  identifier ${r.identifier}`);
+  lines.push("");
+  lines.push("① 添加 MCP 服务器");
+  r.steps.forEach((s, i) => lines.push(`   ${i + 1}. ${s}`));
+  lines.push("");
+  lines.push("② 自定义 header（认证，每请求携带）");
+  lines.push(`   ${r.headerName}: ${r.headerValueRef}`);
+  lines.push("   令牌不写进配方正文（避免明文外泄）。在本机取出整行值再粘贴到 Dify 的 header 值：");
+  lines.push(`     ${r.tokenCommand}`);
+  lines.push("");
+  lines.push("③ 系统提示词纪律区块（整段粘贴到 Agent 应用的系统提示词/指令）");
+  lines.push(r.discipline);
+  lines.push("");
+  lines.push("④ 验证（Dify 工具列表应出现下列工具，出现即通）");
+  for (const tool of r.verification) lines.push(`   - ${tool}`);
+  lines.push("   不出现：先查 URL 可达性（Dify 所在网络能否访问服务端点），再查 header 是否带 Bearer 前缀。");
+  lines.push("");
+  lines.push("边界：" + r.honesty);
+  return lines.join("\n");
+}
+
+export function difyDisconnectNotes(serverUrl: string): string[] {
+  return [
+    `Dify 控制台 → Integrations（工具）→ Tools → 找到 identifier 为 ${DIFY_SERVER_IDENTIFIER} 的服务器（${serverUrl}）并移除`,
+    `引用过它的 Agent/Chatflow/Workflow 要重新选工具；系统提示词里的纪律段落请一并删除`,
+  ];
+}
+
+// ── coze (honest recon, D2) ──────────────────────────────────────────────────
+// Coze Studio (open source) has no MCP client capability — the tracked issues
+// are still open. So this adapter ships reconnaissance, not steps: credentials
+// and the endpoint are prepared for the day the commercial build supports it,
+// and the output never claims support it does not have.
+export const COZE_RECON_DATE = "2026-11-07";
+export const COZE_RECON_ISSUES = [
+  "https://github.com/coze-dev/coze-studio/issues/7",
+  "https://github.com/coze-dev/coze-studio/issues/2079",
+  "https://github.com/coze-dev/coze-studio/issues/628",
+] as const;
+
+export interface CozeRecon {
+  date: string;
+  supported: false;
+  status: string;
+  issues: readonly string[];
+  serverUrl: string;
+  identity: string;
+  headerValueRef: string;
+  tokenCommand: string;
+  prepared: string;
+}
+
+export function cozeRecon(args: { baseUrl: string; identity: string; envVar: string }): CozeRecon {
+  return {
+    date: COZE_RECON_DATE,
+    supported: false,
+    status:
+      "coze-studio 开源版没有 MCP client 能力：平台侧无法把外部 MCP 服务器挂成工具，因此现在没有可执行的接入路径。商业版（coze.cn）的 MCP 文档页无法无头勘定，待有账号时实机验证。",
+    issues: COZE_RECON_ISSUES,
+    serverUrl: mcpUrlFor(args.baseUrl),
+    identity: "u/" + args.identity,
+    headerValueRef: difyHeaderValueRef(args.envVar),
+    tokenCommand: difyTokenCommand(args.envVar),
+    prepared:
+      "端点、身份绑定与 person 令牌已备好（写入 0600 凭据文件）。等平台侧支持 HTTP transport 的 MCP 客户端，直接用同一套 URL + 请求头即可，无需重新铸造身份。",
+  };
+}
+
+export function renderCozeRecon(r: CozeRecon): string {
+  const lines: string[] = [];
+  lines.push("Coze 接入现状（诚实结论：暂不支持）");
+  lines.push(`  勘定日期  ${r.date}`);
+  lines.push(`  结论      ${r.status}`);
+  lines.push("  跟踪      ");
+  for (const issue of r.issues) lines.push(`     - ${issue}`);
+  lines.push("");
+  lines.push("已备好的料（等平台支持后即用）");
+  lines.push(`  服务      ${r.serverUrl}`);
+  lines.push(`  身份根    ${r.identity}`);
+  lines.push(`  请求头    Authorization: ${r.headerValueRef}`);
+  lines.push(`  取值      ${r.tokenCommand}`);
+  lines.push("");
+  lines.push(r.prepared);
+  lines.push("本次没有写入任何平台配置，也没有生成接入步骤——支持就是支持，不支持不假装。");
+  return lines.join("\n");
+}
+
+export function cozeDisconnectNotes(): string[] {
+  return [
+    "coze 未写入任何平台配置，无需在平台侧移除",
+    "本侧备料（凭据文件中的 coze 绑定与导出的令牌变量）已清理；身份根与记忆数据不动",
+  ];
 }

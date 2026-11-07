@@ -11,7 +11,10 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync } from "n
 import { dirname } from "node:path";
 import { TokenStore } from "../auth.js";
 
-export type Harness = "claude-code" | "zcode" | "mcp";
+// claude-code/zcode get file-level adapters; mcp is the paste-ready generic
+// snippet; dify/coze are recipe-shaped (UI-configured platforms — no config
+// file to write, see adapters.ts).
+export type Harness = "claude-code" | "zcode" | "mcp" | "dify" | "coze";
 
 export interface Binding {
   url: string;

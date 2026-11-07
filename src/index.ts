@@ -24,7 +24,7 @@ usage:
   yongyi token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]
   yongyi token list
   yongyi token revoke --id <id>
-  yongyi connect claude-code|zcode|mcp --url U --as user [--project P] [--dir D]
+  yongyi connect claude-code|zcode|mcp|dify|coze --url U --as user [--project P] [--dir D]
   yongyi disconnect <harness>
   yongyi hook <harness> <event>      stdin: hook event JSON (capture, fail-drop)
 env:

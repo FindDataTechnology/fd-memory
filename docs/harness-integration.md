@@ -1,6 +1,6 @@
 # 永忆接入指南（Harness Integration）
 
-面向把 AI harness（Claude Code、ZCode、任意 MCP 客户端、自研 runner/网关）接入永忆的集成者。读完这篇你应当清楚：接入的三件套契约是什么、`/observe` 的完整 API 语义、每个适配器写了什么与断开时还原什么、客户端 SDK 提供什么，以及「换工具不换记忆」是如何被契约保证的。
+面向把 AI harness（Claude Code、ZCode、任意 MCP 客户端、Dify 这类 UI 配置型 Agent 平台、自研 runner/网关）接入永忆的集成者。读完这篇你应当清楚：接入的三件套契约是什么、`/observe` 的完整 API 语义、每个适配器写了什么与断开时还原什么、客户端 SDK 提供什么，以及「换工具不换记忆」是如何被契约保证的。
 
 > 术语对齐：**u/** 人根 · **d/&lt;pack&gt;/&lt;member&gt;** 部署根 · **own/shared** 分区 · **L0–L3** 四层记忆 · **digest** 服务端渲染摘要块 · **蒸馏接替（supersede）** 旧结论退役、原文保留。
 >
@@ -117,6 +117,49 @@ yongyi connect mcp --url http://localhost:49375
 ```
 
 输出可直接粘贴进任意 MCP 客户端的 JSON 配置片段（服务 URL + 令牌引用方式）。不写入任何特定工具的配置文件，片段中**不内嵌明文平台令牌**。
+
+### 3.4 dify
+
+```bash
+yongyi connect dify --url http://localhost:49375 --as you@example.com
+```
+
+Dify 是 UI 配置型平台，没有可合并的配置文件，所以这个适配器是**配方生成器**：不写任何平台配置，输出四段终端指引。
+
+| 段 | 内容 | 依据 |
+| --- | --- | --- |
+| ① 添加服务器 | Integrations（工具）→ Tools → 添加 MCP 服务器；transport 选 HTTP；URL 填 `…/mcp` | Dify 只支持 HTTP transport 的 MCP 服务器，永忆的 streamable-http 端点原生匹配 |
+| ② 认证 header | `Authorization: Bearer <person 令牌>`，每请求携带；令牌用命令从 `$YONGYI_HOME/env` 取，配方正文不落明文 | 静态 header 足够（person 令牌是长期凭据）；动态 OAuth 注册留待后续 |
+| ③ 纪律区块 | 整段粘贴到 Agent 应用的系统提示词 | Dify 无回合 hook 面，纪律是此处唯一的记忆写路径 |
+| ④ 验证清单 | 工具列表出现五个工具即通：`memory_write_page` / `memory_query` / `memory_recent` / `memory_handoff_begin` / `memory_handoff_list` | 与 MCP 工具面同源核对（`src/mcp.ts`），清单漂移会让测试失败 |
+
+`identifier` 固定为 `yongyi`：Dify 应用按 identifier 引用服务器，改名会断掉所有已有引用，因此配方把它钉死而非留作可选项。
+
+**诚实边界**：Dify 侧的记忆是 agent 自觉写，不是平台担保——`/observe` 的 L0 自动捕获需要回合/工具事件面，Dify 没有，配方与本节都不假装有。幂等：同参数重跑输出一致，并复用同一 person 根。
+
+断开：
+
+```bash
+yongyi disconnect dify
+```
+
+CLI 代不了 UI 操作，所以输出的是移除步骤（找到 identifier 为 `yongyi` 的服务器并移除、重选工具、删掉提示词里的纪律段落）；本侧只清我们自己的备料——凭据文件里的 dify 绑定与导出的令牌变量。身份根与全部记忆页不动。
+
+### 3.5 coze
+
+```bash
+yongyi connect coze --url http://localhost:49375 --as you@example.com
+```
+
+**当前不支持，且不说成支持**。勘定（2026-11-07）：coze-studio 开源版没有 MCP client 能力，平台侧无法把外部 MCP 服务器挂成工具；商业版（coze.cn）的 MCP 文档页为 JS 渲染，无法无头勘定，需有账号时实机验证。跟踪：[#7](https://github.com/coze-dev/coze-studio/issues/7)、[#2079](https://github.com/coze-dev/coze-studio/issues/2079)、[#628](https://github.com/coze-dev/coze-studio/issues/628)。
+
+命令输出的是侦察结论 + 备料：端点、身份根、person 令牌（落 0600 凭据文件，`YONGYI_TOKEN_COZE`）。**不含任何接入步骤**——平台支持那天，同一套 URL + `Authorization: Bearer` 即可用，身份不必重铸。勘定日期随 CLI 版本更新，过期可见。
+
+```bash
+yongyi disconnect coze
+```
+
+coze 没有写入任何平台配置，所以断开只清本侧备料。
 
 ---
 
