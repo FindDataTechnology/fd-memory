@@ -428,3 +428,205 @@ def test_llamaindex_callback_face_accepts_function_call_kind(observer, transport
 def test_llamaindex_callback_face_still_accepts_tool_kind(observer, transport):
     li_mod.send_event_end(observer, "tool", {"tool_name": "newer", "tool_output": "out"})
     assert transport.last["payload"]["title"] == "工具调用：newer"
+
+
+# ── 真机（llama-index-core 0.14.25）: agent 路径没有工具事件 ──────────────────
+# 实测一个真 FunctionAgent 回合（工具确实执行、答案为 12），事件流只有 LLMChat* 与
+# Workflow*：AgentToolCallEvent 有定义但全包无实例化，CBEventType.FUNCTION_CALL 无
+# 发射点，LLMChatEndEvent.response.message.tool_calls 为空。工具级捕获因此放在调用点
+# （instrument_tools），回合级用 WorkflowRunOutputEvent（框架只给字符串摘要）。
+
+
+class FakeWorkflowRunOutputEvent:
+    """真 WorkflowRunOutputEvent 的 output 是 str（StopEvent/AgentOutput 的 repr）。"""
+
+    def __init__(self, output):
+        self.output = output
+
+
+FakeWorkflowRunOutputEvent.__name__ = "WorkflowRunOutputEvent"
+
+
+def test_llamaindex_workflow_run_end_maps_to_turn_outcome(observer, transport):
+    li_mod.send_instrumentation_event(
+        observer,
+        FakeWorkflowRunOutputEvent(
+            "StopEvent(result=AgentOutput(response=ChatMessage(role=<MessageRole.ASSISTANT: 'assistant'>, "
+            "additional_kwargs={}, blocks=[TextBlock(block_type='text', text='12')])))"
+        ),
+    )
+    sent = transport.last["payload"]
+    assert sent["type"] == "turn_outcome"
+    assert sent["body"] == "12", "要从 repr 里取到答案，别把整串 repr 落成记忆正文"
+    assert sent["metadata"]["phase"] == "workflow"
+
+
+def test_llamaindex_workflow_run_end_falls_back_to_raw_summary(observer, transport):
+    """repr 里没有 text='...' 时原样保留——宁可多带壳也不丢内容。"""
+    raw = "StopEvent(result=AgentOutput(response=ChatMessage(content='no blocks')))"
+    li_mod.send_instrumentation_event(observer, FakeWorkflowRunOutputEvent(raw))
+    assert transport.last["payload"]["body"] == raw
+
+
+def test_llamaindex_tool_wrapper_captures_real_output(observer, transport):
+    def multiply(a, b):
+        """Multiply two integers."""
+        return a * b
+
+    wrapped = li_mod.instrument_tools([multiply], observer)[0]
+    assert wrapped(3, 4) == 12
+    payload = transport.last["payload"]
+    assert payload["type"] == "tool_call"
+    assert payload["title"] == "工具调用：multiply"
+    assert payload["body"] == "12"
+    assert payload["metadata"]["phase"] == "finished"
+
+
+def test_llamaindex_tool_wrapper_preserves_signature_and_docstring():
+    def multiply(a: int, b: int) -> int:
+        """Multiply two integers."""
+        return a * b
+
+    wrapped = li_mod.instrument_tools([multiply], object())[0]  # observer 不会被用到（不抛错即可）
+    import inspect
+
+    assert wrapped.__name__ == "multiply"
+    assert list(inspect.signature(wrapped).parameters) == ["a", "b"]
+
+
+def test_llamaindex_tool_wrapper_records_error_and_reraises(observer, transport):
+    """工具抛错：记一条 outcome=error 的 tool_call，异常必须还给宿主。"""
+    def boom(a):
+        """Explode."""
+        raise ValueError("bad input")
+
+    wrapped = li_mod.instrument_tools([boom], observer)[0]
+    try:
+        wrapped(1)
+    except ValueError as exc:
+        assert "bad input" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("异常必须原样抛回宿主，绝不能吞")
+    payload = transport.last["payload"]
+    assert payload["metadata"]["outcome"] == "error"
+    assert "bad input" in payload["body"]
+
+
+def test_llamaindex_instrumentation_payload_single_compat_entry(observer, transport):
+    assert li_mod.instrumentation_payload(FakeToolCallEvent())["event_type"] == "tool_call"
+    assert li_mod.instrumentation_payload(object()) is None
+
+
+# ── instrument_agent：回合正文取真答案 ─────────────────────────────────────
+# 真机实测：WorkflowRunOutputEvent.output 是 summarize_event(max_length=200) 截出的
+# repr，推理模型先吐 ThinkingBlock，答案常常被截掉——只能证「回合发生了」。所以
+# 回合正文从调用点取：宿主 await 到的 AgentOutput.response 才是真答案。
+
+
+class _FakePending:
+    """真 WorkflowHandler 的 awaitable 面（+ 一个非 await 的转发属性）。"""
+
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+        self.label = "stream_events"
+
+    def __await__(self):
+        return self._wait().__await__()
+
+    async def _wait(self):
+        import asyncio
+
+        await asyncio.sleep(0)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+    def stream_events(self):
+        return "stream"
+
+
+class _FakeCandidate:
+    def __init__(self, content):
+        self.content = content
+
+
+class _FakeAgentOutput:
+    def __init__(self, content):
+        self.response = _FakeCandidate(content)
+
+
+class _FakeAgent:
+    def __init__(self, value=None, error=None):
+        self._pending = _FakePending(value, error)
+        self.role = "researcher"
+
+    def run(self, *args, **kwargs):
+        self.last_call = (args, kwargs)
+        return self._pending
+
+
+def _await(value):
+    import asyncio
+
+    return asyncio.run(_await_async(value))
+
+
+async def _await_async(value):
+    return await value
+
+
+def test_llamaindex_instrument_agent_captures_real_answer(observer, transport):
+    proxy = li_mod.instrument_agent(_FakeAgent(_FakeAgentOutput("42")), observer)
+    assert _await(proxy.run(user_msg="6*7?")) is not None
+    payload = transport.last["payload"]
+    assert payload["type"] == "turn_outcome"
+    assert payload["body"] == "42", "正文必须是从 AgentOutput.response 取的答案，不是 200 字 repr 摘要"
+    assert payload["metadata"]["phase"] == "agent"
+
+
+def test_llamaindex_instrument_agent_keeps_call_signature(observer):
+    agent = _FakeAgent(_FakeAgentOutput("ok"))
+    proxy = li_mod.instrument_agent(agent, observer)
+    _await(proxy.run("hello", max_iterations=3))
+    assert agent.last_call == (("hello",), {"max_iterations": 3})
+
+
+def test_llamaindex_instrument_agent_delegates_other_attributes(observer):
+    proxy = li_mod.instrument_agent(_FakeAgent(_FakeAgentOutput("ok")), observer)
+    assert proxy.role == "researcher", "只拦 await，其余属性原样转发"
+    assert proxy.run("x").stream_events() == "stream"
+
+
+def test_llamaindex_instrument_agent_records_error_and_reraises(observer, transport):
+    proxy = li_mod.instrument_agent(_FakeAgent(error=RuntimeError("boom")), observer)
+    try:
+        _await(proxy.run("x"))
+    except RuntimeError as exc:
+        assert "boom" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("异常必须原样还给宿主")
+    payload = transport.last["payload"]
+    assert payload["metadata"]["outcome"] == "error"
+    assert "boom" in payload["body"]
+
+
+def test_llamaindex_instrument_agent_without_run_is_returned_as_is(observer):
+    sentinel = object()
+    assert li_mod.instrument_agent(sentinel, observer) is sentinel
+
+
+def test_llamaindex_instrument_agent_stream_events_reachable(observer):
+    """真 WorkflowHandler 的主要用法之一是 stream_events()，代理不能把它吃掉。"""
+    agent = _FakeAgent(_FakeAgentOutput("ok"))
+    proxy = li_mod.instrument_agent(agent, observer)
+    assert proxy.run("x").stream_events() == "stream"
+
+
+def test_llamaindex_agent_turn_summary_can_be_switched_off(observer, transport):
+    """两条都开 = 同一次回合两条 turn_outcome（真机实测），所以 handler 默认关摘要。"""
+    ev = FakeWorkflowRunOutputEvent("StopEvent(result=AgentOutput(... text='42' ...))")
+    li_mod.send_instrumentation_event(observer, ev, agent_turn_summary=False)
+    assert transport.calls == [], "关掉摘要就不该投递任何观测"
+    li_mod.send_instrumentation_event(observer, ev, agent_turn_summary=True)
+    assert transport.last["payload"]["metadata"]["phase"] == "workflow"
