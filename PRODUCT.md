@@ -37,10 +37,13 @@ Confirmed constraints:
 - **No token, internal IP, or secrets in src/ or output.** The service runs on markdown truth plus derived SQLite only.
 - **Degrade-open everywhere it can fail** — keyword lane for embeds, no read face ever 5xxs for a lane scream; anything graceful wins first.
 - **Never claims shipping capability or facts it doesn't produce**: no prices, no benchmarks, no production customers' faces absent from spec.
+- **Free forever, by discipline.** No metering surface, no paywall, no license-check mechanism — any future "just add an authorization check" drift violates this commitment (see Brand Commitments).
 
 ## Brand Commitments
 
 Name canon: **永忆（YongYi）** — owner choice on 2026-10-26 as fd-memory's public brand. Package name corrected to `@finddatatechnology/yongyi` on 2026-10-27 (publish org follows the owner's npm account, not the runtime scope). `fd-memory` stays as the internal code root and Docker image during transition; public surfaces use 永忆 first. License MIT. Typeface/identity are new (no reuse of deployer-side identity assets).
+
+**Free forever.** Decided 2026-11 with the complete-solution change: YongYi the memory service is permanently free — self-hosting is free and stays free. There is no metering surface, no paywall, and no license-check mechanism, and this is itself product discipline: no future build may quietly bolt an authorization gate onto the service. Embedding and distillation model costs are borne by the operator (bring your own model / embedding budget); the service never meters usage. The commercial return path lives in adjacent product lines built around YongYi's ecosystem, never inside YongYi itself.
 
 ## Evidence on Hand
 

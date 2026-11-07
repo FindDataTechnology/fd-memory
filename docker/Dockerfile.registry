@@ -12,6 +12,7 @@ WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+COPY portal ./portal
 COPY package.json ./
 EXPOSE 49375
 USER node

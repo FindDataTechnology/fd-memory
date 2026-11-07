@@ -1,0 +1,11 @@
+// ── 工作记忆纪律文本 · 单源（自 paas/memory-discipline.js 下放） ─────────────
+//
+// 双语单源（zh + en，一行对一行）：舰队侧（dsh persona 行 / ACP workspace
+// CLAUDE.md）与 cell 侧（预设 persona 后缀）都追加本字符串，两面的引导永不
+// 漂移。工具名无论中英都是 ASCII。消费者 MUST 经本接口取文本，不得手抄副本；
+// 文本更新随 SDK 版本发布。
+//
+// 字节契约：本字符串与壹座现行注入逐字节一致（金样 fixture 见
+// test/goldens/discipline.txt，由 paas 现役实现实跑产出）。
+
+export const MEMORY_DISCIPLINE = "\n\n## 工作记忆（fd-memory）/ Working memory (fd-memory)\n\nMCP 服务器 fd-memory 已挂载（工具名 mcp__fd-memory__*）。 / An MCP server \"fd-memory\" is mounted (tools appear as mcp__fd-memory__*).\n\n- 会话收尾做成了有意义的工作时，调用 memory_handoff_begin 写交接：完成了什么、接口形状、下一步、坑、涉及的文件。\n  When you finish meaningful work in a session, call memory_handoff_begin before stopping: what is done, interface shapes, next steps, known pitfalls, files touched.\n- 开场若可能在续作先前工作，先 memory_handoff_list；有给自己的 open handoff 就用 memory_handoff_accept 认领后续作，不要重推背景。\n  When you start and may be resuming prior work, call memory_handoff_list first; if an open handoff is addressed to you, claim it with memory_handoff_accept and continue from it instead of re-deriving the background.\n- 当用户明确说「记住这个／别忘了」，或你学到跨会话仍有价值的偏好或事实时，调用 memory_write_page 记一条 note；之后的会话开场会自动带上最近的 note。写之前先 memory_query 查一下是否已有同主题 note——更新就写一条新的更正 note（标明「更正」），蒸馏层会自动接替旧结论，但 note 原文会一直都在，重复写同一条只会稀释开场记忆。\n  When the user explicitly asks you to remember something, or you learn a preference or fact worth carrying into later sessions, call memory_write_page; recent notes are surfaced automatically at the start of later sessions. Before writing, memory_query for an existing note on the topic — to update, write a new correction note (marked as such); distillation supersedes the old conclusion automatically, but the raw notes persist, and rewriting the same note only dilutes the opening memory.\n- 读资料库的文档时（library 工具），把与本职相关的要点消化成自己的记忆：调用 memory_write_page 写进自己的分区，正文注明出处（来自哪份文档）。文档是原料、记忆是消化过的经验——只有你理解并转述过的内容才值得写；原样照抄文档不算记忆。\n  When reading library documents (the library tools), distill what matters for YOUR role into your own memory via memory_write_page, citing the source document in the note body. Documents are raw material; memory is processed experience — only what you understood and restated is worth writing; verbatim copying is not memory.\n";

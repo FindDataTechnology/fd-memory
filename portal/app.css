@@ -1,0 +1,274 @@
+/* 永忆 Portal — 手写样式，零构建链。设计令牌全部内联于此（design D2）。 */
+
+:root {
+  --c-bg: #f5f6f8;
+  --c-panel: #ffffff;
+  --c-ink: #1f2430;
+  --c-muted: #6b7280;
+  --c-line: #e2e5ea;
+  --c-brand: #2f5fd0;
+  --c-brand-ink: #ffffff;
+  --c-warn: #b45309;
+  --c-danger: #b91c1c;
+  --c-badge-bg: #eef2ff;
+  --c-badge-ink: #3730a3;
+  --c-row-hover: #f0f4ff;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --radius: 8px;
+  --font: system-ui, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  background: var(--c-bg);
+  color: var(--c-ink);
+  line-height: 1.6;
+}
+
+/* ── 顶栏与品牌 ─────────────────────────────────────────── */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+  padding: var(--space-3) var(--space-6);
+  background: var(--c-panel);
+  border-bottom: 1px solid var(--c-line);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+
+.brand {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.brand-sub {
+  margin-left: var(--space-3);
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--c-muted);
+  letter-spacing: 1px;
+}
+
+.tabs { display: flex; gap: var(--space-2); flex: 1; }
+
+.tab {
+  border: 1px solid transparent;
+  background: none;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius);
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--c-muted);
+}
+
+.tab.active { color: var(--c-brand); border-color: var(--c-brand); background: var(--c-badge-bg); }
+
+.auth-zone { display: flex; align-items: center; gap: var(--space-3); }
+
+/* ── 通用件 ─────────────────────────────────────────────── */
+
+.panel {
+  max-width: 720px;
+  margin: var(--space-6) auto;
+  padding: var(--space-6);
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+}
+
+.view { max-width: 1100px; margin: 0 auto; padding: var(--space-4) var(--space-6); }
+
+.muted { color: var(--c-muted); font-size: 13px; }
+
+.hint { min-height: 1.2em; color: var(--c-warn); font-size: 13px; }
+
+.row { display: flex; gap: var(--space-2); align-items: center; }
+.row.end { justify-content: flex-end; margin-top: var(--space-3); }
+
+input, select, textarea {
+  font: inherit;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+  background: var(--c-panel);
+  color: var(--c-ink);
+}
+
+textarea { width: 100%; resize: vertical; }
+
+button {
+  font: inherit;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+  background: var(--c-panel);
+  cursor: pointer;
+}
+
+button.primary { background: var(--c-brand); border-color: var(--c-brand); color: var(--c-brand-ink); }
+button.warn { background: none; border-color: var(--c-warn); color: var(--c-warn); }
+button.danger { background: none; border-color: var(--c-danger); color: var(--c-danger); }
+button.ghost { border-color: transparent; color: var(--c-muted); }
+button:hover { filter: brightness(0.97); }
+
+.badge {
+  display: inline-block;
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  background: var(--c-badge-bg);
+  color: var(--c-badge-ink);
+  font-size: 12px;
+}
+
+/* ── 登录面板 ───────────────────────────────────────────── */
+
+.login h1 { margin-top: 0; font-size: 18px; }
+.login .row input { flex: 1; }
+
+/* ── 筛选条 ─────────────────────────────────────────────── */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  align-items: end;
+  padding: var(--space-3);
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+}
+
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--c-muted);
+}
+
+.filters input, .filters select { min-width: 110px; }
+
+/* ── 列表与详情 ─────────────────────────────────────────── */
+
+.layout { display: flex; gap: var(--space-4); align-items: flex-start; margin-top: var(--space-3); }
+
+.list {
+  flex: 1;
+  border-collapse: collapse;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.list th, .list td {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--c-line);
+  font-size: 14px;
+}
+
+.list th { color: var(--c-muted); font-weight: 500; font-size: 12px; }
+
+.list tbody tr { cursor: pointer; }
+.list tbody tr:hover { background: var(--c-row-hover); }
+.list tbody tr.selected { background: var(--c-badge-bg); }
+
+.detail {
+  width: 320px;
+  flex-shrink: 0;
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+}
+
+.detail h2 { margin: 0 0 var(--space-2); font-size: 16px; }
+
+.detail dl { display: grid; grid-template-columns: 72px 1fr; gap: var(--space-1) var(--space-2); margin: var(--space-3) 0; }
+.detail dt { color: var(--c-muted); font-size: 12px; }
+.detail dd { margin: 0; font-size: 13px; word-break: break-all; }
+
+.pager { display: flex; gap: var(--space-3); align-items: center; margin-top: var(--space-3); }
+
+/* ── 晋升候选 ───────────────────────────────────────────── */
+
+.promo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-2); }
+
+.promo-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+}
+
+.promo-main { flex: 1; }
+.promo-title { font-weight: 600; }
+.promo-meta { font-size: 12px; color: var(--c-muted); word-break: break-all; }
+
+/* ── 摘要 ───────────────────────────────────────────────── */
+
+.digest {
+  background: var(--c-panel);
+  border: 1px solid var(--c-line);
+  border-radius: var(--radius);
+  padding: var(--space-4);
+  font-family: var(--font);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 65vh;
+  overflow: auto;
+}
+
+/* ── 纠错弹层 ───────────────────────────────────────────── */
+
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgb(15 23 42 / 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+
+.modal-box {
+  width: min(560px, calc(100vw - var(--space-6) * 2));
+  background: var(--c-panel);
+  border-radius: var(--radius);
+  padding: var(--space-6);
+}
+
+.modal-box h2 { margin-top: 0; font-size: 16px; }
+.modal-box textarea { margin-top: var(--space-2); }
+
+/* ── 提示浮层 ───────────────────────────────────────────── */
+
+.toast {
+  position: fixed;
+  bottom: var(--space-6);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--c-ink);
+  color: #fff;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius);
+  font-size: 14px;
+  z-index: 30;
+  max-width: 80vw;
+}

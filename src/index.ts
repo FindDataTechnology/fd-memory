@@ -1,8 +1,10 @@
 #!/usr/bin/env node
-// YongYi entry: `serve` (default), `token mint|list|revoke`, `reindex`.
+// YongYi entry: `serve` (default), `token mint|list|revoke`, `reindex`,
+// `connect|disconnect|hook` (add-yongyi-complete-solution).
 
 import { Service } from "./http.js";
 import { TokenStore } from "./auth.js";
+import { runConnect, runDisconnect, runHook } from "./connect/cli.js";
 import { mkdirSync } from "node:fs";
 
 function dataDir(): string {
@@ -22,6 +24,9 @@ usage:
   yongyi token mint --kind deployment|person|runner|platform --namespace <ns|*> [--label L]
   yongyi token list
   yongyi token revoke --id <id>
+  yongyi connect claude-code|zcode|mcp --url U --as user [--project P] [--dir D]
+  yongyi disconnect <harness>
+  yongyi hook <harness> <event>      stdin: hook event JSON (capture, fail-drop)
 env:
   FD_MEMORY_DATA     data directory (default ~/Library/Application Support/fd-memory)
   FD_MEMORY_PEPPER   token hash pepper (set this in production)
@@ -74,9 +79,30 @@ if (cmd === "serve") {
     console.error("token subcommand: mint|list|revoke");
     process.exit(2);
   }
+} else if (cmd === "connect") {
+  runConnect(process.argv.slice(3)).catch((e: unknown) => fail(e));
+} else if (cmd === "disconnect") {
+  try {
+    runDisconnect(process.argv.slice(3));
+  } catch (e) {
+    fail(e);
+  }
+} else if (cmd === "hook") {
+  runHook(process.argv.slice(3), readStdin).catch((e: unknown) => fail(e));
 } else {
   console.error(`unknown command: ${cmd} (see --help)`);
   process.exit(2);
+}
+
+function fail(e: unknown): never {
+  console.error(e instanceof Error ? e.message : String(e));
+  process.exit(1);
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function argValue(flag: string): string | undefined {

@@ -12,14 +12,19 @@
 
 export interface DigestItem {
   id: string;
-  layer: "L1" | "L2";
-  kind: string; // fact | experience | note …
+  // L0 (add-yongyi-complete-solution): observe-lane observation pages ride the
+  // digest as raw evidence; the budget share logic treats L0 like L1.
+  layer: "L0" | "L1" | "L2";
+  kind: string; // fact | experience | note | observation …
   title: string; // fact: statement; experience: task
   excerpt: string;
   confidence?: number | null;
   updated_at?: string | null;
   forgotten_at?: string | null;
   expires_at?: string | null;
+  // Cross-harness source badge (design D5): set from page metadata.harness by
+  // the write lanes; absent ⇒ the line renders byte-identically to before.
+  harness?: string;
 }
 
 export interface DigestHandoff {
@@ -65,7 +70,12 @@ function itemLine(item: DigestItem): string {
     while (common < max && title[common] === excerpt[common]) common += 1;
     if (common >= 40) excerpt = excerpt.slice(common).trimStart();
   }
-  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${shownTitle}${excerpt ? `：${excerpt}` : ""}`;
+  // Cross-harness source badge (D5, tasks 5.2): a user-readable marker at the
+  // line end, Chinese-first. The badge rides INSIDE the line string, so the
+  // budget accounting (estimateTokens on the whole line) stays exact — no
+  // discipline drift.
+  const badge = item.harness ? `（来自 ${item.harness}）` : "";
+  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${shownTitle}${excerpt ? `：${excerpt}` : ""}${badge}`;
 }
 
 // Notification semantics (constructed-benchmark finding, 2026-10-25): a
@@ -105,9 +115,11 @@ export function renderDigest(opts: {
     // were squeezed to zero. Reserve a floor for L1 notes; L2 keeps the rest,
     // and notes may expand into whatever L2 leaves unused. No L1 items ⇒
     // byte-identical to the previous single-loop behavior.
+    // L0 observations (add-yongyi-complete-solution) share the note floor:
+    // both are short raw-evidence lines, not distilled L2.
     const NOTE_SHARE_TOKENS = 400;
-    const l1 = items.filter((i) => i.layer === "L1");
-    const rest = items.filter((i) => i.layer !== "L1");
+    const l1 = items.filter((i) => i.layer !== "L2");
+    const rest = items.filter((i) => i.layer === "L2");
     const cap = l1.length ? budget - Math.min(NOTE_SHARE_TOKENS, Math.floor(budget / 3)) : budget;
     const pushItems = (list: typeof items, capTokens: number): number => {
       let spent = 0;

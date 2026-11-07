@@ -174,6 +174,13 @@ export class RootDb {
         gaps INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
         pending_since INTEGER
       );
+      CREATE TABLE IF NOT EXISTS observe_dedupe (
+        project TEXT NOT NULL,
+        idem_key TEXT NOT NULL,
+        page_rel TEXT NOT NULL,
+        seen_at TEXT NOT NULL,
+        PRIMARY KEY (project, idem_key)
+      );
     `);
     // Pre-v2 databases: observations had no project column (the root was one
     // agent's), handoffs had no to_agent. Those rows belong to the agent's own
@@ -733,6 +740,32 @@ export class RootDb {
       .prepare("INSERT OR IGNORE INTO hook_dedupe (ingest_key, session_id, event, seen_at) VALUES (?,?,?,?)")
       .run(ingestKey, sessionId, event, seenAt);
     return res.changes > 0;
+  }
+
+  // -- observe dedupe (add-yongyi-complete-solution, spec yongyi-observe-lane) --
+  // Persistent (project, idempotency_key) claim for the /observe lane: the
+  // first delivery claims the key and stores its page rel; any replay reads
+  // the FIRST page back without adding rows. Pure addition — the root IS the
+  // namespace boundary (one DB per owner root), so (project, key) here is the
+  // design's (namespace, idempotency_key), restart-safe.
+  claimObserveEvent(project: string, idemKey: string, pageRel: string, seenAt: string): { first: boolean; page_rel: string | null } {
+    const ins = this.db
+      .prepare("INSERT OR IGNORE INTO observe_dedupe (project, idem_key, page_rel, seen_at) VALUES (?,?,?,?)")
+      .run(project, idemKey, pageRel, seenAt);
+    if (Number(ins.changes) > 0) return { first: true, page_rel: pageRel };
+    const row = this.db
+      .prepare("SELECT page_rel FROM observe_dedupe WHERE project=? AND idem_key=?")
+      .get(project, idemKey) as { page_rel: string } | undefined;
+    return { first: false, page_rel: row?.page_rel ?? null };
+  }
+
+  // L0 observation pages (wiki) for the digest L1 lane — a pure-additive
+  // read: legacy roots hold none, so callers merging it in see unchanged
+  // output for every pre-existing page population.
+  recentObservationPages(project: string, limit = 5): Array<{ path: string; title: string; body: string; updated_at: string }> {
+    return this.db
+      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='observation' ORDER BY updated_at DESC LIMIT ?")
+      .all(project, limit) as never;
   }
 
   reindexFromWiki(wikiDir: string): number {

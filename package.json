@@ -38,6 +38,7 @@
   },
   "files": [
     "dist",
+    "portal",
     "README.md"
   ]
 }

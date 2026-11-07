@@ -5,6 +5,8 @@ Working memory for agentic platforms — durable, layered, self-distilling memor
 
 永忆（YongYi，fd-memory 的产品品牌）是一个为**智能体 / 多智能体系统**设计的长期记忆基础设施：把「一个 agent 过去知道的一切」变成**每回合都可召回**的结构化知识，支撑跨平台部署与多 agent 协同。
 
+> **永久免费**：永忆本体自托管免费，无计量面、无付费墙、无 license 检查机制；嵌入与蒸馏的模型成本由运营者自担（BYO 模型）。Free forever — self-host free, no metering, no paywall; bring your own model budget.
+
 ## 为什么
 
 Agentic 平台的共同问题：
@@ -87,6 +89,58 @@ curl "http://127.0.0.1:4000/digest?project=default&q=%E5%91%A8%E6%8A%A5" \
 | `memory_query`                     | 全页型 FTS 搜索（note 与 L2 均可查）   |
 | `memory_recent`                    | 新近页列表                        |
 
+## 接入（Integration）
+
+一条命令把 harness 接上永忆：MCP 挂载、回合捕获（hook → `/observe`）、纪律注入、身份绑定一次完成。完整契约与 API 参考见 [`docs/harness-integration.md`](docs/harness-integration.md)。
+
+### Claude Code
+
+```bash
+yongyi connect claude-code --url http://localhost:49375 --as you@example.com
+```
+
+接入后得到三样东西：
+
+- **MCP 挂载** — streamable-http 方式挂载永忆 MCP 工具面（`memory_write_page` / `memory_query` / …）
+- **hook 捕获** — 会话收尾与工具事件经 hook 转发到 `/observe`，落为 L0 observation：记忆捕获由平台担保，不依赖 agent 自觉
+- **纪律区块** — CLAUDE.md 注入 `<!-- yongyi:begin --> … <!-- yongyi:end -->` 受管区块；区块外你的自有内容逐字不动，重复运行幂等（条目只存在一份）
+
+断开：
+
+```bash
+yongyi disconnect claude-code
+```
+
+移除全部受管工件（挂载条目、hook 接线、纪律区块）；已写入的记忆仍在你的 u/ 根下，可召回、可在 Portal 管理——断开工具不删记忆。
+
+### ZCode
+
+```bash
+yongyi connect zcode --url http://localhost:49375 --as you@example.com
+```
+
+与 claude-code 等价：MCP 挂载 + 捕获接线 + AGENTS.md 受管纪律区块，幂等语义相同；断开用 `yongyi disconnect zcode`。
+
+### 任意 MCP 客户端
+
+```bash
+yongyi connect mcp --url http://localhost:49375
+```
+
+输出可直接粘贴进任意 MCP 客户端的 JSON 配置片段（服务 URL + 令牌引用方式），不写入任何特定工具的配置文件，也不内嵌明文平台令牌。
+
+### Portal（人面门户）
+
+服务进程自带 `/portal`：浏览器打开、粘贴 person 令牌即登录，无需任何额外安装。
+
+- **浏览 / 筛选**：按 scope / layer / tier / tag / 时间窗分页浏览你的记忆
+- **纠错**：对任一记忆页发起更正，生成一条标注「更正」的 note；旧结论经蒸馏自动接替，原文保留可审计
+- **晋升**：AI 提议的晋升候选要等你点头——接受才翻 tier（来源标记 human），忽略进冷却
+
+### 换工具不换记忆
+
+`--as` 绑定的是人根身份（`u/<id>`）：同一身份在多个 harness 接入，写入自动合流到同一 u/ 根。Claude Code 会话里记下的部署口径，在 ZCode 新会话的 digest 里直接可召回；跨来源的更正经蒸馏接替旧结论；每页带 harness 来源标注，Portal 可见。断开任何一个工具都不删记忆。合流只发生在同一 person 根内——deployment 根（d/<pack>/<member>）不参与，岗位私有分区不串门。
+
 ## 配置（生产）
 
 环境变量全部可选（默认懒启动、零蒸馏）。
@@ -141,6 +195,7 @@ distiller/             # Python sidecar（LLM/嵌入调用——可以装起来�
 ## 文档
 
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — 部署教程（裸机/Docker/systemd/compose/K8s、反代路径封禁、备份升级、安全清单）
+- [`docs/harness-integration.md`](docs/harness-integration.md) — Harness 接入指南（/observe API、connect 适配器、客户端 SDK、跨 harness 合流语义）
 - [`docs/eval-continue.md`](docs/eval-continue.md) — 继续性评估 runbook（场景形状、门禁、当前成绩）
 - [`docs/federation-recipe.md`](docs/federation-recipe.md) — 多 deployment 联邦与跨 deployment 记忆访问
 - [`docs/spike-hook-wire.md`](docs/spike-hook-wire.md) — HTML 写入 hook 的开发思路（后续方向）

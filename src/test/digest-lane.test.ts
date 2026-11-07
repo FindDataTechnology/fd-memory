@@ -467,3 +467,35 @@ test("/digest: the vector lane respects supersede — retired pages do not resur
     __resetEmbedGate();
   }
 });
+
+// ── harness source badge lane (add-yongyi-complete-solution, design D5 /
+// tasks 5.2): pages whose metadata carries `harness` render a （来自 x）
+// marker; pages without it keep the exact pre-badge line bytes.
+
+test("/digest L1: harness metadata renders the source badge; pages without harness stay byte-identical", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const { server, base } = await start(svc);
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const withH = await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-badge", title: "跨 harness 口径", body: "两条 harness 的写入都进同一个根。", metadata: { harness: "claude-code" } }) });
+    assert.equal(withH.status, 200);
+    const r = await fetch(base + "/digest?project=c-badge&q=harness", { headers: H });
+    assert.equal(r.status, 200);
+    const d = (await r.json()) as { digest: string };
+    const line = d.digest.split("\n").find((l) => l.startsWith("- 〔L1"))!;
+    assert.ok(line.endsWith("（来自 claude-code）"), `badge rides the line end (got: ${line})`);
+
+    // no-harness note (a page written without source metadata): exact old shape
+    await fetch(base + "/pages", { method: "POST", headers: H, body: JSON.stringify({ project: "c-plain", title: "无来源标注", body: "普通页面不渲染徽标。" }) });
+    const r2 = await fetch(base + "/digest?project=c-plain&q=普通", { headers: H });
+    const d2 = (await r2.json()) as { digest: string };
+    const line2 = d2.digest.split("\n").find((l) => l.startsWith("- 〔L1"))!;
+    assert.match(line2, /^- 〔L1·note｜\d{4}-\d{2}-\d{2}〕无来源标注：普通页面不渲染徽标。$/, "no-harness line keeps the exact pre-badge shape");
+    assert.ok(!d2.digest.includes("（来自"), "no phantom badge without harness metadata");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

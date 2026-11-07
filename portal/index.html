@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>永忆 · 记忆门户</title>
+<link rel="stylesheet" href="/portal/app.css">
+<script type="module" src="/portal/app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">永忆<span class="brand-sub">记忆门户</span></div>
+  <nav id="nav" class="tabs" hidden>
+    <button type="button" class="tab active" data-view="memory">记忆浏览</button>
+    <button type="button" class="tab" data-view="promotions">晋升候选</button>
+    <button type="button" class="tab" data-view="digest">今日摘要</button>
+  </nav>
+  <div class="auth-zone">
+    <span id="login-state" class="muted" hidden></span>
+    <button type="button" id="logout-btn" class="ghost" hidden>退出</button>
+  </div>
+</header>
+
+<!-- 登录：person 令牌粘贴登录（设计 D2）。令牌仅存本浏览器 localStorage，
+     后续请求以 Bearer 头出示；401 时回到此页并给出引导文案，绝不裸报错。 -->
+<section id="login-panel" class="panel login">
+  <h1>登录永忆</h1>
+  <p class="muted">粘贴你的 person 令牌，查看与管理自己的记忆。令牌只保存在本浏览器中，不会上传到别处；如遗失令牌请联系部署方重新签发。</p>
+  <div class="row">
+    <input id="login-cred" type="password" placeholder="粘贴 person 令牌" autocomplete="off" spellcheck="false">
+    <button type="button" id="login-btn" class="primary">登录</button>
+  </div>
+  <p id="login-hint" class="hint" role="status"></p>
+</section>
+
+<main id="app" hidden>
+  <!-- 记忆浏览：复用既有读面筛选语义（scope/layer/tier/tag/since/until），分页一致 -->
+  <section id="view-memory" class="view">
+    <form id="filter-form" class="filters">
+      <label>项目 <input id="f-scope" placeholder="项目名（可空）"></label>
+      <label>层
+        <select id="f-layer">
+          <option value="">全部</option>
+          <option value="L0">L0 观察</option>
+          <option value="L1">L1 笔记</option>
+          <option value="L2">L2 事实</option>
+        </select>
+      </label>
+      <label>tier
+        <select id="f-tier">
+          <option value="">全部</option>
+          <option value="draft">draft</option>
+          <option value="stable">stable</option>
+          <option value="canonical">canonical</option>
+        </select>
+      </label>
+      <label>标签 <input id="f-tag" placeholder="标签（可空）"></label>
+      <label>始于 <input id="f-since" type="date"></label>
+      <label>止于 <input id="f-until" type="date"></label>
+      <label>每页
+        <select id="f-limit">
+          <option value="10">10</option>
+          <option value="20" selected>20</option>
+          <option value="50">50</option>
+        </select>
+      </label>
+      <button type="submit" class="primary">筛选</button>
+    </form>
+    <p id="mem-count" class="muted" role="status"></p>
+    <div class="layout">
+      <table class="list" id="mem-list">
+        <thead>
+          <tr><th>标题</th><th>项目</th><th>层</th><th>tier</th><th>来源</th><th>更新时间</th></tr>
+        </thead>
+        <tbody id="mem-body"></tbody>
+      </table>
+      <aside id="detail" class="detail" hidden>
+        <h2 id="d-title"></h2>
+        <p id="d-harness" class="badge" hidden></p>
+        <dl>
+          <dt>路径</dt><dd id="d-path"></dd>
+          <dt>项目</dt><dd id="d-project"></dd>
+          <dt>层</dt><dd id="d-layer"></dd>
+          <dt>tier</dt><dd id="d-tier"></dd>
+          <dt>标签</dt><dd id="d-tags"></dd>
+          <dt>更新时间</dt><dd id="d-ts"></dd>
+        </dl>
+        <button type="button" id="corr-open" class="warn">更正此页</button>
+      </aside>
+    </div>
+    <div class="pager">
+      <button type="button" id="prev-btn">上一页</button>
+      <span id="pager-pos" class="muted"></span>
+      <button type="button" id="next-btn">下一页</button>
+    </div>
+  </section>
+
+  <!-- 晋升候选：AI 只提议，接受才翻 tier（tier_origin=human 由服务端强制），忽略进冷却 -->
+  <section id="view-promotions" class="view" hidden>
+    <h2>晋升候选</h2>
+    <p class="muted">以下由 AI 提议晋升的页面需要你确认：接受后 tier 才会变更且来源标记为 human；忽略则进入冷却，不再重复提醒。</p>
+    <p id="promo-count" class="muted" role="status"></p>
+    <ul id="promo-list" class="promo-list"></ul>
+  </section>
+
+  <!-- 今日摘要：复用既有 digest 面（服务端渲染），空查询即按近期记忆呈现 -->
+  <section id="view-digest" class="view" hidden>
+    <h2>今日摘要</h2>
+    <form id="digest-form" class="filters">
+      <label>项目 <input id="digest-project" value="default"></label>
+      <label>主题 <input id="digest-q" placeholder="可选：按主题召回"></label>
+      <button type="submit" class="primary">生成</button>
+    </form>
+    <p id="digest-note" class="hint" role="status"></p>
+    <pre id="digest-out" class="digest"></pre>
+  </section>
+</main>
+
+<!-- 纠错表单：对任一页发起更正，写入一条「更正」note 到用户根（走既有 /pages 写入），
+     标题与正文带「更正」标识并引用原页；旧结论由蒸馏自动接替。 -->
+<section id="corr-panel" class="modal" hidden>
+  <div class="modal-box">
+    <h2>发起更正</h2>
+    <p class="muted">原页：<span id="corr-source"></span></p>
+    <textarea id="corr-body" rows="6" placeholder="填写新的结论…"></textarea>
+    <p id="corr-hint" class="hint" role="status"></p>
+    <div class="row end">
+      <button type="button" id="corr-cancel">取消</button>
+      <button type="button" id="corr-submit" class="primary">提交更正</button>
+    </div>
+  </div>
+</section>
+
+<div id="toast" class="toast" hidden></div>
+</body>
+</html>

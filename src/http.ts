@@ -12,6 +12,8 @@ import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot, normalizeMetadata } from "./store.js";
 import { PageFilter } from "./db.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
+import { parseObserveEvent, landObserveEvent, observeRateGuard } from "./observe.js";
+import { handlePortal } from "./portal-server.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
@@ -175,6 +177,11 @@ export class Service {
       return void res.end(JSON.stringify({ status: "ok", service: "fd-memory" }));
     }
 
+    // Portal (add-yongyi-complete-solution): static assets carry zero data, and
+    // browser navigation cannot attach a Bearer header — auth happens on the
+    // data faces via the page's paste-login, so this must sit BEFORE this.auth.
+    if (await handlePortal(req, res, path)) return;
+
     const scope = this.auth(req);
     if (!scope) {
       res.writeHead(401, { "content-type": "application/json" });
@@ -269,6 +276,53 @@ export class Service {
         return void res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "service tokens carry no data-plane identity" } }));
       }
       return this.mcp(req, res, scope);
+    }
+
+    // ── /observe (add-yongyi-complete-solution, spec yongyi-observe-lane): the
+    // platform-side L0 capture lane. Closed-set turn events land as observation
+    // pages in the CALLER'S namespace — person → its u/ root's default
+    // project; deployment → its own member partition; pod → the pack's shared
+    // partition (既有 own/shared 规则). Persistent (project, idempotency_key)
+    // dedupe replays the first page; per-token rate guard + 32KB body cap
+    // (truncation annotated in-page) keep a noisy harness from dragging the
+    // service. No queue — validate, land, answer, so capture never blocks a
+    // turn and never delays /digest, /pages or /mcp.
+    if (path === "/observe" && req.method === "POST") {
+      if (scope.kind === "platform" || scope.kind === "runner") {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "service_tokens_carry_no_data_plane_identity", code: "service_tokens_carry_no_data_plane_identity" }));
+      }
+      const guard = observeRateGuard(scope.tokenId);
+      if (!guard.ok) {
+        res.writeHead(429, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "rate_limited", code: "rate_limited", retry_after_ms: guard.retryAfterMs, limit: guard.limit, hint: "discard the event or retry after retry_after_ms — a harness turn must not wait on memory" }));
+      }
+      let raw: unknown;
+      try { raw = JSON.parse(await this.rawBody(req)); } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "invalid_body", code: "invalid_body" }));
+      }
+      const parsed = parseObserveEvent(raw);
+      if (!parsed.ok) {
+        res.writeHead(parsed.status, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: parsed.error, code: parsed.code, ...(parsed.extra ?? {}) }));
+      }
+      // Namespace authority (spec: 不得静默改落他处): the landing partition is
+      // derived from the token family alone, never from the payload. The grant
+      // table is the last word — a token without rw on its landing namespace
+      // is a named 403.
+      const landingProject = namespaceParts(scope.namespace).project; // person→default, member→own, pod→shared
+      const grantNs = scope.kind === "person" ? `${scope.namespace}/p/${landingProject}` : scope.namespace;
+      if (!this.tokens.allows(scope.tokenId, grantNs, "rw")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "forbidden", code: "forbidden" }));
+      }
+      const root = this.rootFor(scope);
+      const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs });
+      res.writeHead(202, { "content-type": "application/json" });
+      return void res.end(JSON.stringify(out.duplicate
+        ? { page: out.page, duplicate: true }
+        : { page: out.page, ...(out.truncated ? { truncated: true } : {}) }));
     }
 
     // ── /pages (add-memory-scopes-and-cluster-sharing): the platform-seam
@@ -569,16 +623,33 @@ export class Service {
         excerpt: String(p.body ?? "").replace(/\s+/g, " ").trim().slice(0, 120),
         confidence: null, updated_at: p.updated_at,
       }));
+      // Observe pages (add-yongyi-complete-solution): L0 observation pages ride
+      // the same capped L1 lane by recency — for roots with none, the merge is
+      // the recentNotes order unchanged (byte-identical digests, budget
+      // discipline intact: still ≤ NOTES_LIMIT items through the same renderer).
+      const obsPages = dRoot.db.recentObservationPages(project, NOTES_LIMIT);
+      const recency = [...dRoot.db.recentNotes(project, NOTES_LIMIT), ...obsPages]
+        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
       const merged = [
         ...matched,
-        ...dRoot.db.recentNotes(project, NOTES_LIMIT).filter((p) => (!matchedPaths.has(p.path)) && (!allowedPaths || allowedPaths.has(p.path))),
+        ...recency.filter((p) => (!matchedPaths.has(p.path)) && (!allowedPaths || allowedPaths.has(p.path))),
       ].slice(0, NOTES_LIMIT);
       const noteItems: DigestItem[] = merged.map((p) => {
         const page = dRoot.readPageByRel(p.path);
+        // Source badge (D5): pages whose metadata carries `harness` render a
+        // （来自 x） marker — observe writes it as a first-class field. Pages
+        // without harness keep the pre-existing line bytes exactly.
+        const fm = page?.frontmatter as Record<string, unknown> | undefined;
+        const isObs = fm?.type === "observation";
+        const meta = fm?.metadata;
+        const harness = meta && typeof meta === "object" && !Array.isArray(meta)
+          ? String((meta as Record<string, unknown>).harness ?? "")
+          : "";
         return {
-          id: p.path, layer: "L1" as const, kind: "note", title: p.title,
+          id: p.path, layer: (isObs ? "L0" : "L1") as "L0" | "L1", kind: isObs ? "observation" : "note", title: p.title,
           excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 100),
           confidence: null, updated_at: p.updated_at,
+          ...(harness ? { harness } : {}),
         };
       });
       // Handoffs cap (add-chat-memory-injection drill, 2026-10-25): the

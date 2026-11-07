@@ -118,3 +118,31 @@ test("itemLine: distiller task≈solution duplication collapses to one statement
   assert.ok(line2.includes("…"), "over-90 title capped with ellipsis");
   assert.ok(line2.includes("不同内容的摘录"), "distinct excerpt kept");
 });
+
+// ── harness source badge (add-yongyi-complete-solution, design D5 / tasks 5.2)
+
+test("harness badge: （来自 x） rides the line end; items without harness render byte-identically", () => {
+  const base = { id: "n1", layer: "L1" as const, kind: "note", title: "周报口径", excerpt: "表头用中文", confidence: null as number | null, updated_at: "2026-10-25T00:00:00.000Z" };
+  const noBadge = renderDigest({ items: [base], handoffs: [], now: NOW });
+  const noLine = noBadge.split("\n").find((l) => l.startsWith("- 〔L1"))!;
+  assert.equal(noLine, "- 〔L1·note｜2026-10-25〕周报口径：表头用中文", "no-harness line keeps the exact pre-badge bytes");
+  const badged = renderDigest({ items: [{ ...base, harness: "claude-code" }], handoffs: [], now: NOW });
+  const line = badged.split("\n").find((l) => l.startsWith("- 〔L1"))!;
+  assert.equal(line, "- 〔L1·note｜2026-10-25〕周报口径：表头用中文（来自 claude-code）");
+});
+
+test("harness badge: badge cost is inside the line budget; L0 observations ride the note share", () => {
+  const mk = (n: number): DigestItem => ({
+    id: `o${n}`, layer: "L0", kind: "observation", title: `回合结局 ${n}`,
+    excerpt: "周报初稿完成，待评审。", confidence: null, updated_at: "2026-10-25T00:00:00.000Z", harness: "claude-code",
+  });
+  const out = renderDigest({ items: Array.from({ length: 30 }, (_, i) => mk(i + 1)), handoffs: [], budgetTokens: 200, now: NOW });
+  assert.ok(out.includes("（来自 claude-code）"), "badged lines render");
+  assert.ok(estimateTokens(out) <= 200 + 40, `badge cost is inside the budget accounting (got ${estimateTokens(out)})`);
+  // L0 shares the note floor: with heavy L2 filling the budget, an observation still renders
+  const heavyL2: DigestItem = { id: "exp_1", layer: "L2", kind: "experience", title: "L2 条目：" + "正文".repeat(120), excerpt: "摘录".repeat(150), confidence: 0.8, updated_at: "2026-10-24T00:00:00.000Z" };
+  const obs: DigestItem = { id: "o1", layer: "L0", kind: "observation", title: "回合结局", excerpt: "周报初稿完成", confidence: null, updated_at: "2026-10-25T00:00:00.000Z" };
+  const mixed = renderDigest({ items: [heavyL2, obs], handoffs: [], budgetTokens: 1500, now: NOW });
+  assert.ok(mixed.includes("回合结局"), "L0 observation survives L2 pressure via the note share");
+  assert.match(mixed, /〔L0·observation｜/);
+});
