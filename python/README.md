@@ -71,14 +71,26 @@ CrewAI 的 MCP 集成随版本演进，挂载形态以所装版本为准（需�
 
 ## LlamaIndex
 
+0.14+ 的现役路径是 **instrumentation**，不是回调事件：
+
+```python
+from yongyi_agent.llamaindex import event_handler
+
+handler = event_handler()     # 注册进全局分派器；请持有返回值
+# ... 跑你的 agent / query engine ...
+# uninstall(handler)          # 需要时摘除
+```
+
+映射：`AgentToolCallEvent` → `tool_call`（工具名取 `event.tool.name`，参数是 JSON 串）；`QueryEndEvent` → `turn_outcome`（正文从 `response.response` 取，不 unwrap 会落成对象 repr）。
+
+**为什么不是 `CBEventType.TOOL`**：那是 0.10 时代的回调事件。released 的 `llama-index-core 0.14.25` 连这个枚举成员都没有（`tool` 只在上游 main 分支的 schema 里），core 也不再派发它——按老写法接上去会捕获不到任何东西。旧回调面作为低版本兼容保留，认 `tool` / `function_call` / `agent_step` 三种：
+
 ```python
 from llama_index.core.callbacks import CallbackManager
 from yongyi_agent.llamaindex import callback_handler
 
 Settings.callback_manager = CallbackManager([callback_handler()])
 ```
-
-映射：`on_event_end(CBEventType.TOOL)` → `tool_call`；`on_event_end(CBEventType.AGENT_STEP)` → `turn_outcome`；其它事件忽略。
 
 MCP 挂载（`llama-index-tools-mcp`）：
 
@@ -107,11 +119,11 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest -q
 ```
 
-61 项，全部无网络、不需要装任何框架（映射函数收鸭子类型事件，框架类型只在真正接线的入口出现）。
+68 项，全部无网络、不需要装任何框架（映射函数收鸭子类型事件，框架类型只在真正接线的入口出现）。
 
 ## 边界（如实标注）
 
 - **未发布到 PyPI**：包在本仓 `python/` 内可 `pip install -e` 安装使用；上 PyPI 需要发布凭据，属另行批准的步骤。
-- **未做三框架实机验证**：映射函数的形状按上游源码（`BaseCallbackHandler` / `crewai.events` / `CallbackManager`）核对，但没在真实的 LangChain/CrewAI/LlamaIndex 应用里跑过整轮——首次实机接入时以各框架所装版本为准，尤其 CrewAI 的 MCP 客户端形态。
+- **实机验证到了哪一层**：LangChain 与 LlamaIndex 已在隔离环境里对着**真框架**跑过（`langchain-core 1.7.6` / `llama-index-core 0.14.25`，真实 `@tool` 调用、真实 `RunnableLambda` 链、真实 instrumentation 事件与分派器），投递面用桩 transport 捕获——也就是说「事件面形状 + 注册方式」已实证，**没有**跑真实 LLM 驱动的完整 agent 回合。这一步抓到两个缺陷（LangChain 缺事件入口会往宿主日志打 callback 错误；LlamaIndex 的 `CBEventType.TOOL` 在发布版根本不存在），回归测试已入仓。**CrewAI 尚未实机验证**（未安装），其监听器注册与事件字段以所装版本为准，尤其 MCP 客户端形态。
 - 框架回调签名随版本演进；本包的容忍策略是「缺字段降级 + 异常全吞」，不会因为签名变化弄破宿主，但可能少上报一条观测。
 

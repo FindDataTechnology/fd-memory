@@ -280,3 +280,100 @@ def test_llamaindex_trace_hooks_are_safe_no_ops(observer):
     assert handler.on_event_start(FakeEnum("tool"), {}, event_id="e1") == "e1"
     handler.start_trace("t1")
     handler.end_trace("t1", {})
+
+
+# ── 真框架跑出来的两个缺陷（回归钉） ────────────────────────────────────────
+# 这两条不是从文档推的，是真跑 langchain-core 1.7.6 / llama-index-core 0.14.25
+# 打出来的：缺方法会污染宿主日志；工具事件的名字/载体与我们最初的假设不同。
+
+def test_langchain_handler_implements_the_full_event_surface():
+    """LangChain 的回调管理器对每个事件都调同名方法，缺一个就往宿主日志里打
+    「Error in ... callback: AttributeError」。所以整个面必须存在（哪怕是空操作）。
+    """
+    required = [
+        "on_llm_start", "on_chat_model_start", "on_llm_new_token", "on_llm_end", "on_llm_error",
+        "on_chain_start", "on_chain_end", "on_chain_error",
+        "on_tool_start", "on_tool_end", "on_tool_error",
+        "on_agent_action", "on_agent_finish",
+        "on_retriever_start", "on_retriever_end", "on_retriever_error",
+        "on_text", "on_retry", "on_custom_event",
+    ]
+    handler = lc_mod.YongyiCallbackHandler(object())  # type: ignore[arg-type]
+    missing = [name for name in required if not callable(getattr(handler, name, None))]
+    assert missing == [], "缺这些入口会让 LangChain 往宿主日志里打 callback 错误: %s" % missing
+
+
+def test_langchain_uninteresting_events_are_silent_noops(observer, transport):
+    handler = lc_mod.callback_handler(observer)
+    for name in ("on_llm_start", "on_chat_model_start", "on_tool_start", "on_chain_start", "on_text"):
+        getattr(handler, name)({"run_id": "r"}, name="x")
+    assert transport.calls == [], "不关心的事件不该产生观测"
+
+
+class FakeToolMeta:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeToolCallEvent:
+    """真 AgentToolCallEvent 的鸭子类型（含 ToolMetadata 形状的 tool）。"""
+
+    def __init__(self, name="multiply", arguments='{"a": 3}'):
+        self.tool = FakeToolMeta(name)
+        self.arguments = arguments
+
+
+FakeToolCallEvent.__name__ = "AgentToolCallEvent"
+
+
+class FakeResponse:
+    def __init__(self, response):
+        self.response = response
+
+
+class FakeQueryEndEvent:
+    def __init__(self, response="the answer"):
+        self.response = FakeResponse(response)
+
+
+FakeQueryEndEvent.__name__ = "QueryEndEvent"
+
+
+def test_llamaindex_instrumentation_tool_call_event(observer, transport):
+    payload = li_mod.send_instrumentation_event(observer, FakeToolCallEvent())
+    assert payload
+    sent = transport.last["payload"]
+    assert sent["type"] == "tool_call"
+    assert sent["title"] == "工具调用：multiply"
+    assert sent["metadata"]["tool"] == "multiply"
+
+
+def test_llamaindex_instrumentation_unwraps_response_object(observer, transport):
+    """QueryEndEvent.response 是 pydantic Response 对象；不 unwrap 会落成对象 repr。"""
+    li_mod.send_instrumentation_event(observer, FakeQueryEndEvent())
+    sent = transport.last["payload"]
+    assert sent["type"] == "turn_outcome"
+    assert sent["body"] == "the answer"
+    assert "object at 0x" not in sent["body"]
+
+
+def test_llamaindex_instrumentation_ignores_unrelated_events(observer, transport):
+    class AgentRunStepEndEvent:
+        pass
+
+    assert li_mod.instrumentation_payload(AgentRunStepEndEvent()) is None
+    assert transport.calls == []
+
+
+def test_llamaindex_callback_face_accepts_function_call_kind(observer, transport):
+    """0.14 发布版的工具类回调事件叫 function_call（tool 只在 main 分支）。"""
+    li_mod.send_event_end(observer, "function_call", {"tool_name": "legacy", "tool_output": "out"})
+    sent = transport.last["payload"]
+    assert sent["type"] == "tool_call"
+    assert sent["title"] == "工具调用：legacy"
+    assert sent["body"] == "out"
+
+
+def test_llamaindex_callback_face_still_accepts_tool_kind(observer, transport):
+    li_mod.send_event_end(observer, "tool", {"tool_name": "newer", "tool_output": "out"})
+    assert transport.last["payload"]["title"] == "工具调用：newer"

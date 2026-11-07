@@ -94,6 +94,56 @@ class YongyiCallbackHandler:
     def on_tool_error(self, error: BaseException, **kwargs: Any) -> None:
         run_safely(tool_end_event, self.observer, {**kwargs, "output": str(error)}, failed=True)
 
+    # ── 无操作的事件入口 ─────────────────────────────────────────────────────
+    # LangChain 的回调管理器对每个事件都调 handler 上的同名方法，缺了就抛
+    # AttributeError 并把它当成 callback 错误打到宿主日志里（真跑 langchain-core
+    # 1.7.6 实测）。我们不关心这些事件，但必须实现成空操作——否则用户每天在
+    # 日志里看到一排「Error in YongyiCallbackHandler.on_tool_start」。
+    def on_llm_start(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_chat_model_start(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_llm_end(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_llm_error(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_llm_new_token(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_chain_start(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_tool_start(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_agent_action(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_text(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_retry(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_retriever_start(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_retriever_end(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_retriever_error(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_custom_event(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def on_stream_event(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
     def on_agent_finish(self, finish: Any = None, **kwargs: Any) -> None:
         run_safely(turn_end_event, self.observer, {**kwargs, "return_values": finish}, summary=self.turn_summary)
 
