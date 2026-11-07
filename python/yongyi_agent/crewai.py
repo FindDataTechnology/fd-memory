@@ -85,7 +85,7 @@ def register(observer: Observer, bus: Any, *, events: Any = None) -> Any:
     tool_done = events.ToolUsageFinishedEvent
 
     def on_tool(source: Any, event: Any) -> None:
-        payload = tool_usage_payload(event)  # noqa: F841 — 供调试
+        payload = tool_usage_payload(event)
         run_safely(
             lambda: observer.tool_call(
                 payload["name"],
@@ -111,8 +111,11 @@ def register(observer: Observer, bus: Any, *, events: Any = None) -> Any:
 
     def _unregister() -> None:
         for event_cls, handler in ((tool_done, on_tool), (completed, on_crew_done), (failed, on_crew_done)):
+            # CrewAI 1.15 的 off 是 `off(event_type, handler)` 两个位置参数——不是
+            # `on()` 那样的装饰器工厂。写成 off(cls)(handler) 会抛 TypeError，被下面
+            # 的 except 吞掉，于是「断开」变成静默空操作（真机跑出来的）。
             try:
-                bus.off(event_cls)(handler)
+                bus.off(event_cls, handler)
             except Exception:  # noqa: BLE001 — 卸载失败不值得弄破宿主退出流程
                 pass
 
@@ -141,3 +144,18 @@ def event_listener(observer: Optional[Observer] = None) -> Any:
             self._unregister = register(observer, bus)
 
     return _YongyiListener()
+
+
+def uninstall(listener: Any) -> None:
+    """把 `event_listener()` 注册的监听器从总线上摘掉（失败即忽略）。
+
+    CrewAI 没有「销毁监听器」的官方动作——注册就是往全局 bus 上挂函数。本函数
+    调的就是 `register()` 返回的注销函数；摘掉之后捕获停止，已写下的记忆不动。
+    """
+    unregister = getattr(listener, "_unregister", None)
+    if unregister is None:
+        return
+    try:
+        unregister()
+    except Exception:  # noqa: BLE001
+        pass

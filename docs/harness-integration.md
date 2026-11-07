@@ -183,8 +183,8 @@ pip install "yongyi-agent[langchain]"   # 或 [crewai] / [llamaindex]
 | --- | --- | --- |
 | LangChain | `on_tool_end` | `tool_call` |
 | LangChain | `on_agent_finish`；无 agent 时顶层 `on_chain_end` | `turn_outcome` |
-| CrewAI | `ToolUsageFinishedEvent` | `tool_call`（`failure` → `metadata.outcome`） |
-| CrewAI | `CrewKickoffCompletedEvent` / `CrewKickoffFailedEvent` | `turn_outcome` |
+| CrewAI | `ToolUsageFinishedEvent` | `tool_call`（`failure` 非空 → `metadata.outcome`） |
+| CrewAI | `CrewKickoffCompletedEvent` / `CrewKickoffFailedEvent` | `turn_outcome`（`total_tokens` / `crew_name` 进 metadata） |
 | LlamaIndex | `AgentToolCallEvent`（instrumentation） | `tool_call` |
 | LlamaIndex | `QueryEndEvent`（instrumentation） | `turn_outcome` |
 
@@ -198,8 +198,9 @@ from yongyi_agent.langchain import callback_handler
 graph.invoke(inputs, config={"callbacks": [callback_handler()]})
 
 # CrewAI —— 监听器必须实例化才注册，丢掉返回值会静默失去捕获
-from yongyi_agent.crewai import event_listener
+from yongyi_agent.crewai import event_listener, uninstall
 listener = event_listener()
+# uninstall(listener)   # 停止捕获，已写下的记忆不动
 
 # LlamaIndex（0.14+，现役）—— 返回值请持有，uninstall(handler) 用它摘除
 from yongyi_agent.llamaindex import event_handler
@@ -231,7 +232,7 @@ CrewAI 的 MCP 集成随版本演进，挂载形态以所装版本为准（要�
 
 **设计底线**（与前面的 harness 适配器同一条）：框架回调体整段包在 try/except 里，任何异常不外泄；投递失败/超时/4xx 全部吞掉、不重试；默认守护线程异步投递，绝不阻塞回合；封闭集之外的事件类型与空标题在构造期就抛错。纪律文本 `yongyi_agent.DISCIPLINE` 与 TypeScript 侧逐字节一致（同一 golden 两侧钉住）。
 
-**已知边界**：LangChain 的 `on_chain_end` 每层 runnable 都触发，适配层只认顶层（`parent_run_id is None`）——不过滤会让一次 agent 运行落十几条 `turn_outcome`。LangChain 的回调管理器还会对**每个**事件调 handler 上的同名方法（真跑 1.7.6 实测：缺方法会被记成 callback 错误打进宿主日志），所以适配层把用不到的入口全部实现成空操作——不是凑数，是消除日志噪声。LlamaIndex 的 `QueryEndEvent` 未必出现在所有编排里（纯工具编排没有查询收尾），映射层不做「一定会有几次」的假设。
+**已知边界**：LangChain 的 `on_chain_end` 每层 runnable 都触发，适配层只认顶层（`parent_run_id is None`）——不过滤会让一次 agent 运行落十几条 `turn_outcome`。LangChain 的回调管理器还会对**每个**事件调 handler 上的同名方法（真跑 1.7.6 实测：缺方法会被记成 callback 错误打进宿主日志），所以适配层把用不到的入口全部实现成空操作——不是凑数，是消除日志噪声。CrewAI 的 `emit()` 把同步 handler 提交到线程池并返回 Future（不阻塞），所以回调体永远不在调用方线程上；适配层本就 fire-and-forget，不受影响，但自己写测试要等 `future.result()`。LlamaIndex 的 `QueryEndEvent` 未必出现在所有编排里（纯工具编排没有查询收尾），映射层不做「一定会有几次」的假设。
 
 ---
 

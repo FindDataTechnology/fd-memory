@@ -58,14 +58,18 @@ tools = await client.get_tools()
 ## CrewAI
 
 ```python
-from yongyi_agent.crewai import event_listener
+from yongyi_agent.crewai import event_listener, uninstall
 
 listener = event_listener()   # 必须持有这个返回值！
+# ...
+uninstall(listener)           # 停止捕获（已写下的记忆不动）
 ```
 
 **坑**：CrewAI 的监听器靠**实例化**注册——只是 import 模块不会生效。丢掉返回值不报错，但会静默失去捕获。
 
-映射：`ToolUsageFinishedEvent` → `tool_call`（`failure` 字段进 `metadata.outcome`）；`CrewKickoffCompletedEvent` / `CrewKickoffFailedEvent` → `turn_outcome`。
+映射：`ToolUsageFinishedEvent` → `tool_call`（`failure` 是 `ToolFailure` 对象，非空即 `metadata.outcome=error`）；`CrewKickoffCompletedEvent` / `CrewKickoffFailedEvent` → `turn_outcome`（`total_tokens`、`crew_name` 进 metadata）。
+
+两点实测事实（crewai 1.15.37）：①事件类经 `crewai.events` 的懒加载导出可取，不必记子模块路径；②`bus.emit()` 把同步 handler 提交到线程池并返回 Future，**不阻塞**——所以回调体永远不在调用方线程上，自己写测试时要 `future.result()` 等它。
 
 CrewAI 的 MCP 集成随版本演进，挂载形态以所装版本为准（需要的就是 HTTP transport MCP 客户端 + 自定义 `Authorization` 头）。
 
@@ -119,11 +123,11 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest -q
 ```
 
-68 项，全部无网络、不需要装任何框架（映射函数收鸭子类型事件，框架类型只在真正接线的入口出现）。
+72 项，全部无网络、不需要装任何框架（映射函数收鸭子类型事件，框架类型只在真正接线的入口出现）。
 
 ## 边界（如实标注）
 
 - **未发布到 PyPI**：包在本仓 `python/` 内可 `pip install -e` 安装使用；上 PyPI 需要发布凭据，属另行批准的步骤。
-- **实机验证到了哪一层**：LangChain 与 LlamaIndex 已在隔离环境里对着**真框架**跑过（`langchain-core 1.7.6` / `llama-index-core 0.14.25`，真实 `@tool` 调用、真实 `RunnableLambda` 链、真实 instrumentation 事件与分派器），投递面用桩 transport 捕获——也就是说「事件面形状 + 注册方式」已实证，**没有**跑真实 LLM 驱动的完整 agent 回合。这一步抓到两个缺陷（LangChain 缺事件入口会往宿主日志打 callback 错误；LlamaIndex 的 `CBEventType.TOOL` 在发布版根本不存在），回归测试已入仓。**CrewAI 尚未实机验证**（未安装），其监听器注册与事件字段以所装版本为准，尤其 MCP 客户端形态。
+- **实机验证到了哪一层**：三个框架都在隔离环境里对着**真框架**跑过——`langchain-core 1.7.6`（真实 `@tool` 调用、真实 `RunnableLambda` 链）、`llama-index-core 0.14.25`（真实 instrumentation 事件与分派器）、`crewai 1.15.37`（真实事件总线与事件对象）；投递面一律用桩 transport 捕获。也就是说「事件面形状 + 注册方式 + 注销」已实证，**没有**跑真实 LLM 驱动的完整 agent 回合。这条路上抓到三个缺陷，回归钉全部入仓：LangChain 缺事件入口会往宿主日志打 callback 错误；LlamaIndex 的 `CBEventType.TOOL` 在发布版根本不存在（捕获率为零）；CrewAI 的 `bus.off` 是两个位置参数、当装饰器工厂用会让「断开」静默失效。
 - 框架回调签名随版本演进；本包的容忍策略是「缺字段降级 + 异常全吞」，不会因为签名变化弄破宿主，但可能少上报一条观测。
 

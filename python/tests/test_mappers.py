@@ -111,6 +111,13 @@ class FakeCrewEvent:
 
 
 class FakeBus:
+    """按 CrewAI 1.15 真机核对的签名：`on(cls)` 是装饰器工厂，`off(cls, fn)` 是两个
+    位置参数。
+
+    这两者不对称是真实存在的——我最初把 `off` 也写成装饰器工厂，单测跟着我的假设
+    一起错，真机一跑才发现注销是静默空操作（off(cls) 抛 TypeError 被 except 吞）。
+    """
+
     def __init__(self):
         self.handlers = {}
 
@@ -121,11 +128,8 @@ class FakeBus:
 
         return register
 
-    def off(self, event_cls):
-        def unregister(fn):
-            self.handlers[event_cls].remove(fn)
-
-        return unregister
+    def off(self, event_cls, fn):
+        self.handlers.get(event_cls, []).remove(fn)
 
     def fire(self, event_cls, event):
         for fn in list(self.handlers.get(event_cls, [])):
@@ -189,6 +193,53 @@ def test_crewai_unregister_stops_capture(observer, transport):
     unregister()
     bus.fire(FakeEvents.ToolUsageFinishedEvent, FakeToolEvent())
     assert transport.calls == []
+
+
+def test_crewai_unregister_uses_two_positional_bus_off(observer):
+    """真机（crewai 1.15.37）的 `bus.off(event_type, handler)` 是两个位置参数，不是
+    `on()` 那样的装饰器工厂。写成 `off(cls)(handler)` 会抛 TypeError，而注销逻辑
+    里那个 except 会把它吞掉——「断开」因此变成静默空操作，捕获继续。"""
+    calls = []
+
+    class StrictBus(FakeBus):
+        def off(self, event_cls, fn):
+            calls.append((event_cls, fn))
+            super().off(event_cls, fn)
+
+    bus = StrictBus()
+    unregister = crewai_mod.register(observer, bus, events=FakeEvents)
+    unregister()
+    assert len(calls) == 3, "三个事件都要真的摘掉: %s" % (calls,)
+    assert all(bus.handlers[k] == [] for k in bus.handlers), "摘除后不应残留 handler: %s" % (bus.handlers,)
+
+
+def test_crewai_unregister_failure_does_not_break_host(observer):
+    """注销抛错也不许外泄——宿主退出流程不能被我们的清理逻辑弄挂。"""
+
+    class BrokenBus(FakeBus):
+        def off(self, event_cls, fn):
+            raise RuntimeError("bus is already gone")
+
+    bus = BrokenBus()
+    crewai_mod.register(observer, bus, events=FakeEvents)()
+
+
+def test_crewai_uninstall_public_entry_stops_capture(observer, transport):
+    """公开面：`uninstall(listener)` 摘掉监听器（真实监听器把注销函数存在 _unregister）。"""
+    bus = FakeBus()
+    unregister = crewai_mod.register(observer, bus, events=FakeEvents)
+
+    class FakeListener:
+        def __init__(self):
+            self._unregister = unregister  # 注意存实例属性：存类属性能变成绑定方法
+
+    crewai_mod.uninstall(FakeListener())
+    bus.fire(FakeEvents.ToolUsageFinishedEvent, FakeToolEvent())
+    assert transport.calls == []
+
+
+def test_crewai_uninstall_on_foreign_object_is_a_noop():
+    crewai_mod.uninstall(object())
 
 
 def test_crewai_listener_never_leaks_exceptions(observer):
