@@ -1,2 +1,10 @@
 node_modules/
 dist/
+
+# python adapter package
+python/.venv/
+python/**/__pycache__/
+python/**/*.egg-info/
+python/build/
+python/dist/
+.pytest_cache/

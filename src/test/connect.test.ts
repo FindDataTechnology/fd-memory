@@ -704,3 +704,18 @@ test("CLI: disconnect dify/coze on a never-connected machine is a clean no-op", 
   }
   assert.equal(existsSync(join(home, ".yongyi", "credentials.json")), false, "no credential file invented by disconnect");
 });
+
+// ── cross-language discipline pin (add-yongyi-connect-frameworks D4) ─────────
+// The Python adapter ships the same discipline text. Both sides compare against
+// the same fixture, which is generated from this single source — so a change on
+// either side turns the other side red until they agree again.
+
+test("discipline: platform text equals the cross-language golden the Python package ships", () => {
+  const goldenPath = join(repoRoot, "python", "tests", "goldens", "discipline-platform.txt");
+  const golden = readFileSync(goldenPath, "utf8");
+  assert.equal(
+    platformDisciplineText,
+    golden,
+    "python golden is stale — run `node scripts/emit-discipline-golden.mjs` after editing discipline-text.ts",
+  );
+});

@@ -1,6 +1,6 @@
 # 永忆接入指南（Harness Integration）
 
-面向把 AI harness（Claude Code、ZCode、任意 MCP 客户端、Dify 这类 UI 配置型 Agent 平台、自研 runner/网关）接入永忆的集成者。读完这篇你应当清楚：接入的三件套契约是什么、`/observe` 的完整 API 语义、每个适配器写了什么与断开时还原什么、客户端 SDK 提供什么，以及「换工具不换记忆」是如何被契约保证的。
+面向把 AI harness（Claude Code、ZCode、任意 MCP 客户端、Dify 这类 UI 配置型 Agent 平台、LangChain/CrewAI/LlamaIndex 这类代码级框架、自研 runner/网关）接入永忆的集成者。读完这篇你应当清楚：接入的三件套契约是什么、`/observe` 的完整 API 语义、每个适配器写了什么与断开时还原什么、客户端 SDK 提供什么，以及「换工具不换记忆」是如何被契约保证的。
 
 > 术语对齐：**u/** 人根 · **d/&lt;pack&gt;/&lt;member&gt;** 部署根 · **own/shared** 分区 · **L0–L3** 四层记忆 · **digest** 服务端渲染摘要块 · **蒸馏接替（supersede）** 旧结论退役、原文保留。
 >
@@ -160,6 +160,72 @@ yongyi disconnect coze
 ```
 
 coze 没有写入任何平台配置，所以断开只清本侧备料。
+
+### 3.6 框架（Python：LangChain / CrewAI / LlamaIndex）
+
+前三节都是「有配置文件」或「UI 配置」的宿主。代码级框架两样都没有，但它们**有事件面**——所以接入不再依赖 agent 自觉，捕获在适配层担保。三级谱系：
+
+| 级别 | 形态 | 记忆写入的保证 |
+| --- | --- | --- |
+| 平台担保 | 原生平台 | 平台在每个回合收尾自动落 L0，不依赖 agent |
+| 适配层担保 | 框架 handler（本节） | 框架每次工具调用/回合结束都回调，适配层自动上报 |
+| agent 自觉 | UI 型平台（Dify，§3.4） | 只有提示词纪律，agent 不写就没有 |
+
+```bash
+pip install "yongyi-agent[langchain]"   # 或 [crewai] / [llamaindex]
+```
+
+**身份**：适配层只消费凭据，不铸造、不改写——令牌按 `YONGYI_TOKEN`（旧名 `FD_MEMORY_TOKEN`）→ `~/.yongyi/credentials.json`（由 `yongyi connect` 写出，须 0600）解析。
+
+**映射表**（三个框架同一套语义）：
+
+| 框架 | 触发点 | 事件 |
+| --- | --- | --- |
+| LangChain | `on_tool_end` | `tool_call` |
+| LangChain | `on_agent_finish`；无 agent 时顶层 `on_chain_end` | `turn_outcome` |
+| CrewAI | `ToolUsageFinishedEvent` | `tool_call`（`failure` → `metadata.outcome`） |
+| CrewAI | `CrewKickoffCompletedEvent` / `CrewKickoffFailedEvent` | `turn_outcome` |
+| LlamaIndex | `on_event_end(CBEventType.TOOL)` | `tool_call` |
+| LlamaIndex | `on_event_end(CBEventType.AGENT_STEP)` | `turn_outcome` |
+
+接线：
+
+```python
+# LangChain
+from yongyi_agent.langchain import callback_handler
+graph.invoke(inputs, config={"callbacks": [callback_handler()]})
+
+# CrewAI —— 监听器必须实例化才注册，丢掉返回值会静默失去捕获
+from yongyi_agent.crewai import event_listener
+listener = event_listener()
+
+# LlamaIndex
+from llama_index.core.callbacks import CallbackManager
+from yongyi_agent.llamaindex import callback_handler
+Settings.callback_manager = CallbackManager([callback_handler()])
+```
+
+**MCP 挂载配方**（工具面本身仍走 MCP；令牌只给引用）：
+
+```python
+# langchain-mcp-adapters
+client = MultiServerMCPClient({"fd-memory": {
+    "url": "http://127.0.0.1:49375/mcp",
+    "transport": "http",
+    "headers": {"Authorization": "Bearer ${YONGYI_TOKEN}"},
+}})
+tools = await client.get_tools()
+
+# llama-index-tools-mcp
+client = BasicMCPClient("http://127.0.0.1:49375/mcp")
+tools = await McpToolSpec(client=client).to_tool_list_async()
+```
+
+CrewAI 的 MCP 集成随版本演进，挂载形态以所装版本为准（要的只是 HTTP transport MCP 客户端 + 自定义 `Authorization` 头）——本节不假装它有一个我们没验证过的固定 API。
+
+**设计底线**（与前面的 harness 适配器同一条）：框架回调体整段包在 try/except 里，任何异常不外泄；投递失败/超时/4xx 全部吞掉、不重试；默认守护线程异步投递，绝不阻塞回合；封闭集之外的事件类型与空标题在构造期就抛错。纪律文本 `yongyi_agent.DISCIPLINE` 与 TypeScript 侧逐字节一致（同一 golden 两侧钉住）。
+
+**已知边界**：LangChain 的 `on_chain_end` 每层 runnable 都触发，适配层只认顶层（`parent_run_id is None`）——不过滤会让一次 agent 运行落十几条 `turn_outcome`。LlamaIndex 的 `AGENT_STEP` 未必出现在所有编排里（纯 query engine 没有），映射层不做「一定会有几次」的假设。
 
 ---
 

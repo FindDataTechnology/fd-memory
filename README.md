@@ -153,6 +153,31 @@ yongyi connect coze --url http://localhost:49375 --as you@example.com
 
 现状结论：**coze-studio 开源版没有 MCP client 能力**，平台侧无法把外部 MCP 服务器挂成工具，因此没有可执行的接入路径（跟踪 issue 见 [coze-dev/coze-studio#7](https://github.com/coze-dev/coze-studio/issues/7)、[#2079](https://github.com/coze-dev/coze-studio/issues/2079)、[#628](https://github.com/coze-dev/coze-studio/issues/628)）。这条命令输出的是侦察结论与备料：端点、身份根、person 令牌都先备好并落到 0600 凭据文件，等平台支持时直接用同一套 URL + 请求头，无需重新铸身份。它**不输出接入步骤，也不宣称已支持**。
 
+### 框架（Python：LangChain / CrewAI / LlamaIndex）
+
+用代码写的 agent 框架没有配置文件可改，但它们**有事件面**——所以捕获能在适配层担保：
+
+```bash
+pip install "yongyi-agent[langchain]"   # 或 [crewai] / [llamaindex]
+```
+
+```python
+from yongyi_agent.langchain import callback_handler
+handler = callback_handler()            # 令牌按 YONGYI_TOKEN → ~/.yongyi/credentials.json 解析
+graph.invoke(inputs, config={"callbacks": [handler]})
+```
+
+工具调用与回合收尾自动上报到 `/observe`，不靠 agent 自觉写。核心包零第三方依赖（只用标准库），框架依赖走 extras；MCP 挂载配方（`langchain-mcp-adapters` / `llama-index-tools-mcp`）见 [python/README.md](python/README.md)。
+
+三级捕获担保谱系：
+
+| 级别 | 形态 | 保证 |
+| --- | --- | --- |
+| 平台担保 | 原生平台 | 平台每回合自动落 L0 |
+| 适配层担保 | 框架 handler | 框架事件驱动自动上报 |
+| agent 自觉 | UI 型平台（Dify） | 只有提示词纪律 |
+
+
 ### Portal（人面门户）
 
 服务进程自带 `/portal`：浏览器打开、粘贴 person 令牌即登录，无需任何额外安装。
