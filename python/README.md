@@ -141,7 +141,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 
 ## 边界（如实标注）
 
-- **已发布到 PyPI**（2026-11-08，0.1.0）：`pip install yongyi-agent` 直接装；本仓 `python/` 仍可 `pip install -e` 用于开发。版本发布走 `python -m build` + `twine upload`，发布凭据不进仓、用完即吊销。
+- **已发布到 PyPI**（0.1.1，2026-11-08）：`pip install yongyi-agent` 直接装；0.1.0 的 LlamaIndex 说明是错的（把 instrumentation 当现役路径），0.1.1 起为本文所写的行为；本仓 `python/` 仍可 `pip install -e` 用于开发。版本发布走 `python -m build` + `twine upload`，发布凭据不进仓、用完即吊销。
 - **实机验证到了哪一层**：三个框架都在隔离环境里对着**真框架**跑过——`langchain-core 1.7.6`、`llama-index-core 0.14.25`、`crewai 1.15.37`；投递面一律用桩 transport 捕获。三个框架**都还跑过真实 LLM 驱动的完整回合**（模型 `glm-5.3-flash`，走 OpenAI 兼容网关）：LangChain 的 react agent 产生 `tool_call`（`add` → 5）与恰好一条 `turn_outcome`；LlamaIndex 的 `FunctionAgent` 产生 `tool_call`（`multiply` → 42）与正文就是答案 `42` 的 `turn_outcome`；CrewAI 的 crew 产生 `tool_call`（`add` → 5）与 `turn_outcome`（`total_tokens` 1105）。这证的是「真回合里事件确实会发生」，比构造事件投递更强。
 - **这条路上抓到五个缺陷**，回归钉全部入仓：LangChain 缺事件入口会往宿主日志打 callback 错误；LlamaIndex 的 `CBEventType.TOOL` 在发布版根本不存在（捕获率为零）；**LlamaIndex 的 `AgentToolCallEvent` 同样有定义无发射点**（agent 工具调用零捕获，只能包调用点）；**`WorkflowRunOutputEvent.output` 是 200 字截断 repr**（推理模型的回合正文里没有答案）；CrewAI 的 `bus.off` 是两个位置参数、当装饰器工厂用会让「断开」静默失效。
 - 框架回调签名随版本演进；本包的容忍策略是「缺字段降级 + 异常全吞」，不会因为签名变化弄破宿主，但可能少上报一条观测。LlamaIndex 的工具级捕获因此不依赖框架事件面——那是它唯一不随版本漂移的接法。

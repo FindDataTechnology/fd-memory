@@ -175,7 +175,7 @@ coze 没有写入任何平台配置，所以断开只清本侧备料。
 pip install "yongyi-agent[langchain]"   # 或 [crewai] / [llamaindex]
 ```
 
-包已发布到 PyPI（0.1.0，2026-11-08）；本仓 `fd-memory/python/` 是它的真源。
+包已发布到 PyPI（0.1.1，2026-11-08）；本仓 `fd-memory/python/` 是它的真源。0.1.0 的 LlamaIndex 段是错的（把 instrumentation 当现役路径），请用 0.1.1 及以上。
 
 **身份**：适配层只消费凭据，不铸造、不改写——令牌按 `YONGYI_TOKEN`（旧名 `FD_MEMORY_TOKEN`）→ `~/.yongyi/credentials.json`（由 `yongyi connect` 写出，须 0600）解析。
 
