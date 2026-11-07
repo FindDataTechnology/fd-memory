@@ -282,11 +282,16 @@ export class Service {
     // platform-side L0 capture lane. Closed-set turn events land as observation
     // pages in the CALLER'S namespace — person → its u/ root's default
     // project; deployment → its own member partition; pod → the pack's shared
-    // partition (既有 own/shared 规则). Persistent (project, idempotency_key)
-    // dedupe replays the first page; per-token rate guard + 32KB body cap
-    // (truncation annotated in-page) keep a noisy harness from dragging the
-    // service. No queue — validate, land, answer, so capture never blocks a
-    // turn and never delays /digest, /pages or /mcp.
+    // partition (既有 own/shared 规则). A person token MAY steer the landing
+    // with an optional `project` field (add-observe-project-field): a root-
+    // internal NAME only, resolved inside the caller's own root — deployment/
+    // pod tokens ignore the field outright. Persistent (project,
+    // idempotency_key) dedupe replays the first page (claimed on the token's
+    // canonical partition, so a key stays root-global across projects);
+    // per-token rate guard + 32KB body cap (truncation annotated in-page) keep
+    // a noisy harness from dragging the service. No queue — validate, land,
+    // answer, so capture never blocks a turn and never delays /digest, /pages
+    // or /mcp.
     if (path === "/observe" && req.method === "POST") {
       if (scope.kind === "platform" || scope.kind === "runner") {
         res.writeHead(403, { "content-type": "application/json" });
@@ -308,17 +313,26 @@ export class Service {
         return void res.end(JSON.stringify({ error: parsed.error, code: parsed.code, ...(parsed.extra ?? {}) }));
       }
       // Namespace authority (spec: 不得静默改落他处): the landing partition is
-      // derived from the token family alone, never from the payload. The grant
-      // table is the last word — a token without rw on its landing namespace
-      // is a named 403.
-      const landingProject = namespaceParts(scope.namespace).project; // person→default, member→own, pod→shared
+      // derived from the token family alone, never from the payload — with ONE
+      // add-observe-project-field exception: a person token MAY steer its own
+      // landing to a root-internal project name (parse-side sanitized to a
+      // single in-root segment). Deployment/pod tokens ignore the field
+      // outright; their own/shared partitioning stays namespace-derived. The
+      // grant table is the last word — a token without rw on its landing
+      // namespace is a named 403, and the reachable set never leaves the
+      // caller's own root.
+      const nsProject = namespaceParts(scope.namespace).project; // person→default, member→own, pod→shared
+      const landingProject = scope.kind === "person" && parsed.event.project ? parsed.event.project : nsProject;
       const grantNs = scope.kind === "person" ? `${scope.namespace}/p/${landingProject}` : scope.namespace;
       if (!this.tokens.allows(scope.tokenId, grantNs, "rw")) {
         res.writeHead(403, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "forbidden", code: "forbidden" }));
       }
       const root = this.rootFor(scope);
-      const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs });
+      // Dedupe claims ride the token's canonical partition (nsProject), not the
+      // steered landing project — an idempotency key remains root-global, and
+      // the first delivery's page is what every replay gets back.
+      const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs }, nsProject);
       res.writeHead(202, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out.duplicate
         ? { page: out.page, duplicate: true }

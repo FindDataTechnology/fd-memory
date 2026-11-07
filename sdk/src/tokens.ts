@@ -62,11 +62,11 @@ export async function personTokenFor(
   return token;
 }
 
-// dsh-mcp-client 的加载行（http 分支），mcpEntry 形状逐字段保留。
+// DeepSeek Harness MCP 客户端的加载行（http 分支），mcpEntry 形状逐字段保留。
 export function memoryMcpEntry(url: string, token: string) {
   return {
     id: "mcp-fd-memory",
-    name: "@deepseek-ai/dsh-mcp-client",
+    name: "@deepseek-ai/dsh-mcp-client", // leak-check:allow 公开 npm 包名
     config: {
       serverName: "fd-memory",
       failOnStartupError: false,

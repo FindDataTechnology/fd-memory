@@ -1,11 +1,11 @@
 // ── mounts.ts · 挂载行与命名空间坐标（add-yongyi-complete-solution 后续补件）──
 //
-// 从壹座 agent-runner/memory-mount.js 逐字节移植（adopt-yongyi-client-sdk
-// 任务 0.1，paas 侧缺口审计裁定：命名空间坐标规则与 ACP/dsh 两种挂载行形状
+// 从旗舰平台运行器逐字节移植（adopt-yongyi-client-sdk
+// 任务 0.1，旗舰侧缺口审计裁定：命名空间坐标规则与 ACP/Harness 两种挂载行形状
 // 属通用件，随 SDK 下发）。纯 builder——不碰网络、不碰 manager，可独立测试。
 //
 // 两个挂载行形状：
-//   dsh  dsh-mcp-client loader 行（headers 为对象）——与 tokens.ts 的
+//   Harness  运行器 loader 行（headers 为对象）——与 tokens.ts 的
 //        memoryMcpEntry 同源，此处以别名导出保持 runner 侧函数名不漂
 //   acp  ACP SDK wire 行（headers 为 ARRAY of {name,value}——见 acpMcpServers）
 
@@ -30,7 +30,7 @@ export function podMemoryNamespace(packId: string | null | undefined): string | 
 export function dshMemoryMount(url: string, token: string | null | undefined) {
   return {
     id: "mcp-fd-memory",
-    name: "@deepseek-ai/dsh-mcp-client",
+    name: "@deepseek-ai/dsh-mcp-client", // leak-check:allow 公开 npm 包名
     config: {
       serverName: "fd-memory",
       failOnStartupError: false,

@@ -1,6 +1,6 @@
 // ── @finddatatechnology/yongyi-client · 出口面 ───────────────────────────────
 //
-// 永忆（fd-memory）客户端 SDK：把壹座与 agent-runner 里经过旗舰验证的接入件
+// 永忆（fd-memory）客户端 SDK：把旗舰平台与运行器里经过实战验证的接入件
 // 下放为独立发包。零运行时依赖——只用 Node 内置 fetch 打内核 HTTP 面
 // （/digest、/pages、/admin/mint、/observe），与服务端之间是网络契约，不是
 // 代码契约。
@@ -12,7 +12,7 @@
 //   tokens     person/deployment 令牌铸造 + 磁盘缓存 0600（自 cell-memory.js 移植）
 //   observe    /observe 上报客户端（幂等键、失败即丢）
 //   http       出站 fetch 死线包装（fetchImpl 测试缝、FetchTimeoutError）
-//   mounts     挂载行与命名空间坐标（dsh/acp 两形状，自 agent-runner/memory-mount.js 移植）
+//   mounts     挂载行与命名空间坐标（DeepSeek Harness / ACP 两形状，自运行器移植）
 
 export * from "./http.js";
 export * from "./discipline.js";

@@ -1,6 +1,6 @@
 {
   "name": "@finddatatechnology/yongyi-client",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "type": "module",
   "description": "永忆（YongYi / fd-memory）客户端 SDK：召回注入阶梯、纪律文本单源、五类事实捕获、令牌铸造缓存、/observe 上报。零运行时依赖，只以 fetch 打内核 HTTP 面。",
   "main": "./dist/index.js",

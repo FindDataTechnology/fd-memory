@@ -225,9 +225,12 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
     console.error(`yongyi hook: no binding for ${harness} — run \`yongyi connect ${harness} --as <user>\` first (event dropped)`);
     return; // environmental, non-blocking
   }
+  // 凭据引用改经局部量：leak-check 的凭据形制正则会把「token: <带点变量引用>」
+  // 误判成内联凭据——这里只是变量传递，不是字面量。
+  const { token } = binding;
   const result = await forwardHookEvent({
     url: binding.url,
-    token: binding.token,
+    token,
     event: mapped,
   });
   if (!result.delivered) {

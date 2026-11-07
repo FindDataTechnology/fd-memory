@@ -263,3 +263,118 @@ test("/observe: subject/ts/metadata pass-through — malformed shapes are named 
     assert.deepEqual(page.frontmatter.observe, { type: "tool_call", idempotency_key: "k4", ts: "2026-11-01T08:00:00Z" });
   } finally { await close(); }
 });
+
+// -- add-observe-project-field: optional `project` steering -------------------
+
+test("/observe: person project steering — event lands under the named root-internal project, /digest recalls it there, default lane byte-unchanged", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const r = await post(base, person, {
+      type: "turn_outcome", idempotency_key: "room-1", title: "房间纪要", body: "房间回合的捕获内容", project: "room-abc",
+    });
+    assert.equal(r.status, 202, "steered delivery still answers 2xx");
+    const d = (await r.json()) as { page: string; duplicate?: boolean };
+    assert.ok(d.page.startsWith("room-abc/observations/"), `page lands under the named project (got ${d.page})`);
+    const page = svc.rootForKey("u-alice").readPageByRel(d.page)!;
+    assert.ok(page, "page lives inside the caller's own root");
+    assert.equal(page.frontmatter.type, "observation");
+    assert.equal((page!.frontmatter.observe as Record<string, unknown>).idempotency_key, "room-1");
+
+    // spec scenario: digest recall under THAT project
+    const dg = await fetch(`${base}/digest?project=room-abc&q=房间`, { headers: json(person) });
+    assert.equal(dg.status, 200);
+    assert.ok(((await dg.json()) as { digest: string }).digest.includes("房间纪要"), "digest recalls the page in its project");
+
+    // the steered delivery touched nothing outside the named project
+    assert.equal(svc.rootForKey("u-alice").db.recentObservationPages("default", 50).length, 0, "default project untouched by the steered delivery");
+
+    // default lane byte-unchanged: absent project still lands default
+    const plain = await post(base, person, { type: "tool_call", idempotency_key: "plain-1", title: "缺省投递", body: "不带 project 字段" });
+    assert.equal(plain.status, 202);
+    assert.ok(((await plain.json()) as { page: string }).page.startsWith("default/observations/"), "absent project keeps the default lane");
+  } finally { await close(); }
+});
+
+test("/observe: project value is a root-internal NAME, never a path — separators flatten, dot-only falls back, other roots see zero writes", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const bob = svc.tokens.mint("person", "u/bob").token;
+
+    // a value that names another root flattens to an in-root project name
+    const steal = await post(base, bob, { type: "tool_call", idempotency_key: "x-1", title: "越根尝试", body: "点名别的根", project: "u/alice/p/steal" });
+    assert.equal(steal.status, 202);
+    const sd = (await steal.json()) as { page: string };
+    assert.ok(sd.page.startsWith("u-alice-p-steal/observations/"), `separator-carrying value flattens to an in-root name (got ${sd.page})`);
+    assert.ok(svc.rootForKey("u-bob").readPageByRel(sd.page), "page lives in the caller's own root");
+
+    // the named root holds ZERO writes anywhere (spec: 其它根零写入)
+    const alicePages = svc.rootForKey("u-alice").db.recentPages(100);
+    assert.equal(alicePages.length, 0, "no page of any project appeared in the named root");
+
+    // traversal shapes degrade safely: dot-only → default lane, mixed dots keep no separators
+    const dot = await post(base, bob, { type: "tool_call", idempotency_key: "x-2", title: "点号", body: "dot-only 值", project: ".." });
+    assert.equal(dot.status, 202);
+    assert.ok(((await dot.json()) as { page: string }).page.startsWith("default/observations/"), "dot-only value falls back to the default lane, never climbs out");
+    const climb = await post(base, bob, { type: "tool_call", idempotency_key: "x-3", title: "爬路径", body: "相对路径尝试", project: "../../outside" });
+    assert.equal(climb.status, 202);
+    const cd = ((await climb.json()) as { page: string }).page;
+    assert.ok(cd.startsWith("..-..-outside/observations/"), `separators flatten so the value cannot climb (got ${cd})`);
+    const climbSeg = cd.split("/")[0];
+    assert.ok(!/[\\/]/.test(climbSeg), "project segment holds no path separator — join stays inside the root");
+    assert.ok(svc.rootForKey("u-bob").readPageByRel(cd), "climbing value still lands inside the caller's root");
+
+    // malformed shapes are IGNORED (capture-degrading, never a 400): non-string and empty → default lane
+    for (const [label, project] of [["number", 42], ["empty", ""]] as Array<[string, unknown]>) {
+      const r = await post(base, bob, { type: "tool_call", idempotency_key: `x-${label}`, title: "坏形状", body: "非法形状的 project", project });
+      assert.equal(r.status, 202, `${label}-shaped project is ignored, not refused`);
+      assert.ok(((await r.json()) as { page: string }).page.startsWith("default/observations/"), `${label}-shaped project degrades to the default lane`);
+    }
+  } finally { await close(); }
+});
+
+test("/observe: deployment/pod tokens ignore the project field — own/shared partitioning unchanged, no steered partition appears", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const dep = svc.tokens.mint("deployment", "d/pk/agentA").token;
+    const r = await post(base, dep, { type: "turn_outcome", idempotency_key: "dp-1", title: "成员事件", body: "带 project 字段", project: "room-xyz" });
+    assert.equal(r.status, 202);
+    assert.ok(((await r.json()) as { page: string }).page.startsWith("agentA/observations/"), "member event still lands its OWN partition");
+
+    const pod = svc.tokens.mint("pod", "d/pk").token;
+    const rp = await post(base, pod, { type: "tool_call", idempotency_key: "dp-2", title: "pod 事件", body: "带 project 字段", project: "room-xyz" });
+    assert.equal(rp.status, 202);
+    assert.ok(((await rp.json()) as { page: string }).page.startsWith("shared/observations/"), "pod event still lands shared");
+
+    const packPages = svc.rootForKey("d-pk").db.recentPages(100);
+    assert.ok(packPages.every((p) => p.project !== "room-xyz"), "no steered partition was created anywhere in the pack root");
+  } finally { await close(); }
+});
+
+test("/observe: idempotency stays root-global across projects — same key in another project replays the FIRST page, never a second copy", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const first = await post(base, person, { type: "turn_outcome", idempotency_key: "g-1", title: "首次投递", body: "落在 room-a", project: "room-a" });
+    assert.equal(first.status, 202);
+    const p1 = ((await first.json()) as { page: string }).page;
+    assert.ok(p1.startsWith("room-a/observations/"));
+
+    // same key, different project: duplicate — the first delivery's page wins
+    const replay = await post(base, person, { type: "turn_outcome", idempotency_key: "g-1", title: "换房重放", body: "落在 room-b", project: "room-b" });
+    assert.equal(replay.status, 202, "replay is a 2xx");
+    const rd = (await replay.json()) as { page: string; duplicate: boolean };
+    assert.equal(rd.page, p1, "the first delivery's page id comes back");
+    assert.equal(rd.duplicate, true);
+
+    // same key, no project at all: still the same first page
+    const bare = await post(base, person, { type: "turn_outcome", idempotency_key: "g-1", title: "裸重放", body: "不带 project" });
+    assert.equal(bare.status, 202);
+    assert.equal(((await bare.json()) as { page: string; duplicate: boolean }).page, p1);
+
+    const root = svc.rootForKey("u-alice");
+    assert.equal(root.db.recentObservationPages("room-a", 50).length, 1, "room-a holds exactly the first page");
+    assert.equal(root.db.recentObservationPages("room-b", 50).length, 0, "room-b holds nothing — no per-project key fork");
+    assert.equal(root.db.recentObservationPages("default", 50).length, 0, "default holds nothing");
+  } finally { await close(); }
+});

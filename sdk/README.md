@@ -1,12 +1,12 @@
 # @finddatatechnology/yongyi-client
 
-永忆（YongYi / fd-memory）客户端 SDK：把壹座与 agent-runner 里经过旗舰验证的接入件下放为独立 npm 包，任何 harness 集成方与自有产品条线拿到同一套接入件，消灭跨仓漂移拷贝。
+永忆（YongYi / fd-memory）客户端 SDK：把经过旗舰平台（agent 工作台/运行器）实战验证的接入件下放为独立 npm 包，任何 harness 集成方拿到同一套接入件。
 
 **零运行时依赖**——只用 Node 内置 fetch 打永忆内核的 HTTP 面（`/digest`、`/pages`、`/admin/mint`、`/observe`），与内核之间是网络契约，不是代码契约。
 
 - 模块：`ladder`（注入阶梯）、`discipline`（纪律文本单源）、`facts`（五类事实捕获）、`tokens`（令牌铸造缓存）、`observe`（/observe 上报）、`http`（出站死线包装）。
 - 契约：降级开放——注入与捕获的任何失败都以缺席告终，绝不向宿主回合抛错；铸造失败则原样抛给调用方计数处理，绝不静默假装成功。
-- 字节同源：注入块与壹座现行输出逐字节一致（金样固化于 `test/goldens/`，由 paas 现役实现实跑产出）。
+- 字节同源：注入块与旗舰平台现行输出逐字节一致（金样固化于 `test/goldens/`，由现役实现实跑产出）。
 
 ```bash
 npm install @finddatatechnology/yongyi-client
@@ -42,7 +42,7 @@ if (cm) {
 
 ```js
 import { MEMORY_DISCIPLINE } from "@finddatatechnology/yongyi-client";
-personaSuffix += MEMORY_DISCIPLINE;  // 与壹座现行注入逐字节一致
+personaSuffix += MEMORY_DISCIPLINE;  // 与旗舰现行注入逐字节一致
 ```
 
 ## facts — 五类事实捕获
@@ -74,7 +74,7 @@ import { cellMemoryConfig, personTokenFor, memberTokenFor, memoryMcpEntry } from
 const cfg = cellMemoryConfig(env);          // 四件套缺一即 null（整体关闭）
 const person = await personTokenFor(cfg, "owner@example.com");   // 失败 → throw，调用方计数
 const member = await memberTokenFor(cfg, { packId: "fleet-9", memberId: "writer-a", ownerEmail: "owner@example.com" });
-const mcpEntry = memoryMcpEntry(cfg.url, person);                // dsh-mcp-client 加载行（http 分支）
+const mcpEntry = memoryMcpEntry(cfg.url, person);                // DeepSeek Harness MCP 客户端加载行（http 分支） // leak-check:allow
 ```
 
 ## observe — /observe 上报
@@ -94,11 +94,11 @@ observeFireAndForget({
 
 ## 挂载行形状（参照）
 
-dsh / ACP 载体的记忆挂载行形状（见 `paas/agent-runner/memory-mount.js` 的 `dshMemoryMount` / `acpMemoryMount`）：
+DeepSeek Harness / ACP 两类载体的记忆挂载行形状（`dshMemoryMount` / `acpMemoryMount`）：
 
 ```js
-// dsh：dsh-mcp-client 加载行
-{ id: "mcp-fd-memory", name: "@deepseek-ai/dsh-mcp-client",
+// DeepSeek Harness：mcp 客户端加载行
+{ id: "mcp-fd-memory", name: "@deepseek-ai/dsh-mcp-client", // leak-check:allow 公开 npm 包名
   config: { serverName: "fd-memory", failOnStartupError: false, transport: "streamable-http",
             url: "<url>/mcp", headers: { Authorization: "Bearer <token>" } } }
 // ACP：SDK wire 行（headers 为 {name,value} 数组）

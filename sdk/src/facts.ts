@@ -161,7 +161,7 @@ export interface FleetDigestSegment {
   block: string;
 }
 
-// 三段标签：壹座现行字符串，逐字节金样（test/goldens/fleet-digest-block.txt）。
+// 三段标签：旗舰现行字符串，逐字节金样（test/goldens/fleet-digest-block.txt）。
 export const FLEET_SEGMENT_LABELS: Record<FleetDigestSegment["source"], string> = {
   own: "本岗位记忆",
   shared: "团队记忆",

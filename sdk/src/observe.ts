@@ -31,6 +31,8 @@ export interface ObserveInput {
   /** 来源标注（跨 harness 合流，design D5）。 */
   harness?: string;
   metadata?: Record<string, unknown>;
+  /** 调用方 person 根内的目标 project（可选，缺省 default；只作根内名，不越根）。 */
+  project?: string;
   /** 有界超时（毫秒）；缺省 10s（PLATFORM_FETCH_TIMEOUT_MS 语义）。 */
   timeoutMs?: number;
   fetchImpl?: FetchLike;
@@ -64,6 +66,7 @@ function observePayload(input: ObserveInput): Record<string, unknown> {
   if (input.ts != null) payload.ts = input.ts;
   if (input.harness != null) payload.harness = input.harness;
   if (input.metadata != null) payload.metadata = input.metadata;
+  if (input.project != null) payload.project = input.project;
   return payload;
 }
 

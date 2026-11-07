@@ -1,5 +1,5 @@
-// 纪律文本单源测试：SDK 导出与金样 fixture 逐字节相等（fixture 由 paas
-// 现役实现实跑产出，即壹座现行注入的字节）。
+// 纪律文本单源测试：SDK 导出与金样 fixture 逐字节相等（fixture 由旗舰
+// 现役实现实跑产出，即旗舰现行注入的字节）。
 
 import { test } from "node:test";
 import assert from "node:assert/strict";

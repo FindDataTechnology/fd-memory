@@ -9,7 +9,7 @@
 // warn；记忆永不失败一个回合。返回块本身（记忆关闭/不可用时为空串），调用方
 // 拼装自己的 prompt 时追加的文本与聊天车道产出的完全一致。
 //
-// 字节同源纪律：标题标签与行组装字符串与壹座现行注入逐字节一致，金样固化在
+// 字节同源纪律：标题标签与行组装字符串与旗舰现行注入逐字节一致，金样固化在
 // test/goldens/（由 paas 现役实现实跑产出）。
 //
 // 环境参数化：壹座侧从 process.env 读的开关与默认（CELL_MEMORY_DIGEST*）在
@@ -67,7 +67,7 @@ export interface ClusterClientOptions {
   env?: EnvLike;
 }
 
-// 从壹座 cell 配置构建的客户端三面（clusterMemoryFor 的 faces 移植）。
+// 从 cell 配置构建的客户端三面（clusterMemoryFor 的 faces 移植）。
 export function createClusterMemoryClient(opts: ClusterClientOptions): ClusterMemoryClient {
   const { url, token } = opts;
   const fetchImpl = opts.fetchImpl ?? (fetch as FetchLike);
@@ -119,7 +119,7 @@ export function createClusterMemoryClient(opts: ClusterClientOptions): ClusterMe
   };
 }
 
-// 壹座位形的整体构建（clusterMemoryFor 移植）：返回客户端或 null（配置关 /
+// 旗舰位形的整体构建（clusterMemoryFor 移植）：返回客户端或 null（配置关 /
 // 无 owner / 铸造失败）。person 令牌与记忆挂载铸的是同一枚并缓存磁盘——每
 // owner 一铸，重启稳定。
 export async function clusterMemoryFor(
@@ -180,7 +180,7 @@ export async function digestLadder(
   return { block: "", source: "none" };
 }
 
-// 注入调用选项：壹座从 env 读的量全部参数化于此（env 字段保持 env 键语义）。
+// 注入调用选项：旗舰从 env 读的量全部参数化于此（env 字段保持 env 键语义）。
 export interface LadderCallOptions {
   /** 读取 CELL_MEMORY_* 键的环境对象；缺省 process.env。 */
   env?: EnvLike;
@@ -197,7 +197,7 @@ const ladderEnv = (env: EnvLike) => ({
   budget: Number(env.CELL_MEMORY_DIGEST_BUDGET ?? 1500) || 1500,
 });
 
-// 标题标签：壹座现行字符串，逐字节金样（test/goldens/*-titles-block.txt）。
+// 标题标签：旗舰现行字符串，逐字节金样（test/goldens/*-titles-block.txt）。
 export const CHAT_TITLES_LABEL = "【工作记忆】此前会话的沉淀，供参考：";
 export const CLUSTER_TITLES_LABEL = "【集群共享记忆】本集群此前回合的沉淀，供参考：";
 

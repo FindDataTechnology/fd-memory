@@ -168,11 +168,11 @@ test("cellMemoryConfig：四件套缺一即关；URL 去尾斜杠", () => {
   assert.equal(cellMemoryConfig(baseEnv("/data"))!.url, "http://memory.test", "尾斜杠剥离");
 });
 
-test("memoryMcpEntry：dsh 加载行逐字段（http 分支 verbatim）", () => {
+test("memoryMcpEntry：Harness 加载行逐字段（http 分支 verbatim）", () => {
   const row = memoryMcpEntry("http://memory.test", "tok");
   assert.deepEqual(row, {
     id: "mcp-fd-memory",
-    name: "@deepseek-ai/dsh-mcp-client",
+    name: "@deepseek-ai/dsh-mcp-client", // leak-check:allow 公开 npm 包名
     config: {
       serverName: "fd-memory",
       failOnStartupError: false,

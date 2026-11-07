@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import { StoreRoot, AuditIdentity, normalizeMetadata } from "./store.js";
+import { safeSegment } from "./auth.js";
 import { newPage } from "./okf.js";
 import { sanitize } from "./sanitize.js";
 
@@ -38,6 +39,10 @@ export interface NormalizedObserveEvent {
   ts?: string;
   harness?: string;
   metadata?: Record<string, unknown>;
+  // add-observe-project-field: caller-chosen ROOT-INTERNAL project name the
+  // event should land under (person tokens only — http.ts applies the token
+  // gate). Absent → the token's default lane. A NAME, never a path.
+  project?: string;
 }
 
 export type ObserveParseResult =
@@ -87,6 +92,20 @@ export function parseObserveEvent(raw: unknown): ObserveParseResult {
     }
     ts = s;
   }
+  // Optional project steering (add-observe-project-field): the caller MAY name
+  // the root-internal project the event lands in. The value is sanitized like
+  // /pages' project (trim → separators flattened → 128 cap) with auth.ts
+  // safeSegment's dot-only guard, so "." / ".." and any separator-carrying
+  // value degrade to a plain in-root NAME — the wire can never carry a path,
+  // let alone cross a root. Malformed shapes (non-string) and empty values are
+  // IGNORED, not refused: the field only steers a landing inside the caller's
+  // own root, so a bad value degrades to the default lane instead of failing
+  // the capture (spec: 照缺省归属).
+  let project: string | undefined;
+  if (typeof b.project === "string") {
+    const p = safeSegment(b.project);
+    if (p) project = p;
+  }
   const meta = normalizeMetadata(b.metadata);
   if (meta === null) {
     return { ok: false, status: 400, error: "invalid_metadata", code: "invalid_metadata", extra: { reason: "metadata must be an object of scalar/array-of-scalar values" } };
@@ -102,6 +121,7 @@ export function parseObserveEvent(raw: unknown): ObserveParseResult {
       ...(ts ? { ts } : {}),
       ...(harness ? { harness: sanitize(harness) } : {}),
       ...(meta && Object.keys(meta).length ? { metadata: meta } : {}),
+      ...(project ? { project } : {}),
     },
   };
 }
@@ -127,11 +147,16 @@ export interface ObserveLanding {
 // L0 derives from the page type, no new storage concept). Idempotency is
 // PERSISTENT: a per-root (project, idempotency_key) claim table returns the
 // first delivery's page on any replay — restart-safe, no in-memory set.
+// `dedupeProject` (add-observe-project-field, purely additive) lets the caller
+// pin the claim lane INDEPENDENT of the landing project: the person lane claims
+// under its token's canonical partition, so an idempotency key stays
+// root-global even when deliveries steer different projects — the replay
+// returns the FIRST delivery's page, never a second copy under a new name.
 // Landing is fully synchronous: no queue between validate and answer.
-export function landObserveEvent(root: StoreRoot, project: string, ev: NormalizedObserveEvent, audit?: AuditIdentity): ObserveLanding {
+export function landObserveEvent(root: StoreRoot, project: string, ev: NormalizedObserveEvent, audit?: AuditIdentity, dedupeProject?: string): ObserveLanding {
   const slug = randomUUID().slice(0, 8);
   const rel = `${project}/observations/${slug}.md`;
-  const claim = root.db.claimObserveEvent(project, ev.idempotencyKey, rel, new Date().toISOString());
+  const claim = root.db.claimObserveEvent(dedupeProject ?? project, ev.idempotencyKey, rel, new Date().toISOString());
   if (!claim.first && claim.page_rel) {
     return { page: claim.page_rel, duplicate: true, truncated: false };
   }

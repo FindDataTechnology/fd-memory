@@ -81,7 +81,7 @@ export function fetchWithTimeout(
   const timeoutMs = Number.isFinite(opts.timeoutMs) && opts.timeoutMs! > 0
     ? opts.timeoutMs!
     : platformFetchTimeoutMs(opts.env);
-  // 壹座原样：URL 对象上没有 .url 字段，错误消息里的地址回退为空串。
+  // 旗舰原样：URL 对象上没有 .url 字段，错误消息里的地址回退为空串。
   const url = typeof input === "string" ? input : ((input as any)?.url ?? "");
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(new FetchTimeoutError(timeoutMs, url)), timeoutMs);

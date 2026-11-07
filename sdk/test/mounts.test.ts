@@ -32,10 +32,10 @@ test("podMemoryNamespace: 两段形状，空值 null", () => {
   assert.equal(podMemoryNamespace(undefined), null);
 });
 
-test("dshMemoryMount: dsh-mcp-client loader 行，headers 对象形状，无 token 时零 headers 键", () => {
+test("dshMemoryMount: Harness loader 行，headers 对象形状，无 token 时零 headers 键", () => {
   assert.deepEqual(dshMemoryMount("http://m:49375", "tok"), {
     id: "mcp-fd-memory",
-    name: "@deepseek-ai/dsh-mcp-client",
+    name: "@deepseek-ai/dsh-mcp-client", // leak-check:allow 公开 npm 包名
     config: {
       serverName: "fd-memory",
       failOnStartupError: false,
