@@ -1,6 +1,8 @@
 # fd-memory-distiller HTTP face: POST /distill (fd-memory is the only caller,
 # DISTILLER_SHARED_TOKEN bearer) + GET /healthz. stdlib only — no web framework
-# between the contract and the engine.
+# between the contract and the engine. Fails closed: no shared token in the
+# environment means the process exits instead of serving an open port; binds
+# 127.0.0.1 unless DISTILLER_BIND names another interface.
 
 import asyncio
 import json
@@ -44,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
         auth = self.headers.get("authorization", "")
-        if expected and auth != f"Bearer {expected}":
+        if not expected or auth != f"Bearer {expected}":
             self._json(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("content-length", 0))
@@ -66,7 +68,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_tag(self):
         expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
-        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+        if not expected or self.headers.get("authorization", "") != f"Bearer {expected}":
             self._json(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("content-length", 0))
@@ -97,7 +99,7 @@ class Handler(BaseHTTPRequestHandler):
         # /tag — shared token, recorder accounting, failures come back as a
         # structured 200 (never a 500 the scheduler has to guess about).
         expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
-        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+        if not expected or self.headers.get("authorization", "") != f"Bearer {expected}":
             self._json(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("content-length", 0))
@@ -125,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_embed(self):
         expected = os.environ.get("DISTILLER_SHARED_TOKEN", "")
-        if expected and self.headers.get("authorization", "") != f"Bearer {expected}":
+        if not expected or self.headers.get("authorization", "") != f"Bearer {expected}":
             self._json(401, {"error": "unauthorized"})
             return
         length = int(self.headers.get("content-length", 0))
@@ -183,10 +185,14 @@ def load_provider_env():
 
 
 def main():
+    if not os.environ.get("DISTILLER_SHARED_TOKEN"):
+        print("[fd-memory-distiller] DISTILLER_SHARED_TOKEN is not set — refusing to serve", file=sys.stderr, flush=True)
+        sys.exit(1)
     load_provider_env()
+    host = os.environ.get("DISTILLER_BIND", "127.0.0.1")
     port = int(os.environ.get("DISTILLER_PORT", "8100"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print(f"[fd-memory-distiller] listening on 0.0.0.0:{port} engine={engine.ENGINE}", flush=True)
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"[fd-memory-distiller] listening on {host}:{port} engine={engine.ENGINE}", flush=True)
     server.serve_forever()
 
 
