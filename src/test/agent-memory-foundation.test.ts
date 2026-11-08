@@ -300,6 +300,35 @@ test("overview: deployment member sees own+shared only; pod sees shared only; pe
   } finally { await close(); }
 });
 
+test("overview: both dimensions capped, and truncated tells the truth", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const personTok = svc.tokens.mint("person", "u/bulk").token;
+    const root = svc.rootForKey("u-bulk");
+    // 40 partitions (over the 25 cap), the first holding 20 pages (over the 3
+    // titles shown). The old guard (`partitions.length >= 50`) would have said
+    // truncated=false while shipping all of it.
+    root.writePage("p00", "notes", "a", { frontmatter: { type: "note", title: "t" }, body: "b\n" });
+    for (let i = 0; i < 20; i++) root.writePage("p00", "notes", `n${i}`, { frontmatter: { type: "note", title: `t${i}` }, body: "b\n" });
+    for (let p = 1; p < 40; p++) root.writePage(`p${String(p).padStart(2, "0")}`, "notes", "x", { frontmatter: { type: "note", title: "x" }, body: "b\n" });
+    const call = await mcpSession(base, personTok);
+    const out = await call("memory_overview", {});
+    assert.equal(out.partitions.length, 25, "partition page is capped");
+    assert.equal(out.total_partitions, 40, "the real count is stated");
+    assert.equal(out.truncated, true, "and the page says it is a page");
+    for (const p of out.partitions) assert.ok(p.recent.length <= 3, `${p.project} listed ${p.recent.length} titles`);
+
+    // A single partition with more pages than titles is ALSO truncated even
+    // though the partition count fits.
+    const root2 = svc.rootForKey("u-small");
+    const t2 = svc.tokens.mint("person", "u/small").token;
+    for (let i = 0; i < 9; i++) root2.writePage("only", "notes", `k${i}`, { frontmatter: { type: "note", title: `k${i}` }, body: "b\n" });
+    const out2 = await (await mcpSession(base, t2))("memory_overview", {});
+    assert.equal(out2.partitions.length, 1);
+    assert.equal(out2.truncated, true, "9 pages behind 3 titles is truncation, not a complete view");
+  } finally { await close(); }
+});
+
 // ── normalizeMetadata unit shape ─────────────────────────────────────────────
 
 test("normalizeMetadata: absent vs invalid vs valid", () => {

@@ -133,6 +133,11 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
   // page deliberately. Both are stated to the caller via total/truncated.
   const HANDOFF_LIST_LIMIT = 20;
   const HANDOFF_LIST_MAX = 100;
+  // Overview caps (fix-memory-overview-cost): a person root can hold hundreds of
+  // partitions; listing every one with ten titles is a bulk export wearing an
+  // overview's name.
+  const OVERVIEW_PARTITIONS = 25;
+  const OVERVIEW_TITLES = 3;
 
   const targetProps = { target: TARGET_SCHEMA };
 
@@ -381,10 +386,23 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     },
     {
       name: "memory_overview",
-      description: "A self-awareness snapshot of YOUR memory: which partitions your grants can reach, how many pages each holds, and the most recent titles. Read-only, hard-capped, never crosses into partitions you cannot reach.",
-      inputSchema: { type: "object", properties: { recent: { type: "number", description: "Recent titles per partition (default 5, cap 10)." } } },
+      description:
+        "A self-awareness snapshot of YOUR memory: which partitions your grants can reach, how many pages each holds, and the most recent titles. " +
+        `Read-only, hard-capped (${OVERVIEW_PARTITIONS} partitions, ${OVERVIEW_TITLES} recent titles each) — it is a compass, not a bulk export. ` +
+        "total_partitions / truncated say whether anything was left out.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          recent: { type: "number", description: `Recent titles per partition (default ${OVERVIEW_TITLES}, cap ${OVERVIEW_TITLES}).` },
+        },
+      },
       handler: (args) => {
-        const recent = Math.min(10, Math.max(1, Number(args.recent ?? 5) || 5));
+        // Cap the page, not just the partition count (fix-memory-overview-cost):
+        // the old guard was `truncated: partitions.length >= 50`, so a root with
+        // 40 partitions × 10 titles each reported truncated=false while shipping
+        // megabytes — measured at 2.2MB on the deployment. Both dimensions are
+        // now bounded and both are stated.
+        const recent = Math.min(OVERVIEW_TITLES, Math.max(1, Number(args.recent ?? OVERVIEW_TITLES) || OVERVIEW_TITLES));
         // Same source of truth as the read faces: readProjects' union for
         // deploy tokens, the whole root for persons (their grant covers it),
         // shared-only for pods. Oversight partitions ride separately, tagged.
@@ -406,11 +424,18 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
             };
           });
         }
+        const total = partitions.length;
+        const shown = partitions.slice(0, OVERVIEW_PARTITIONS);
         return text({
           kind: scope.kind,
-          partitions,
-          // Total volume guard: the overview is a compass, not a bulk export.
-          truncated: partitions.length >= 50,
+          partitions: shown,
+          total_partitions: total,
+          // Honest on BOTH dimensions: more partitions than the cap, or any
+          // partition whose title list was itself clipped.
+          // A partition with 100 pages and 3 listed titles IS truncated — the
+          // old rule only looked at the partition count and called that page
+          // complete.
+          truncated: total > shown.length || shown.some((p) => p.pages > p.recent.length),
         });
       },
     },
