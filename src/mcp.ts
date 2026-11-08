@@ -128,6 +128,12 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     return { error: err("invalid_target", { target: t }) };
   }
 
+  // Handoff-list page size (fix-memory-handoff-list-cost): the default keeps a
+  // routine turn's "anything for me?" check cheap; the ceiling lets a caller
+  // page deliberately. Both are stated to the caller via total/truncated.
+  const HANDOFF_LIST_LIMIT = 20;
+  const HANDOFF_LIST_MAX = 100;
+
   const targetProps = { target: TARGET_SCHEMA };
 
   // Structured read filter (add-agent-memory-foundation): optional `filter`
@@ -199,13 +205,46 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     },
     {
       name: "memory_handoff_list",
-      description: "List open handoffs — default across your accessible partitions, each tagged with its source.",
-      inputSchema: { type: "object", properties: { ...targetProps } },
+      // Cap + projection (fix-memory-handoff-list-cost): this tool is called at
+      // the START of most turns (the discipline tells agents to), and it used to
+      // return EVERY open handoff with every column — 10.6MB across one cell's
+      // traces, the single largest tool result on the deployment, and a direct
+      // contributor to the context-compaction storms that burn a fleet round's
+      // whole budget. The list is for DECIDING whether a handoff is yours, so it
+      // carries the decision fields newest-first and says how many it left out;
+      // the body (open_questions / next_steps / files_touched) is fetched by
+      // memory_handoff_accept on the one the agent actually claims.
+      description:
+        "List open handoffs (newest first, capped) — default across your accessible partitions, each tagged with its source. " +
+        "Returns id/summary/to_agent/from_agent/created_at plus total + truncated; claim one with memory_handoff_accept to get its full body.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          ...targetProps,
+          limit: { type: "number", description: `Max handoffs to return (default ${HANDOFF_LIST_LIMIT}, max ${HANDOFF_LIST_MAX}).` },
+        },
+      },
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
-        const rows = root.db.openHandoffs(r.projects).map((row) => ({ ...row, source: sourceOf(row.project) }));
-        return text({ handoffs: rows });
+        const requested = Number(args.limit);
+        const cap = Number.isFinite(requested) && requested > 0 ? Math.min(Math.floor(requested), HANDOFF_LIST_MAX) : HANDOFF_LIST_LIMIT;
+        // Newest first is the useful order for "is one addressed to me, and how
+        // recent is it" — the old query sorted ascending and the caller read the
+        // whole list anyway.
+        const all = root.db.openHandoffs(r.projects)
+          .slice()
+          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+        const handoffs = all.slice(0, cap).map((row) => ({
+          id: row.id,
+          summary: row.summary,
+          from_agent: row.from_agent,
+          to_agent: row.to_agent ?? null,
+          project: row.project,
+          created_at: row.created_at,
+          source: sourceOf(row.project),
+        }));
+        return text({ handoffs, total: all.length, truncated: all.length > handoffs.length });
       },
     },
     {

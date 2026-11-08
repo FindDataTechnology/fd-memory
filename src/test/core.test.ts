@@ -702,3 +702,44 @@ test("migrate-v2: moves wiki verbatim, carries observations/handoffs, keeps back
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("mcp tools: handoff list is capped, newest-first, and says what it left out", () => {
+  const data = tmpData();
+  try {
+    const a = memberTools(data, "d/p/handoffs");
+    const call = a.call;
+    const tools = buildTools(a.scope, a.root, { allows: () => true });
+    const schema = tools.find((t) => t.name === "memory_handoff_list")!.inputSchema as {
+      properties: Record<string, { description?: string }>;
+    };
+    assert.ok(schema.properties.limit, "the page size is caller-settable");
+
+    // 30 open handoffs, oldest first in the store — the list must answer with
+    // the NEWEST page and say how many it did not show.
+    const ids: string[] = [];
+    for (let i = 0; i < 30; i++) ids.push(call("memory_handoff_begin", { summary: `s${i}`, next_steps: ["n"] }).body.handoff_id);
+    const page = call("memory_handoff_list", {});
+    assert.equal(page.body.handoffs.length, 20, "default page");
+    assert.equal(page.body.total, 30);
+    assert.equal(page.body.truncated, true);
+    assert.equal(page.body.handoffs[0].id, ids[29], "newest first");
+
+    // The decision fields ride; the body does not (that is what claiming is for).
+    const row = page.body.handoffs[0];
+    for (const k of ["id", "summary", "from_agent", "to_agent", "project", "created_at", "source"]) assert.ok(k in row, k);
+    for (const k of ["open_questions", "next_steps", "files_touched"]) assert.equal(row[k], undefined, `${k} must not ride the list`);
+
+    // Claiming still returns the full body.
+    const claimed = call("memory_handoff_accept", { handoff_id: ids[29], agent: "zcode" });
+    assert.equal(claimed.body.status, "claimed");
+    assert.ok("next_steps" in claimed.body.handoff);
+
+    // Paging: a larger limit reaches everything; over-max is clamped.
+    assert.equal(call("memory_handoff_list", { limit: 25 }).body.handoffs.length, 25);
+    const capped = call("memory_handoff_list", { limit: 9999 });
+    assert.equal(capped.body.handoffs.length, 29, "29 still open after the claim, clamped at the ceiling");
+    assert.equal(capped.body.truncated, false);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
