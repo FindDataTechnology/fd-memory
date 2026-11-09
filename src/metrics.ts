@@ -18,6 +18,12 @@ const digestRungs = { vector: 0, keyword: 0, cooling: 0, empty: 0 };
 const embedSamples: EmbedSample[] = [];
 const EMBED_SAMPLE_CAP = 200;
 const distills = { runs: 0, pages: 0, tokens: 0, failures: 0, lastError: "" as string };
+// Per-run samples (optimize-yongyi-read-surfaces 7.1). The cost knobs that
+// matter — how many items a run swallowed, how many engine calls that took,
+// what it billed — were only visible as cumulative counters, which cannot
+// answer "is one run doing 120 calls?" or "did a chunk split get worse".
+// Bounded ring so a long-lived process does not accumulate a history.
+const DISTILL_SAMPLE_MAX = 200;
 // Embedding-model consistency (2026-10-28): the vector space is only valid
 // while every stored vector and every query embedding come from ONE model.
 // These counters make drift observable from a single /admin/metrics read.
@@ -115,15 +121,64 @@ export function sampleVectorsScale(perRootCounts: number[]): void {
   vectorsScaleSample = { roots: live.length, total, max_root: max, over_threshold: max > t.max_per_root || total > t.total, threshold: t };
 }
 
-export function noteDistill(ok: boolean, pages: number, tokens: number, error?: string): void {
+const distillSamples: Array<{ items: number; calls: number; tokens: number; pages: number }> = [];
+
+export function noteDistill(
+  ok: boolean,
+  pages: number,
+  tokens: number,
+  error?: string,
+  extra?: { items?: number; calls?: number },
+): void {
   if (ok) {
     distills.runs += 1;
     distills.pages += pages;
     distills.tokens += tokens;
+    distillSamples.push({
+      items: Math.max(0, Math.floor(Number(extra?.items ?? 0)) || 0),
+      calls: Math.max(0, Math.floor(Number(extra?.calls ?? 0)) || 0),
+      tokens: Math.max(0, Number(tokens) || 0),
+      pages,
+    });
+    if (distillSamples.length > DISTILL_SAMPLE_MAX) distillSamples.shift();
   } else {
     distills.failures += 1;
     if (error) distills.lastError = String(error).slice(0, 300);
   }
+}
+
+function distillDistribution(): {
+  samples: number;
+  items: { total: number; mean: number; max: number };
+  calls: { total: number; mean: number; max: number };
+  tokens: { total: number; mean: number; p50: number | null; p90: number | null; max: number };
+  last: { items: number; calls: number; tokens: number; pages: number } | null;
+} {
+  const n = distillSamples.length;
+  const last = n ? distillSamples[n - 1] : null;
+  if (!n) {
+    const zero = { total: 0, mean: 0, max: 0 };
+    return { samples: 0, items: zero, calls: zero, tokens: { ...zero, p50: null, p90: null }, last };
+  }
+  const sum = (pick: (x: (typeof distillSamples)[number]) => number) => distillSamples.reduce((a, x) => a + pick(x), 0);
+  const maxOf = (pick: (x: (typeof distillSamples)[number]) => number) => Math.max(...distillSamples.map(pick));
+  const tok = distillSamples.map((x) => x.tokens).sort((a, b) => a - b);
+  const itemsTotal = sum((x) => x.items);
+  const callsTotal = sum((x) => x.calls);
+  const tokensTotal = sum((x) => x.tokens);
+  return {
+    samples: n,
+    items: { total: itemsTotal, mean: Number((itemsTotal / n).toFixed(1)), max: maxOf((x) => x.items) },
+    calls: { total: callsTotal, mean: Number((callsTotal / n).toFixed(1)), max: maxOf((x) => x.calls) },
+    tokens: {
+      total: tokensTotal,
+      mean: Math.round(tokensTotal / n),
+      p50: quantile(tok, 50),
+      p90: quantile(tok, 90),
+      max: maxOf((x) => x.tokens),
+    },
+    last,
+  };
 }
 
 function quantile(sorted: number[], p: number): number | null {
@@ -159,7 +214,15 @@ export function metricsSnapshot(): Record<string, unknown> {
       ms_max: oks.length ? oks[oks.length - 1] : null,
       failure_reasons: reasons,
     },
-    distill: { runs: distills.runs, pages: distills.pages, tokens: distills.tokens, failures: distills.failures, last_error: distills.lastError },
+    distill: {
+      runs: distills.runs,
+      pages: distills.pages,
+      tokens: distills.tokens,
+      failures: distills.failures,
+      last_error: distills.lastError,
+      // Distribution over the last DISTILL_SAMPLE_MAX successful runs.
+      recent: distillDistribution(),
+    },
     promotion: { ...promotion },
     meta_filter_queries: metaFilterQueries,
     vectors: { ...vectors },
@@ -185,6 +248,7 @@ export function __resetMetrics(): void {
   distills.tokens = 0;
   distills.failures = 0;
   distills.lastError = "";
+  distillSamples.length = 0;
   vectors.mismatch_excluded = 0;
   vectors.writes_rejected = 0;
   vectors.writes_allowed = 0;

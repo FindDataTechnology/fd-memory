@@ -88,6 +88,26 @@ curl "http://127.0.0.1:4000/digest?project=default&q=%E5%91%A8%E6%8A%A5" \
 | `memory_handoff_list / accept / cancel` | 列/认领/取消交接             |
 | `memory_query`                     | 全页型 FTS 搜索（note 与 L2 均可查）   |
 | `memory_recent`                    | 新近页列表                        |
+| `memory_read_page` / `memory_overview` | 单页正文（超长按字节分页）/ 分区概览 |
+| `memory_handoff_accept / cancel`   | 认领（带完整正文，逐字段自证截断）/ 取消 |
+
+**读面都有上限，且截断会自证。** 每个工具声明自己的上限，被截断时回带 `truncated`
+与总量（正文型还回 `next_offset`），不会把截断的返回显示成完整：
+
+| 读面 | 上限 | 自证字段 |
+|---|---|---|
+| `memory_query` / `memory_recent` | 条数 `[1, 50]`，默认 20 | `total` / `truncated` |
+| `memory_read_page` | 单次正文 32 KiB（默认与上限同值） | `truncated` / `total_bytes` / `next_offset` |
+| `memory_handoff_list` | 20 条（可到 100），单行 summary 200 字 | `truncated` / `truncated_summaries` |
+| `memory_handoff_accept` | summary 4 KiB、列表 20×500 字、文件 200 项 | `truncated_fields` |
+| `memory_overview` | 25 个分区 × 每个 3 个标题 | `truncated` / `total_partitions` |
+| `/memory/promotions` | 跨分区合计 100 条 | `total` / `truncated` / `total_partitions` |
+
+全部可用环境变量覆盖（如 `FD_MEMORY_LIST_LIMIT_MAX`、`FD_MEMORY_HANDOFF_SUMMARY_CHARS`、
+`FD_MEMORY_READ_BODY_MAX_BYTES`），默认值即上表。
+
+**退役页只有一个判定。** 被更新的页通过 `supersedes` 取代的旧页不出现在任何读面
+（检索、新近、正文、概览）；需要看历史时显式传 `include_superseded: true`。
 
 ## 接入（Integration）
 

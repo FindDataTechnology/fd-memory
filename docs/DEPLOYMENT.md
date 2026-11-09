@@ -240,9 +240,19 @@ node scripts/reembed.mjs --data /var/lib/fdmm   # 或删 db/ 让首启重建（�
 ## 9. 升级与回滚
 
 1. 镜像/代码打版本标签，升级 = 换 tag + 滚动重启；
-2. 升级前跑 `npm test`（70+ 单元）；改了评测场景集要记 `scenes_version`，新旧基线不可混比；
+2. 升级前跑 `npm test`（190+ 单元）；改了评测场景集要记 `scenes_version`，新旧基线不可混比；
 3. schema 有破坏性变更时仓内会带迁移脚本（`src/scripts/`），升级顺序=先备份再迁移；
+   自 0.2.x 起有两个**派生**结构会在打开库时自动补：`pages.page_id`（页 id 镜像，用于
+   退役判定）与 `superseded_edges`（退役边表）。两者都可由 `POST /admin/reindex` 重建，
+   不承载真源；reindex 结束会自检边数，不一致直接 500 而不是继续服务。
 4. 回滚 = 退回上一 tag；派生 SQLite 与真源 markdown 分离，旧版读新真源不损坏。
+5. **读面上限可用环境变量调整**，不需要重发版：
+   `FD_MEMORY_LIST_LIMIT` / `FD_MEMORY_LIST_LIMIT_MAX`（query、recent 条数）、
+   `FD_MEMORY_HANDOFF_SUMMARY_CHARS`（列表单行摘要字数）、
+   `FD_MEMORY_READ_BODY_MAX_BYTES`（单次读取正文字节）、
+   `FD_MEMORY_ACCEPT_SUMMARY_CHARS` / `FD_MEMORY_ACCEPT_LIST_ITEMS`（认领面字段上限）、
+   `FD_MEMORY_PROMOTIONS_MAX`（晋升队列跨分区总量）。
+   放宽即回到「吐更多」，收紧则是给上下文预算设闸；默认值见 README 的读面表。
 
 ## 10. 令牌自举（全新实例第一次铸造）
 

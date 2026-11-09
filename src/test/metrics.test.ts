@@ -78,3 +78,40 @@ test("blank-query rung does not dilute vector_ratio", () => {
   assert.equal(m.digest.total, 3, "empty must not enter the denominator");
   assert.equal(m.digest.vector_ratio, 0.667, "ratio reflects only real rung traffic");
 });
+
+test("distill metrics: per-run items/calls/tokens distribution, not just cumulative counters (7.1)", async () => {
+  const { noteDistill, metricsSnapshot, __resetMetrics } = await import("../metrics.js");
+  __resetMetrics();
+  const empty = metricsSnapshot().distill as { recent: { samples: number; tokens: { p50: number | null } } };
+  assert.equal(empty.recent.samples, 0, "no samples before any run");
+  assert.equal(empty.recent.tokens.p50, null, "empty distribution reports null, not 0");
+
+  noteDistill(true, 2, 1300, undefined, { items: 4, calls: 2 });
+  noteDistill(true, 1, 900, undefined, { items: 2, calls: 1 });
+  noteDistill(true, 3, 2600, undefined, { items: 6, calls: 3 });
+  const d = metricsSnapshot().distill as {
+    runs: number;
+    recent: {
+      samples: number;
+      items: { total: number; mean: number; max: number };
+      calls: { total: number; mean: number; max: number };
+      tokens: { total: number; mean: number; p50: number | null; p90: number | null; max: number };
+      last: { items: number; calls: number; tokens: number; pages: number };
+    };
+  };
+  assert.equal(d.runs, 3);
+  assert.equal(d.recent.samples, 3);
+  assert.deepEqual(d.recent.items, { total: 12, mean: 4, max: 6 });
+  assert.deepEqual(d.recent.calls, { total: 6, mean: 2, max: 3 });
+  assert.equal(d.recent.tokens.total, 4800);
+  assert.equal(d.recent.tokens.mean, 1600);
+  assert.equal(d.recent.tokens.max, 2600);
+  assert.ok(d.recent.tokens.p50 !== null && d.recent.tokens.p90 !== null, "quantiles are present");
+  assert.deepEqual(d.recent.last, { items: 6, calls: 3, tokens: 2600, pages: 3 });
+
+  // Failures must not enter the distribution: a failed run has no cost profile.
+  noteDistill(false, 0, 0, "boom");
+  const after = metricsSnapshot().distill as { failures: number; recent: { samples: number } };
+  assert.equal(after.failures, 1);
+  assert.equal(after.recent.samples, 3, "a failure is not a sample");
+});
