@@ -499,3 +499,33 @@ test("/digest L1: harness metadata renders the source badge; pages without harne
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest: a shared-partition candidate carries its date and confidence (4.2)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const person = svc.tokens.mint("person", "u/bob").token;
+    const root = svc.rootForKey("u-bob");
+    // The candidate lives in `shared`; the digest is requested for `cluster-7`.
+    // The enrichment map used to be built from [project] only, so the lookup of
+    // a shared path always missed — no date, no confidence, silently.
+    root.writeDistillPage("shared", "experience", {
+      id: "exp_shared1", engine: "engine:test/1", confidence: 0.66,
+      task: "共享区的巡检口径", search_keys: ["巡检"], solution: "先看 digest",
+      sources: [], supersedes: [],
+    });
+    server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+    const r = await fetch(base + "/digest?project=cluster-7&q=共享区的巡检", { headers: H });
+    assert.equal(r.status, 200);
+    const d = (await r.json()) as { digest: string };
+    assert.match(d.digest, /〔L2·experience｜置信 0\.66｜/, "shared candidate keeps its confidence annotation");
+    assert.ok(/\｜\d{4}-\d{2}-\d{2}/.test(d.digest), "and its date");
+  } finally {
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

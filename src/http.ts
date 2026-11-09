@@ -582,11 +582,16 @@ export class Service {
         : candidates;
       // Enrich candidates with confidence/updated_at from the page index +
       // frontmatter (render annotations must not depend on the caller).
-      const pageMeta = new Map(dRoot.db.recentPages(1000, [project]).map((p) => [p.path, p.updated_at]));
+      // The map covers every root this digest reads: the loop below looks up
+      // `shared` paths too, and building the map from [project] alone meant a
+      // shared-partition candidate never found its row — no date, no
+      // confidence, silently (optimize-yongyi-read-surfaces 4.2).
+      const metaRoots = project === "shared" ? ["shared"] : [project, "shared"];
+      const pageMeta = new Map(dRoot.db.recentPages(1000, metaRoots).map((p) => [p.path, p.updated_at]));
       const items: DigestItem[] = filteredCandidates.map((c) => {
         let updated_at: string | null = null;
         let confidence: number | null = null;
-        for (const p2 of project === "shared" ? ["shared"] : [project, "shared"]) {
+        for (const p2 of metaRoots) {
           const rel = `${p2}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
           if (!pageMeta.has(rel)) continue;
           updated_at = pageMeta.get(rel)!;

@@ -394,3 +394,34 @@ test("platform-seam lane: platform token reads/forgets a named rootKey; agents r
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("candidate scoring: search_keys carries its x2 weight, and legacy pages still reach it (4.1)", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-tier");
+    // Three pages, one term: title hit (x3) > search_keys hit (x2) > body hit
+    // (x1). The x2 tier used to be dead — the field was written only as a body
+    // line while the scorer read frontmatter.
+    root.writeDistillPage("p", "experience", { id: "exp_title", engine: "e", confidence: 0.5, task: "专属词 在标题里", search_keys: [], solution: "无", sources: [], supersedes: [] });
+    root.writeDistillPage("p", "experience", { id: "exp_keys", engine: "e", confidence: 0.5, task: "乙 无关标题", search_keys: ["专属词"], solution: "无", sources: [], supersedes: [] });
+    root.writeDistillPage("p", "experience", { id: "exp_body", engine: "e", confidence: 0.5, task: "丙 无关标题", search_keys: [], solution: "正文里提到 专属词 一次", sources: [], supersedes: [] });
+    const order = distillCandidates(root, ["p"], "专属词").map((c) => c.id);
+    assert.deepEqual(order, ["exp_title", "exp_keys", "exp_body"], "x3 then x2 then x1");
+
+    // The field is now real frontmatter, not just a body line.
+    const fm = root.readPageByRel("p/experiences/exp_keys.md")!.frontmatter as Record<string, unknown>;
+    assert.deepEqual(fm.search_keys, ["专属词"]);
+
+    // A page written before 4.1 has the list only in its body line — it must
+    // still score at the x2 tier instead of degrading to x1 forever.
+    root.writePage("p", "experiences", "exp_legacy", {
+      frontmatter: { type: "experience", title: "丁 旧页" },
+      body: "## Task\n丁 旧页\n\n## Solution\n无\n\nsearch_keys: 旧词\n",
+    } as never);
+    const legacy = distillCandidates(root, ["p"], "旧词").find((c) => c.id === "exp_legacy");
+    assert.ok(legacy, "legacy page is a candidate");
+    assert.deepEqual(legacy!.search_keys, ["旧词"], "body-line fallback feeds the x2 tier");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

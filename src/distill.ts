@@ -31,7 +31,15 @@ function readCandidateFile(root: StoreRoot, rel: string): DistillCandidate | nul
     id,
     kind: type,
     task: String(fm.task ?? fm.statement ?? fm.title ?? ""),
-    search_keys: Array.isArray(fm.search_keys) ? (fm.search_keys as string[]) : [],
+    // Frontmatter is the truth; pages written before 4.1 carry the list only as
+    // a body line ("search_keys: a, b"), so parse that as the fallback rather
+    // than scoring them at x1 forever.
+    search_keys: Array.isArray(fm.search_keys)
+      ? (fm.search_keys as string[])
+      : (() => {
+        const m = /^search_keys:\s*(.+)$/m.exec(String(page.body ?? ""));
+        return m ? m[1].split(",").map((k) => k.trim()).filter(Boolean) : [];
+      })(),
     solution: String(page.body).slice(0, 2000),
     boundary_envs: String(fm.boundary_envs ?? ""),
     supersedes: Array.isArray(fm.supersedes) ? (fm.supersedes as string[]) : [],

@@ -288,6 +288,13 @@ export class StoreRoot {
     // generated.process meta; the engine tag goes beside it)
     const page = this.readPageByRel(rel)!;
     page.frontmatter.generated = { ...(page.frontmatter.generated as Record<string, unknown> ?? {}), by: payload.engine };
+    // search_keys is a first-class field the candidate scorer weights x2 — it
+    // used to ride ONLY the body line, while the reader read frontmatter, so
+    // that weight never fired (optimize-yongyi-read-surfaces 4.1). The body
+    // line stays for readers of the page text; this is the indexable copy.
+    if ((payload.search_keys ?? []).length > 0) {
+      page.frontmatter.search_keys = payload.search_keys!.map((k) => sanitize(String(k))).filter(Boolean);
+    }
     writePageFile(join(this.wikiDir, rel), page);
     return rel;
   }
