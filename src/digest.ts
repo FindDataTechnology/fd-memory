@@ -25,6 +25,9 @@ export interface DigestItem {
   // Cross-harness source badge (design D5): set from page metadata.harness by
   // the write lanes; absent ⇒ the line renders byte-identically to before.
   harness?: string;
+  // Partition this entry came from (6.1). Only rendered when the caller passes
+  // labelSources, so single-partition output stays byte-identical.
+  source?: string;
 }
 
 export interface DigestHandoff {
@@ -54,9 +57,13 @@ function alive(item: DigestItem, now: string): boolean {
   return true;
 }
 
-function itemLine(item: DigestItem): string {
+function itemLine(item: DigestItem, labelSources = false): string {
   const conf = item.confidence != null ? `｜置信 ${Number(item.confidence).toFixed(2)}` : "";
   const date = item.updated_at ? `｜${String(item.updated_at).slice(0, 10)}` : "";
+  // Partition tag (optimize-yongyi-read-surfaces 6.1): a digest merged from
+  // several partitions must say which one an entry came from. Off unless the
+  // caller asks, so a single-partition digest keeps its exact bytes.
+  const src = labelSources && item.source ? `｜${item.source}` : "";
   const title = String(item.title ?? "").replace(/\s+/g, " ").trim();
   // Title cap (run12 transcript): distiller L2 rows carry task ≈ the whole
   // narrative — an unbounded title + its excerpt echo read everything twice
@@ -75,7 +82,7 @@ function itemLine(item: DigestItem): string {
   // budget accounting (estimateTokens on the whole line) stays exact — no
   // discipline drift.
   const badge = item.harness ? `（来自 ${item.harness}）` : "";
-  return `- 〔${item.layer}·${item.kind}${conf}${date}〕${shownTitle}${excerpt ? `：${excerpt}` : ""}${badge}`;
+  return `- 〔${item.layer}·${item.kind}${conf}${date}${src}〕${shownTitle}${excerpt ? `：${excerpt}` : ""}${badge}`;
 }
 
 // Notification semantics (constructed-benchmark finding, 2026-10-25): a
@@ -95,6 +102,8 @@ export function renderDigest(opts: {
   items: DigestItem[];
   handoffs?: DigestHandoff[];
   budgetTokens?: number;
+  /** Prefix each entry with its partition tag (multi-partition digests only). */
+  labelSources?: boolean;
   now?: string;
 }): string {
   const budget = Math.max(64, Number(opts.budgetTokens ?? DIGEST_DEFAULT_BUDGET_TOKENS) | 0);
@@ -125,7 +134,7 @@ export function renderDigest(opts: {
       let spent = 0;
       let opened = false;
       for (const item of list) {
-        let line = itemLine(item);
+        let line = itemLine(item, opts.labelSources === true);
         let cost = estimateTokens(line);
         if (used + spent + cost > capTokens) {
           if (!opened && list.length > 0) {

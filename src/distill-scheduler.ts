@@ -685,13 +685,19 @@ export async function sidecarEmbed(
 export async function hybridCandidates(opts: {
   root: StoreRoot;
   project: string;
+  // Multi-partition recall (optimize-yongyi-read-surfaces 6.1): one request can
+  // span several partitions, so the caller may pass the whole set. Omitted =
+  // the historical [project, "shared"] union, byte-for-byte the old behavior.
+  projects?: string[];
   queryFor: string;
   k?: number;
   embed: (texts: string[]) => Promise<{ vectors: number[][]; model: string; tokens: number }>;
   log?: { warn: (msg: string) => void };
 }): Promise<Array<DistillCandidate & { score?: number }>> {
   const { root, project, queryFor, k = 8, embed, log } = opts;
-  const projects = project === "shared" ? [project] : [project, "shared"];
+  const projects = opts.projects && opts.projects.length
+    ? [...new Set(opts.projects)]
+    : project === "shared" ? [project] : [project, "shared"];
   const keyword = distillCandidates(root, projects, queryFor);
   // An empty query has no vector to compute (2026-10-29): the sidecar rejects
   // blank input with 400 texts_required, and the caller turned that into
@@ -732,7 +738,7 @@ export async function hybridCandidates(opts: {
         if (!page) continue;
         const kind = m[2] === "facts" ? "fact" : "experience";
         c = {
-          id: m[3], kind,
+          id: m[3], kind, project: m[1],
           task: kind === "fact" ? String(page.frontmatter?.subject ?? page.frontmatter?.title ?? m[3]) : String(page.frontmatter?.title ?? m[3]),
           search_keys: [], solution: String(page.body ?? "").slice(0, 400),
           boundary_envs: "", supersedes: [],

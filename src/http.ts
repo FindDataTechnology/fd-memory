@@ -433,6 +433,18 @@ export class Service {
     // failed request. Server-side clamps: k ≤ 8, budget ≤ 2000.
     if (path === "/digest" && req.method === "GET") {
       const rootKeyParam = url.searchParams.get("rootKey");
+      // Multi-partition read (optimize-yongyi-read-surfaces 6.1): `projects`
+      // (repeatable or comma-separated) asks for several partitions in ONE
+      // request. A fleet turn currently issues three reads for own / shared /
+      // legacy; each one re-reads the L2 candidates and decodes every vector of
+      // the root. Merging is one read, one budget, and every entry says which
+      // partition it came from. Absent → the single-partition shape, unchanged.
+      const requestedProjects = url.searchParams.getAll("projects")
+        .flatMap((v) => String(v).split(","))
+        .map((p) => p.trim().replace(/[/\\]+/g, "-").slice(0, 128))
+        .filter(Boolean);
+      const projects = requestedProjects.length ? [...new Set(requestedProjects)] : [];
+      const multi = projects.length > 0;
       let dRoot: StoreRoot;
       let oversight = false;
       if (scope.kind === "platform" || scope.kind === "runner") {
@@ -471,17 +483,21 @@ export class Service {
         const isPod = scope.kind === "pod";
         const project = String(url.searchParams.get("project") ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
         const nsOfProject = (p: string): string => (p === "shared" ? packNs : `${packNs}/${p}`);
-        if (!project) {
+        if (!project && !multi) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "project_required" }));
         }
-        if (isPod && project !== "shared") {
-          res.writeHead(403, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "pod_reads_shared_only" }));
-        }
-        if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
-          res.writeHead(403, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "forbidden_project", project }));
+        // A multi read is checked partition by partition below; the single form
+        // keeps its original checks (and its original error shapes).
+        if (!multi) {
+          if (isPod && project !== "shared") {
+            res.writeHead(403, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "pod_reads_shared_only" }));
+          }
+          if (!this.tokens.allows(scope.tokenId, nsOfProject(project), "r")) {
+            res.writeHead(403, { "content-type": "application/json" });
+            return void res.end(JSON.stringify({ error: "forbidden_project", project }));
+          }
         }
         dRoot = this.rootFor(scope);
       } else {
@@ -489,10 +505,31 @@ export class Service {
         return void res.end(JSON.stringify({ error: "person_token_required" }));
       }
       const project = String(url.searchParams.get("project") ?? "").trim().replace(/[/\\]+/g, "-").slice(0, 128);
-      if (!project) {
+      if (!project && !multi) {
         res.writeHead(400, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "project_required" }));
       }
+      if (multi) {
+        // Every requested partition must be granted, exactly like the single
+        // form — a multi read must not widen what the token may see.
+        if (scope.kind === "deployment" || scope.kind === "pod") {
+          const packNs = "d/" + namespaceParts(scope.namespace).rootKey.slice(2);
+          for (const p of projects) {
+            if (scope.kind === "pod" && p !== "shared") {
+              res.writeHead(403, { "content-type": "application/json" });
+              return void res.end(JSON.stringify({ error: "pod_reads_shared_only", project: p }));
+            }
+            if (!this.tokens.allows(scope.tokenId, p === "shared" ? packNs : `${packNs}/${p}`, "r")) {
+              res.writeHead(403, { "content-type": "application/json" });
+              return void res.end(JSON.stringify({ error: "forbidden_project", project: p }));
+            }
+          }
+        }
+      }
+      // The partition the single form reads, and the set the merge reads.
+      const primary = project || projects[0];
+      const readProjects = multi ? projects : [project];
+      const recallProjects = [...new Set([...readProjects, "shared"])];
       const q = String(url.searchParams.get("q") ?? "");
       const k = Math.min(8, Math.max(1, Number(url.searchParams.get("k") ?? 5) || 5));
       const budget = Math.min(2000, Math.max(64, Number(url.searchParams.get("budget") ?? 1500) || 1500));
@@ -563,7 +600,7 @@ export class Service {
           clearTimeout(timer);
         }
       };
-      const candidates = await hybridCandidates({ root: dRoot, project, queryFor: q, k, embed });
+      const candidates = await hybridCandidates({ root: dRoot, project: primary, projects: recallProjects, queryFor: q, k, embed });
       // Structured filter (add-agent-memory-foundation): ONE indexed SQL pass
       // answers "which pages match"; candidates/notes/refs keep only members
       // of that set. The retrieval lanes stay untouched — the filter narrows
@@ -574,7 +611,7 @@ export class Service {
         return void res.end(JSON.stringify({ error: fp.error }));
       }
       if (fp.filter) noteMetaFilter();
-      const filterProjects = project === "shared" ? ["shared"] : [project, "shared"];
+      const filterProjects = recallProjects;
       const allowedPaths = fp.filter ? dRoot.db.filteredPagePaths(filterProjects, fp.filter) : null;
       const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
       const filteredCandidates = allowedPaths
@@ -602,6 +639,7 @@ export class Service {
         }
         return {
           id: c.id, layer: "L2", kind: c.kind, title: c.task,
+          ...(multi ? { source: c.project ?? primary } : {}),
           // page bodies carry "## Task/## Solution" section headers — strip
           // for the excerpt (producer-side hygiene, same as the eval)
           // L2 gist (2026-10-26 benchmark): 400-char excerpts made ~350-token
@@ -627,17 +665,18 @@ export class Service {
       // Query-relevant notes ride FIRST (the "remember it, find it" lane that
       // doesn't wait for distillation latency), then recency fills the rest.
       // Empty/no-match query → pure recency, byte-identical to before.
-      const matched = q.trim() ? dRoot.db.queryNotes(project, q, 3) : [];
+      const matched = q.trim() ? readProjects.flatMap((p) => dRoot.db.queryNotes(p, q, 3)) : [];
       const matchedPaths = new Set(matched.map((p) => p.path));      // Reference lane (add-unified-memory-and-outputs): thin index entries
       // for library/output artifacts render as citation-by-name lines (「见
       // 资料库《title》— summary」) — never the body. Caps mirror the notes
       // segment; canonical rides first under budget pressure (renderer keeps
       // array order).
       const k_refs = Math.min(3, Math.max(1, Math.floor(k / 2)));
-      const refs = (q.trim() ? dRoot.db.queryReferences(project, q, k_refs) : dRoot.db.queryReferences(project, "", k_refs))
+      const refs = readProjects.flatMap((p) => (q.trim() ? dRoot.db.queryReferences(p, q, k_refs) : dRoot.db.queryReferences(p, "", k_refs)))
         .filter((p) => !allowedPaths || allowedPaths.has(p.path));
       const refItems: DigestItem[] = refs.map((p) => ({
         id: p.path, layer: "L2" as const, kind: "reference",
+        ...(multi ? { source: String(p.path).split("/")[0] } : {}),
         title: `见资料库《${p.title}》`,
         excerpt: String(p.body ?? "").replace(/\s+/g, " ").trim().slice(0, 120),
         confidence: null, updated_at: p.updated_at,
@@ -646,8 +685,8 @@ export class Service {
       // the same capped L1 lane by recency — for roots with none, the merge is
       // the recentNotes order unchanged (byte-identical digests, budget
       // discipline intact: still ≤ NOTES_LIMIT items through the same renderer).
-      const obsPages = dRoot.db.recentObservationPages(project, NOTES_LIMIT);
-      const recency = [...dRoot.db.recentNotes(project, NOTES_LIMIT), ...obsPages]
+      const obsPages = readProjects.flatMap((p) => dRoot.db.recentObservationPages(p, NOTES_LIMIT));
+      const recency = [...readProjects.flatMap((p) => dRoot.db.recentNotes(p, NOTES_LIMIT)), ...obsPages]
         .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
       const merged = [
         ...matched,
@@ -666,6 +705,7 @@ export class Service {
           : "";
         return {
           id: p.path, layer: (isObs ? "L0" : "L1") as "L0" | "L1", kind: isObs ? "observation" : "note", title: p.title,
+          ...(multi ? { source: String(p.path).split("/")[0] } : {}),
           excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 100),
           confidence: null, updated_at: p.updated_at,
           ...(harness ? { harness } : {}),
@@ -684,13 +724,13 @@ export class Service {
       // window only; older ones stay queryable via /pages and the MCP face.
       const HANDOFF_MAX_AGE_MS = Number(process.env.FD_MEMORY_DIGEST_HANDOFF_MAX_AGE_H ?? 48) * 3600_000;
       const freshEnough = (iso: string) => Date.now() - Date.parse(iso) < HANDOFF_MAX_AGE_MS;
-      const handoffs = dRoot.db.openHandoffs([project]).filter((h) => freshEnough(h.created_at)).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
+      const handoffs = dRoot.db.openHandoffs(readProjects).filter((h) => freshEnough(h.created_at)).slice(0, 3).map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
       const allItems = [...refItems, ...items, ...noteItems];
-      const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString() });
+      const digest = renderDigest({ items: allItems, handoffs, budgetTokens: budget, now: new Date().toISOString(), ...(multi ? { labelSources: true } : {}) });
       // Oversight audit (add-agent-memory-foundation): one row per supervised
       // digest read — who, when, root, partitions, how many entries rendered.
       if (oversight) {
-        try { dRoot.db.addOversightRead(`person:${scope.tokenId}`, rootKeyParam!, project, allItems.length); } catch { /* companion record only */ }
+        try { dRoot.db.addOversightRead(`person:${scope.tokenId}`, rootKeyParam!, readProjects.join(","), allItems.length); } catch { /* companion record only */ }
       }
       const rendered = (digest.match(/〔L/g) ?? []).length;
       const renderedNotes = (digest.match(/〔L1·/g) ?? []).length;
@@ -703,9 +743,17 @@ export class Service {
       const logRoot = scope.kind === "platform" || scope.kind === "runner" ? rootKeyParam : namespaceParts(scope.namespace).rootKey;
       const rung = !q.trim() ? "empty" : modelNote ? "keyword" : "vector";
       noteDigestRung(rung);
-      console.log(`[digest] ${logRoot}:${project} rung=${rung} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
+      console.log(`[digest] ${logRoot}:${readProjects.join("+")} rung=${rung} items=${rendered - renderedNotes} notes=${renderedNotes} ms=${Date.now() - t0}${modelNote ? ` note="${modelNote.slice(0, 120)}"` : ""}`);
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ project, digest, items: items.length, notes: renderedNotes, truncated: rendered < allItems.length, ...(modelNote ? { model_note: modelNote } : {}) }));
+      return void res.end(JSON.stringify({
+        project: primary,
+        digest,
+        items: items.length,
+        notes: renderedNotes,
+        truncated: rendered < allItems.length,
+        ...(modelNote ? { model_note: modelNote } : {}),
+        ...(multi ? { projects: readProjects, sources: readProjects } : {}),
+      }));
     }
 
     if (path === "/pages/write" && req.method === "POST") {

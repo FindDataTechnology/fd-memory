@@ -18,6 +18,9 @@ export interface DistillCandidate {
   solution: string;
   boundary_envs: string;
   supersedes: string[];
+  // Partition the page came from (optimize-yongyi-read-surfaces 6.1): a
+  // multi-partition digest must be able to say where an entry came from.
+  project?: string;
 }
 
 function readCandidateFile(root: StoreRoot, rel: string): DistillCandidate | null {
@@ -30,6 +33,7 @@ function readCandidateFile(root: StoreRoot, rel: string): DistillCandidate | nul
   return {
     id,
     kind: type,
+    project: rel.split(/[\\/]/)[0],
     task: String(fm.task ?? fm.statement ?? fm.title ?? ""),
     // Frontmatter is the truth; pages written before 4.1 carry the list only as
     // a body line ("search_keys: a, b"), so parse that as the fallback rather

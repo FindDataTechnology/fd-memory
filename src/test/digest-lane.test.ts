@@ -529,3 +529,61 @@ test("/digest: a shared-partition candidate carries its date and confidence (4.2
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("/digest: several partitions in one request, one budget, every entry labelled (6.1)", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const person = svc.tokens.mint("person", "u/multi").token;
+    const root = svc.rootForKey("u-multi");
+    for (const [project, id, task] of [
+      ["alpha", "exp_a1", "甲分区 的巡检口径"],
+      ["beta", "exp_b1", "乙分区 的巡检口径"],
+      ["shared", "exp_s1", "共享区 的巡检口径"],
+    ] as const) {
+      root.writeDistillPage(project, "experience", {
+        id, engine: "e", confidence: 0.7, task, search_keys: ["巡检"], solution: "先看 digest",
+        sources: [], supersedes: [],
+      });
+    }
+    server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+
+    // Single partition: the response shape and the rendered lines are the old
+    // ones — no partition tags, no extra fields.
+    const one = await (await fetch(`${base}/digest?project=alpha&q=巡检口径&budget=600`, { headers: H })).json() as {
+      digest: string; projects?: string[]; sources?: string[];
+    };
+    assert.equal(one.projects, undefined, "single form adds no partition list");
+    assert.ok(!/〔L2·experience[^〕]*｜alpha〕/.test(one.digest), "single form adds no partition tag");
+
+    // Multi partition: one request, entries from both partitions, each tagged.
+    const multi = await (await fetch(`${base}/digest?projects=alpha,beta&q=巡检口径&budget=600`, { headers: H })).json() as {
+      digest: string; projects: string[]; sources: string[]; items: number;
+    };
+    assert.deepEqual(multi.projects, ["alpha", "beta"]);
+    assert.deepEqual(multi.sources, ["alpha", "beta"]);
+    assert.match(multi.digest, /｜alpha〕/, "alpha entry carries its partition");
+    assert.match(multi.digest, /｜beta〕/, "beta entry carries its partition");
+
+    // ONE budget, not one per partition: the merged block stays within the
+    // single-partition ceiling (a naive per-partition render would be ~2x).
+    const multiTokens = (await import("../digest.js")).estimateTokens(multi.digest);
+    assert.ok(multiTokens <= 600 * 1.15, `merged digest must stay inside one budget (got ${multiTokens})`);
+
+    // A partition the token cannot read is refused, never silently dropped:
+    // the member's own partition is granted at mint, an unrelated one is not.
+    const member = svc.tokens.mint("deployment", "d/f/m1").token;
+    const granted = await fetch(`${base}/digest?projects=m1`, { headers: { authorization: `Bearer ${member}` } });
+    assert.equal(granted.status, 200, "own partition is readable");
+    const denied = await fetch(`${base}/digest?projects=m1,not-mine`, { headers: { authorization: `Bearer ${member}` } });
+    assert.equal(denied.status, 403, "one ungranted partition fails the whole read");
+    assert.equal(((await denied.json()) as { error: string }).error, "forbidden_project");
+  } finally {
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
