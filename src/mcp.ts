@@ -128,16 +128,58 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     return { error: err("invalid_target", { target: t }) };
   }
 
+  // Read-surface caps (optimize-yongyi-read-surfaces). Every read face states
+  // its ceiling and proves when it truncated — a capped page must never read as
+  // the whole set. Measured on the production deployment (2026-11-10): after
+  // fix-memory-handoff-list-cost the list was STILL 92% of all YongYi tool
+  // bytes (297 calls / 3.49 MB in 24h, 12.3 KB per call), because each row
+  // carried its full summary even though the row count was capped.
+  const envInt = (name: string, fallback: number): number => {
+    const v = Number(process.env[name]);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : fallback;
+  };
   // Handoff-list page size (fix-memory-handoff-list-cost): the default keeps a
   // routine turn's "anything for me?" check cheap; the ceiling lets a caller
   // page deliberately. Both are stated to the caller via total/truncated.
-  const HANDOFF_LIST_LIMIT = 20;
-  const HANDOFF_LIST_MAX = 100;
+  const HANDOFF_LIST_LIMIT = envInt("FD_MEMORY_HANDOFF_LIST_LIMIT", 20);
+  const HANDOFF_LIST_MAX = envInt("FD_MEMORY_HANDOFF_LIST_MAX", 100);
+  // Per-row gist: the list is a decision surface ("is one mine and how recent"),
+  // not a body transfer. The full text is claimed through memory_handoff_accept.
+  const HANDOFF_SUMMARY_CHARS = envInt("FD_MEMORY_HANDOFF_SUMMARY_CHARS", 200);
+  // List faces (query/recent): the caller's limit is clamped, never trusted.
+  const LIST_LIMIT_DEFAULT = envInt("FD_MEMORY_LIST_LIMIT", 20);
+  const LIST_LIMIT_MAX = envInt("FD_MEMORY_LIST_LIMIT_MAX", 50);
+  // Body faces: read_page pages by byte offset; accept caps each field.
+  const READ_BODY_MAX_BYTES = envInt("FD_MEMORY_READ_BODY_MAX_BYTES", 32 * 1024);
+  const ACCEPT_SUMMARY_CHARS = envInt("FD_MEMORY_ACCEPT_SUMMARY_CHARS", 4 * 1024);
+  const ACCEPT_LIST_ITEMS = envInt("FD_MEMORY_ACCEPT_LIST_ITEMS", 20);
+  const ACCEPT_ITEM_CHARS = envInt("FD_MEMORY_ACCEPT_ITEM_CHARS", 500);
+  const ACCEPT_FILES_ITEMS = envInt("FD_MEMORY_ACCEPT_FILES_ITEMS", 200);
   // Overview caps (fix-memory-overview-cost): a person root can hold hundreds of
   // partitions; listing every one with ten titles is a bulk export wearing an
   // overview's name.
   const OVERVIEW_PARTITIONS = 25;
   const OVERVIEW_TITLES = 3;
+
+  const clampListLimit = (raw: unknown): number => {
+    const n = Math.floor(Number(raw));
+    if (!Number.isFinite(n) || n <= 0) return LIST_LIMIT_DEFAULT;
+    return Math.min(n, LIST_LIMIT_MAX);
+  };
+  const clip = (raw: unknown, max: number): { text: string; truncated: boolean } => {
+    const v = String(raw ?? "");
+    if (v.length <= max) return { text: v, truncated: false };
+    return { text: v.slice(0, max), truncated: true };
+  };
+  // JSON-encoded list column (handoff fields live as strings) → capped array.
+  const clipList = (raw: unknown, maxItems: number, maxChars: number): { items: string[]; truncated: boolean } => {
+    let parsed: unknown;
+    try { parsed = JSON.parse(String(raw ?? "[]")); } catch { return { items: [], truncated: false }; }
+    if (!Array.isArray(parsed)) return { items: [], truncated: false };
+    const all = parsed.map(String);
+    const items = all.slice(0, maxItems).map((s) => clip(s, maxChars).text);
+    return { items, truncated: all.length > items.length || all.some((s, i) => i < maxItems && s.length > maxChars) };
+  };
 
   const targetProps = { target: TARGET_SCHEMA };
 
@@ -240,16 +282,30 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         const all = root.db.openHandoffs(r.projects)
           .slice()
           .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
-        const handoffs = all.slice(0, cap).map((row) => ({
-          id: row.id,
-          summary: row.summary,
-          from_agent: row.from_agent,
-          to_agent: row.to_agent ?? null,
-          project: row.project,
-          created_at: row.created_at,
-          source: sourceOf(row.project),
-        }));
-        return text({ handoffs, total: all.length, truncated: all.length > handoffs.length });
+        let summariesTruncated = 0;
+        const handoffs = all.slice(0, cap).map((row) => {
+          const gist = clip(row.summary, HANDOFF_SUMMARY_CHARS);
+          if (gist.truncated) summariesTruncated += 1;
+          return {
+            id: row.id,
+            summary: gist.text,
+            ...(gist.truncated ? { summary_truncated: true } : {}),
+            from_agent: row.from_agent,
+            to_agent: row.to_agent ?? null,
+            project: row.project,
+            created_at: row.created_at,
+            source: sourceOf(row.project),
+          };
+        });
+        // truncated is honest about EITHER dimension: more open handoffs than the
+        // page carries, or any row whose summary was cut. A caller deciding
+        // "anything for me?" must not read a gist as the full summary.
+        return text({
+          handoffs,
+          total: all.length,
+          truncated: all.length > handoffs.length || summariesTruncated > 0,
+          ...(summariesTruncated ? { truncated_summaries: summariesTruncated } : {}),
+        });
       },
     },
     {
@@ -263,7 +319,33 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (!may(row.project, "r")) return err("forbidden_project");
         const res = root.acceptHandoff(id, String(args.agent ?? scope.kind), auditOf(row.project));
         if (!res.claimed && res.already === undefined) return err("not_found");
-        return text(res.claimed ? { status: "claimed", handoff: res.handoff } : { status: "already_claimed", accepted_by: res.already });
+        if (!res.claimed) return text({ status: "already_claimed", accepted_by: res.already });
+        // Accept is the ONE face that carries the body, so it is capped field by
+        // field and says which fields were cut — a claimed handoff must not
+        // arrive looking complete while its next steps were silently clipped.
+        // Uncut fields keep their stored bytes exactly (the list columns stay
+        // JSON strings, as before).
+        const h = res.handoff!;
+        const summary = clip(h.summary, ACCEPT_SUMMARY_CHARS);
+        const questions = clipList(h.open_questions, ACCEPT_LIST_ITEMS, ACCEPT_ITEM_CHARS);
+        const steps = clipList(h.next_steps, ACCEPT_LIST_ITEMS, ACCEPT_ITEM_CHARS);
+        const files = clipList(h.files_touched, ACCEPT_FILES_ITEMS, ACCEPT_ITEM_CHARS);
+        const truncatedFields: string[] = [];
+        if (summary.truncated) truncatedFields.push("summary");
+        if (questions.truncated) truncatedFields.push("open_questions");
+        if (steps.truncated) truncatedFields.push("next_steps");
+        if (files.truncated) truncatedFields.push("files_touched");
+        return text({
+          status: "claimed",
+          handoff: {
+            ...h,
+            summary: summary.text,
+            open_questions: questions.truncated ? JSON.stringify(questions.items) : h.open_questions,
+            next_steps: steps.truncated ? JSON.stringify(steps.items) : h.next_steps,
+            files_touched: files.truncated ? JSON.stringify(files.items) : h.files_touched,
+          },
+          ...(truncatedFields.length ? { truncated: true, truncated_fields: truncatedFields } : {}),
+        });
       },
     },
     {
@@ -287,14 +369,23 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (r.error) return r.error;
         const f = readFilter(args);
         if (f.error) return f.error;
-        const results = root.db.searchPages(String(args.q), Number(args.limit ?? 20), r.projects, f.filter).map((row) => ({
-          ...row,
-          source: sourceOf(row.project),
-          layer: layerOf(row.type),
-          ...(layerOf(row.type) === "L2" ? { sources: parseSources(row.sources) } : {}),
-          ...(row.metadata ? { metadata: parseMetadata(row.metadata) } : {}),
-        }));
-        return text({ results });
+        const cap = clampListLimit(args.limit);
+        const meta: { total?: number } = {};
+        // `_total` is the window-function count from the same statement (see
+        // StoreDb.searchPages): the true match count, not the page size.
+        const results = root.db.searchPages(String(args.q), cap, r.projects, f.filter, meta).map((row) => {
+          const { _total, ...rest } = row as typeof row & { _total?: number };
+          void _total;
+          return {
+            ...rest,
+            source: sourceOf(row.project),
+            layer: layerOf(row.type),
+            ...(layerOf(row.type) === "L2" ? { sources: parseSources(row.sources) } : {}),
+            ...(row.metadata ? { metadata: parseMetadata(row.metadata) } : {}),
+          };
+        });
+        const total = Number(meta.total ?? results.length);
+        return text({ results, total, truncated: total > results.length });
       },
     },
     {
@@ -306,35 +397,78 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (r.error) return r.error;
         const f = readFilter(args);
         if (f.error) return f.error;
-        const limit = Number(args.limit ?? 20);
+        const limit = clampListLimit(args.limit);
         const filter = f.filter ?? {};
         // L0 rows are observations, not pages: the pages leg drops for an
         // L0-only ask, and L1/L2 asks never carry observations.
         const layer = (args.filter as { layer?: string } | undefined)?.layer;
-        const pages = layer === "L0" ? [] : root.db.recentPages(limit, r.projects, filter).map((p) => ({
-          ...p,
-          source: sourceOf(p.project),
-          layer: layerOf(p.type),
-          ...(layerOf(p.type) === "L2" ? { sources: parseSources(p.sources) } : {}),
-          ...(p.metadata ? { metadata: parseMetadata(p.metadata) } : {}),
-        }));
+        const pagesMeta: { total?: number } = {};
+        const obsMeta: { total?: number } = {};
+        const pages = layer === "L0" ? [] : root.db.recentPages(limit, r.projects, filter, pagesMeta).map((p) => {
+          const { _total, ...rest } = p as typeof p & { _total?: number };
+          void _total;
+          return {
+            ...rest,
+            source: sourceOf(p.project),
+            layer: layerOf(p.type),
+            ...(layerOf(p.type) === "L2" ? { sources: parseSources(p.sources) } : {}),
+            ...(p.metadata ? { metadata: parseMetadata(p.metadata) } : {}),
+          };
+        });
         const observations = layer === "L2" || layer === "L1"
           ? []
-          : root.db.recentObservations(limit, r.projects, filter.since, filter.until).map((o) => ({ ...o, source: sourceOf(o.project), layer: "L0" as const }));
-        return text({ pages, observations });
+          : root.db.recentObservations(limit, r.projects, filter.since, filter.until, obsMeta).map((o) => {
+            const { _total, ...rest } = o as typeof o & { _total?: number };
+            void _total;
+            return { ...rest, source: sourceOf(o.project), layer: "L0" as const };
+          });
+        // Both legs are capped independently, so the total spans both: a caller
+        // asking "what happened recently" must not read one capped leg as all.
+        const total = Number(pagesMeta.total ?? pages.length) + Number(obsMeta.total ?? observations.length);
+        return text({ pages, observations, total, truncated: total > pages.length + observations.length });
       },
     },
     {
       name: "memory_read_page",
-      description: "Read a page by its wiki-relative path — only within partitions your grants cover.",
-      inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      description: "Read a page by its wiki-relative path — only within partitions your grants cover. Large pages come back in byte-bounded slices: pass the returned next_offset back as offset to continue; truncated/total_bytes say what is left.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string" },
+          offset: { type: "number", description: "Byte offset to continue from (the previous response's next_offset)." },
+          limit_bytes: { type: "number", description: `Max body bytes for this read (default and max ${READ_BODY_MAX_BYTES}).` },
+        },
+        required: ["path"],
+      },
       handler: (args) => {
         const rel = String(args.path);
         const seg = rel.split(/[\\/]/)[0];
         if (!seg || !may(seg, "r")) return err("forbidden_project");
         const page = root.readPageByRel(rel);
         if (!page) return err("not_found");
-        return text({ frontmatter: page.frontmatter, body: page.body, source: sourceOf(seg) });
+        const bodyText = String(page.body ?? "");
+        // Byte-bounded paging (optimize-yongyi-read-surfaces 2.2). Measured on
+        // production the largest page is 10.7 KB, so this cap never fires today
+        // — it is the guard that keeps one pathological page from eating a
+        // turn's window. A cut page always says so and hands back the offset;
+        // a page that fits keeps the pre-existing bytes exactly.
+        const buf = Buffer.from(bodyText, "utf8");
+        const total = buf.byteLength;
+        const offset = Math.max(0, Math.floor(Number(args.offset ?? 0)) || 0);
+        const requested = Math.floor(Number(args.limit_bytes ?? READ_BODY_MAX_BYTES)) || READ_BODY_MAX_BYTES;
+        const width = Math.min(READ_BODY_MAX_BYTES, Math.max(1, requested));
+        const start = Math.min(offset, total);
+        let end = Math.min(start + width, total);
+        // Never split a UTF-8 sequence: back off to a lead byte.
+        while (end > start && end < total && (buf[end] & 0xc0) === 0x80) end -= 1;
+        const body = buf.subarray(start, end).toString("utf8");
+        const partial = start > 0 || end < total;
+        return text({
+          frontmatter: page.frontmatter,
+          body,
+          source: sourceOf(seg),
+          ...(partial ? { truncated: true, total_bytes: total, offset: start, next_offset: end < total ? end : null } : {}),
+        });
       },
     },
     {

@@ -270,7 +270,7 @@ export class RootDb {
     this.db.prepare("DELETE FROM pages WHERE path=?").run(relPath);
   }
 
-  searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null }> {
+  searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null; _total?: number }> {
     const pf = projectFilterSql(projects, "p.project");
     // mf is the FULL page predicate (project + time + type + metadata) built
     // for the joined columns; pf alone is kept for the observations leg below.
@@ -284,11 +284,11 @@ export class RootDb {
       try {
         return this.db
           .prepare(
-            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip
+            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip, COUNT(*) OVER () AS _total
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
              WHERE pages_fts MATCH ?${mf.clause} ORDER BY rank LIMIT ?`,
           )
-          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>;
+          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>;
       } catch {
         return [];
       }
@@ -300,13 +300,17 @@ export class RootDb {
       rows = (
         this.db
           .prepare(
-            `SELECT path, title, project, type, sources, metadata, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet
+            `SELECT path, title, project, type, sources, metadata, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet, COUNT(*) OVER () AS _total
              FROM pages WHERE title LIKE ? OR body LIKE ?${pfq.clause} LIMIT ${Math.max(1, limit | 0)}`,
           )
-          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>
+          .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
       );
     }
-    if (hasPageOnlyFilter) return rows.slice(0, limit);
+    const pagesTotal = rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
+    if (hasPageOnlyFilter) {
+      if (meta) meta.total = pagesTotal;
+      return rows.slice(0, limit);
+    }
     // observations join the search face (spec: manager-captured observations
     // are searchable) — LIKE scan at v1 scale, FTS promotion later. The
     // synthetic path carries the project prefix so a multi-project root (v2)
@@ -316,11 +320,12 @@ export class RootDb {
       this.db
         .prepare(
           `SELECT project || '/' || session_id || '/' || event AS path, coalesce(tool, event) AS title, project, 'observation' AS type, '[]' AS sources, NULL AS metadata,
-             substr(summary, max(1, instr(lower(summary), lower(?)) - 40), 120) AS snippet
+             substr(summary, max(1, instr(lower(summary), lower(?)) - 40), 120) AS snippet, COUNT(*) OVER () AS _total
            FROM observations WHERE (summary LIKE ? OR tool LIKE ?)${pfo.clause} LIMIT ${Math.max(1, limit | 0)}`,
         )
-        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>
+        .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
     );
+    if (meta) meta.total = pagesTotal + (obs.length ? Number(obs[0]._total ?? obs.length) : 0);
     return [...rows, ...obs].slice(0, limit);
   }
 
@@ -328,11 +333,13 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null }> {
+  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
     const mf = pageFilterSql(filter, projects, "f.project", "f.updated_at", "p.type");
-    return this.db
-      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause} ORDER BY f.updated_at DESC LIMIT ?`)
-      .all(...mf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null }>;
+    const rows = this.db
+      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata, COUNT(*) OVER () AS _total FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause} ORDER BY f.updated_at DESC LIMIT ?`)
+      .all(...mf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total: number }>;
+    if (meta) meta.total = rows.length ? Number(rows[0]._total ?? rows.length) : 0;
+    return rows;
   }
 
   // Indexed path set for a filter — the digest face's pushdown helper. Its L2
@@ -370,14 +377,16 @@ export class RootDb {
       .all(sessionId) as unknown as ObservationRow[];
   }
 
-  recentObservations(limit = 50, projects: string[] | null = null, since?: string, until?: string): Array<ObservationRow & { project: string }> {
+  recentObservations(limit = 50, projects: string[] | null = null, since?: string, until?: string, meta?: { total?: number }): Array<ObservationRow & { project: string }> {
     let clause = projectFilterSql(projects, "project").clause;
     const args: SqlArg[] = projectFilterSql(projects, "project").args;
     if (since) { clause += " AND created_at >= ?"; args.push(since); }
     if (until) { clause += " AND created_at <= ?"; args.push(until); }
-    return this.db
-      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project FROM observations WHERE 1=1${clause} ORDER BY id DESC LIMIT ?`)
-      .all(...args, limit) as unknown as Array<ObservationRow & { project: string }>;
+    const rows = this.db
+      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project, COUNT(*) OVER () AS _total FROM observations WHERE 1=1${clause} ORDER BY id DESC LIMIT ?`)
+      .all(...args, limit) as unknown as Array<ObservationRow & { project: string; _total: number }>;
+    if (meta) meta.total = rows.length ? Number(rows[0]._total ?? rows.length) : 0;
+    return rows;
   }
 
   // -- handoffs --------------------------------------------------------------

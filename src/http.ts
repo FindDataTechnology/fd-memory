@@ -911,16 +911,28 @@ export class Service {
       }
       const projectFilter = url.searchParams.get("scope");
       const projects = projectFilter ? [projectFilter] : proot.db.distinctProjects();
-      const proposals = projects
+      // Total cap (optimize-yongyi-read-surfaces 2.5): this face walks every
+      // partition and used to answer with up to 50 proposals EACH, so the
+      // response grew with the partition count and had no ceiling at all. It is
+      // a review queue, not an export: cap the total and say what is left.
+      const PROMOTIONS_MAX = Math.max(1, Number(process.env.FD_MEMORY_PROMOTIONS_MAX ?? 100) || 100);
+      const all = projects
         .flatMap((p) => proot.db.pendingTierProposals(p, 50).map((x) => ({ ...x, project: p })))
-        .sort((a, b) => (a.proposed_at < b.proposed_at ? 1 : -1))
+        .sort((a, b) => (a.proposed_at < b.proposed_at ? 1 : -1));
+      const proposals = all
+        .slice(0, PROMOTIONS_MAX)
         .map((x) => ({
           path: x.page_rel, project: x.project, type: x.type, title: x.title,
           current_tier: x.current_tier, proposed_tier: x.proposed_tier,
           reason: x.reason, proposed_by: x.proposed_by, proposed_at: x.proposed_at,
         }));
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ proposals }));
+      return void res.end(JSON.stringify({
+        proposals,
+        total: all.length,
+        truncated: all.length > proposals.length,
+        total_partitions: projects.length,
+      }));
     }
 
     if (path === "/memory/promotions/accept" && req.method === "POST") {

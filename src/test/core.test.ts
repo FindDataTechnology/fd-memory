@@ -743,3 +743,123 @@ test("mcp tools: handoff list is capped, newest-first, and says what it left out
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("mcp read faces: list caps are stated, and a clipped row says so", () => {
+  const data = tmpData();
+  try {
+    const a = memberTools(data, "d/p/reads");
+    const call = a.call;
+
+    // --- handoff_list: per-row gist cap (optimize-yongyi-read-surfaces 2.4).
+    // Measured on production: row count was capped but each row carried its
+    // full summary, so the list stayed the single largest tool result.
+    const longSummary = "L".repeat(600);
+    const longId = call("memory_handoff_begin", { summary: longSummary }).body.handoff_id;
+    const shortId = call("memory_handoff_begin", { summary: "short one" }).body.handoff_id;
+    const list = call("memory_handoff_list", {});
+    const longRow = list.body.handoffs.find((h: { id: string }) => h.id === longId)!;
+    const shortRow = list.body.handoffs.find((h: { id: string }) => h.id === shortId)!;
+    assert.equal(longRow.summary.length, 200, "gist is cut to the declared width");
+    assert.equal(longRow.summary_truncated, true);
+    assert.equal(shortRow.summary, "short one", "a row under the cap keeps its bytes");
+    assert.equal(shortRow.summary_truncated, undefined);
+    assert.equal(list.body.truncated, true, "a clipped row makes the page truncated even when the set is complete");
+    assert.equal(list.body.truncated_summaries, 1);
+    // The full text is still reachable through the claim face.
+    const claimed = call("memory_handoff_accept", { handoff_id: longId });
+    assert.equal(claimed.body.handoff.summary.length, 600);
+    assert.equal(claimed.body.truncated, undefined);
+
+    // --- query/recent: the caller's limit is clamped, and the true total rides.
+    for (let i = 0; i < 60; i++) call("memory_write_page", { title: `alpha note ${i}`, body: `body ${i}` });
+    const q = call("memory_query", { q: "alpha", limit: 10000 });
+    assert.equal(q.body.results.length, 50, "clamped to the declared ceiling");
+    assert.equal(q.body.total, 60, "total is the match count, not the page size");
+    assert.equal(q.body.truncated, true);
+    assert.equal(q.body.results.some((r: Record<string, unknown>) => "_total" in r), false, "the count column never leaks");
+    const qDefault = call("memory_query", { q: "alpha" });
+    assert.equal(qDefault.body.results.length, 20, "default page");
+    const qSmall = call("memory_query", { q: "alpha", limit: 3 });
+    assert.equal(qSmall.body.results.length, 3);
+    assert.equal(qSmall.body.total, 60);
+    // A nonsense limit falls back to the default instead of becoming 0 rows.
+    assert.equal(call("memory_query", { q: "alpha", limit: 0 }).body.results.length, 20);
+    assert.equal(call("memory_query", { q: "alpha", limit: -5 }).body.results.length, 20);
+    const r = call("memory_recent", { limit: 10000 });
+    assert.ok(r.body.pages.length <= 50, "recent clamps both legs");
+    assert.ok(r.body.total >= 60, "recent total spans pages and observations");
+
+    // --- handoff_accept: field-level caps, unnamed fields keep their bytes.
+    const bigId = call("memory_handoff_begin", {
+      summary: "s".repeat(5000),
+      open_questions: Array.from({ length: 30 }, (_, i) => `question ${i} ${"q".repeat(600)}`),
+      next_steps: ["one small step"],
+      files_touched: Array.from({ length: 250 }, (_, i) => `file${i}.ts`),
+    }).body.handoff_id;
+    const big = call("memory_handoff_accept", { handoff_id: bigId });
+    assert.equal(big.body.truncated, true);
+    assert.deepEqual(big.body.truncated_fields.sort(), ["files_touched", "open_questions", "summary"]);
+    assert.equal(big.body.handoff.summary.length, 4096);
+    const oq = JSON.parse(big.body.handoff.open_questions) as string[];
+    assert.equal(oq.length, 20, "item count capped");
+    assert.ok(oq.every((s) => s.length <= 500), "item width capped");
+    assert.equal(big.body.handoff.next_steps, JSON.stringify(["one small step"]), "an uncut field keeps its stored bytes");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("mcp read faces: caps are env-overridable and there is one place to look", () => {
+  const data = tmpData();
+  const prev = process.env.FD_MEMORY_LIST_LIMIT_MAX;
+  try {
+    process.env.FD_MEMORY_LIST_LIMIT_MAX = "5";
+    const a = memberTools(data, "d/p/envcaps");
+    for (let i = 0; i < 12; i++) a.call("memory_write_page", { title: `beta note ${i}`, body: `b ${i}` });
+    const q = a.call("memory_query", { q: "beta", limit: 10000 });
+    assert.equal(q.body.results.length, 5, "env widened/narrowed the clamp");
+    assert.equal(q.body.total, 12);
+  } finally {
+    if (prev === undefined) delete process.env.FD_MEMORY_LIST_LIMIT_MAX;
+    else process.env.FD_MEMORY_LIST_LIMIT_MAX = prev;
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("mcp read faces: read_page pages by byte offset and never splits a character", () => {
+  const data = tmpData();
+  const prev = process.env.FD_MEMORY_READ_BODY_MAX_BYTES;
+  try {
+    process.env.FD_MEMORY_READ_BODY_MAX_BYTES = "90";
+    const a = memberTools(data, "d/p/readpage");
+    // 100 CJK chars = 300 UTF-8 bytes, well past the 90-byte slice.
+    const body = "记".repeat(100);
+    a.call("memory_write_page", { title: "long page", body });
+    const first = a.call("memory_read_page", { path: a.call("memory_query", { q: "long page" }).body.results[0].path });
+    assert.equal(first.body.truncated, true);
+    assert.equal(first.body.total_bytes, 301, "body plus the trailing newline");
+    assert.ok(first.body.body.length > 0);
+    assert.ok(!first.body.body.includes("\uFFFD"), "no character was cut in half");
+    // Walk the offsets; the concatenation must equal the original bytes.
+    let acc = first.body.body;
+    let next = first.body.next_offset;
+    let guard = 0;
+    while (next !== null && guard++ < 20) {
+      const step = a.call("memory_read_page", { path: a.call("memory_query", { q: "long page" }).body.results[0].path, offset: next });
+      assert.ok(!step.body.body.includes("\uFFFD"), "every slice lands on a character boundary");
+      acc += step.body.body;
+      next = step.body.next_offset;
+    }
+    assert.equal(acc, `${body}\n`, "offsets cover the page once, no gap and no repeat");
+
+    // A page that fits keeps the pre-existing shape: no truncation fields.
+    a.call("memory_write_page", { title: "short page", body: "short" });
+    const small = a.call("memory_read_page", { path: a.call("memory_query", { q: "short page" }).body.results[0].path });
+    assert.equal(small.body.truncated, undefined);
+    assert.equal(small.body.body, "short\n");
+  } finally {
+    if (prev === undefined) delete process.env.FD_MEMORY_READ_BODY_MAX_BYTES;
+    else process.env.FD_MEMORY_READ_BODY_MAX_BYTES = prev;
+    rmSync(data, { recursive: true, force: true });
+  }
+});

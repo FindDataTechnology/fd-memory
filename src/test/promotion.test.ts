@@ -196,3 +196,38 @@ test("promotion face: read, accept flips tier with origin=human, ignore counts; 
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("promotion face: the review queue has a TOTAL cap across partitions (2.5)", async () => {
+  // Before this cap the face walked every partition and answered with up to 50
+  // proposals EACH, so the response grew with the partition count and had no
+  // ceiling at all. 40 partitions x 3 pending must not ship 120 rows.
+  const data = mkdtempSync(join(tmpdir(), "fdm-promo-cap-"));
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const platform = svc.tokens.mint("platform", "*").token;
+    const root = svc.rootForKey("d-promocap");
+    for (let p = 0; p < 40; p++) {
+      const project = `agent${p}`;
+      for (let i = 0; i < 3; i++) {
+        const rel = `${project}/facts/f${i}.md`;
+        root.writePage(project, "facts", `f${i}`, newPage("fact", `标题 ${p}-${i}`, "内容"));
+        root.db.upsertTierProposal(project, rel, { proposed_tier: "stable", reason: "r", proposed_at: new Date(Date.now() - p * 1000).toISOString() });
+      }
+    }
+    server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const H = { "content-type": "application/json", authorization: `Bearer ${platform}` };
+    const body = (await (await fetch(`${base}/memory/promotions?rootKey=d-promocap`, { headers: H })).json()) as {
+      proposals: unknown[]; total: number; truncated: boolean; total_partitions: number;
+    };
+    assert.equal(body.total_partitions, 40);
+    assert.equal(body.total, 120, "the total is the real queue size, not the page");
+    assert.ok(body.proposals.length <= 100, "the page never exceeds the declared cap");
+    assert.equal(body.truncated, true, "a capped page says so");
+  } finally {
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

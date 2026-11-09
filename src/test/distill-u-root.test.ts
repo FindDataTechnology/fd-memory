@@ -283,3 +283,73 @@ test("patrol-echo dedup: a new L2 with the same 16-char title prefix supersedes 
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("u-root: the daily budget binds DURING the run, not once before it (7.3)", async () => {
+  // Measured 2026-11-08: one owner spent 3,734,259 tokens against a 400,000
+  // daily limit (9.3x) because the gate was read once per run and the spend
+  // was written back only after the whole chunked loop finished — one long run
+  // (or two concurrent projects both reading "0 used") sailed past the cap.
+  // This test pins the new shape: each chunk re-reads the ledger, so the
+  // overshoot is bounded by ONE call instead of the whole backlog.
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const fx = fixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_DAILY_TOKENS: "2000" });
+    const root = fx.openRoot("u-budget@test");
+    for (let i = 1; i <= 6; i++) {
+      root.writePage("default", "notes", `b${i}`, {
+        frontmatter: { type: "note", title: `预算 ${i}`, generated: { by: "test", at: `2026-10-25T0${i}:00:00.000Z` } },
+        body: `第 ${i} 条`,
+      } as never);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await fx.sched.distillNow("u-budget@test", "default");
+    const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    // 6 notes = 3 chunks of 2; each call bills 1300 tokens against a 2000 cap.
+    // Old shape: 3 calls / 3900 tokens. New shape: stop when the ledger crosses.
+    assert.equal(distillCalls().length, 2, "the run stops once the ledger crosses the cap");
+    const day = new Date().toISOString().slice(0, 10);
+    const billed = fx.tokens.distillBudgetUsed("u-budget@test", day);
+    assert.equal(billed.tokens, 2600, "spend is written per call, so the overshoot is one call");
+    assert.ok(billed.tokens < 3900, "the remaining chunks never reached the engine");
+    const st = root.db.getDistillState("default")!;
+    assert.equal(st.last_error, "daily_budget_exhausted", "the gap is recorded, not swallowed");
+    assert.ok((st.gaps ?? 0) >= 1);
+    assert.ok(st.note_cursor, "the cursor keeps the work that did land");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("u-root: two projects of one owner never both pass the budget gate (7.3 concurrency)", async () => {
+  // The double-pass: both projects read the same per-root ledger before either
+  // has written to it, so both cleared a 400k cap. Per-owner serialization
+  // means the second run sees the first one's spend.
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const fx = fixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_DAILY_TOKENS: "1300" });
+    const root = fx.openRoot("u-dual@test");
+    for (const project of ["alpha", "beta"]) {
+      for (let i = 1; i <= 4; i++) {
+        root.writePage(project, "notes", `n${i}`, {
+          frontmatter: { type: "note", title: `${project} 笔记 ${i}`, generated: { by: "test", at: `2026-10-25T0${i}:00:00.000Z` } },
+          body: `正文 ${i}`,
+        } as never);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    }
+    await Promise.all([fx.sched.distillNow("u-dual@test", "alpha"), fx.sched.distillNow("u-dual@test", "beta")]);
+    const day = new Date().toISOString().slice(0, 10);
+    const billed = fx.tokens.distillBudgetUsed("u-dual@test", day);
+    // One run may overshoot by a single call (1300); two runs in parallel would
+    // have reached 2600+ each crossing the cap at their own pace.
+    // The cap is exactly ONE call. Unserialized, both projects read "0 used"
+    // and both call (2 calls / 2600 billed). Serialized, exactly one runs.
+    assert.equal(billed.tokens, 1300, `only one run may bill before the cap binds (billed ${billed.tokens})`);
+    const distillCalls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    assert.equal(distillCalls.length, 1, `only one project's chunk reached the engine (${distillCalls.length})`);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

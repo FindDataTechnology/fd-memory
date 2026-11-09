@@ -73,6 +73,8 @@ function isDistillableRoot(rootKey: string, env: NodeJS.ProcessEnv | undefined):
 export class DistillScheduler {
   private pending = new Map<string, { rootKey: string; project: string; since: number }>();
   private inflight = new Set<string>();
+  // Per-owner serialization for the daily-budget gate (7.3): see distillOne.
+  private rootInflight = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
   private lastFallback = 0;
   private readonly log: { warn: (msg: string) => void; log: (msg: string) => void };
@@ -368,6 +370,13 @@ export class DistillScheduler {
 
   private async distillOne(rootKey: string, project: string): Promise<void> {
     const key = DistillScheduler.key(rootKey, project);
+    // One run per OWNER at a time (optimize-yongyi-read-surfaces 7.3). The
+    // daily budget is per root, and the ledger can only be read before a call,
+    // so two projects of the same owner starting together would both read
+    // "0 used" and both pass. Serializing per root closes that window: the
+    // second project sees the first one's spend on its next drain.
+    if (this.rootInflight.has(rootKey)) return;
+    this.rootInflight.add(rootKey);
     this.pending.delete(key);
     this.inflight.add(key);
     try {
@@ -438,6 +447,16 @@ export class DistillScheduler {
         const cap = (s: string) => String(s ?? "").replace(/\s+/g, " ").slice(0, CAP);
         let spentTotal = 0;
         const callEngine = async (items: DistillItem[]) => {
+          // Budget gate PER CHUNK (optimize-yongyi-read-surfaces 7.3). The gate
+          // used to be read once before the whole run and the spend written back
+          // only after it finished, so one long run — or two concurrent projects
+          // of the same owner, each reading "0 used" — could sail past the daily
+          // cap. Measured 2026-11-08: one owner spent 3,734,259 tokens against a
+          // 400,000 limit (9.3x). Re-reading here makes the cap bind during the
+          // run; the increment is written after EVERY call so a sibling run sees
+          // it too.
+          const spentNow = this.opts.tokens.distillBudgetUsed(rootKey, day).tokens;
+          if (spentNow >= this.dailyLimit()) throw new Error("daily_budget_exhausted");
           const candidates = await this.selectCandidates(root, project, items.map((i) => i.summary).join(" ").slice(0, 1200));
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
@@ -474,20 +493,39 @@ export class DistillScheduler {
             writeEntryVector(root, rel, exp, this.log);
           }
           spentTotal += result.tokens ?? 0;
+          // Written per call, not once per run — this is what makes the gate
+          // bind for a concurrent sibling run (7.3).
+          if ((result.tokens ?? 0) > 0) this.opts.tokens.distillBudgetAdd(rootKey, day, result.tokens ?? 0, 1);
           return (result.facts?.length ?? 0) + (result.experiences?.length ?? 0);
         };
         let wrote = 0;
-        for (let i = 0; i < handoffs.length; i += CHUNK) {
-          const batch = handoffs.slice(i, i + CHUNK);
+        // A chunk that hits the cap stops the run cleanly: cursors keep the work
+        // that already landed, and the gap is recorded for the next day.
+        const runChunks = async (batches: Array<() => Promise<void>>) => {
+          for (const run of batches) {
+            try { await run(); }
+            catch (e) {
+              if ((e as Error)?.message === "daily_budget_exhausted") {
+                root.db.upsertDistillState(project, { last_error: "daily_budget_exhausted", gaps: (state?.gaps ?? 0) + 1, next_attempt_at: tomorrowMs(this.now()) });
+                this.log.warn(`[distill] ${key}: daily budget hit mid-run (${this.opts.tokens.distillBudgetUsed(rootKey, day).tokens}/${this.dailyLimit()}) — stopping, cursors kept`);
+                return;
+              }
+              throw e;
+            }
+          }
+        };
+        await runChunks(Array.from({ length: Math.ceil(handoffs.length / CHUNK) }, (_, c) => async () => {
+          const batch = handoffs.slice(c * CHUNK, c * CHUNK + CHUNK);
           wrote += await callEngine(batch.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${cap(h.summary)}｜next: ${cap(h.next_steps)}`, agent: h.from_agent })));
           root.db.upsertDistillState(project, { handoff_cursor: batch[batch.length - 1].created_at, last_tokens: spentTotal });
-        }
-        for (let i = 0; i < notes.length; i += CHUNK) {
-          const batch = notes.slice(i, i + CHUNK);
+        }));
+        await runChunks(Array.from({ length: Math.ceil(notes.length / CHUNK) }, (_, c) => async () => {
+          const batch = notes.slice(c * CHUNK, c * CHUNK + CHUNK);
           wrote += await callEngine(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
           root.db.upsertDistillState(project, { note_cursor: batch[batch.length - 1].updated_at, last_tokens: spentTotal });
-        }
-        this.opts.tokens.distillBudgetAdd(rootKey, day, spentTotal, wrote);
+        }));
+        // The ledger was already fed per call (7.3); only the run-level metrics
+        // report the total here.
         noteDistill(true, wrote, spentTotal);
         this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
         return;
@@ -579,6 +617,7 @@ export class DistillScheduler {
         await this.promotionPassSafe(rootKey, project);
       } finally {
         this.inflight.delete(key);
+        this.rootInflight.delete(rootKey);
       }
     }
   }
