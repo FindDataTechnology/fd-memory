@@ -115,3 +115,32 @@ test("distill metrics: per-run items/calls/tokens distribution, not just cumulat
   assert.equal(after.failures, 1);
   assert.equal(after.recent.samples, 3, "a failure is not a sample");
 });
+
+test("distill metrics: per-stage prompt/completion profile answers 'which stage costs' (7.1)", async () => {
+  const { noteDistillStages, metricsSnapshot, __resetMetrics } = await import("../metrics.js");
+  __resetMetrics();
+  const before = metricsSnapshot().distill as { stages: Record<string, unknown> };
+  assert.deepEqual(before.stages, {}, "no stages before any run");
+
+  noteDistillStages([
+    { stage: "distill_extract", ok: true, prompt_tokens: 900, completion_tokens: 400 },
+    { stage: "distill_fact_reconcile", ok: true, prompt_tokens: 2100, completion_tokens: 300 },
+    { stage: "distill_reconcile", ok: true, prompt_tokens: 1800, completion_tokens: 250 },
+    { stage: "distill_subject_judge", ok: false, prompt_tokens: 5000, completion_tokens: 5000 },
+    { stage: "fact_cap", ok: true, warning: "dropped 1" },
+  ]);
+  const stages = (metricsSnapshot().distill as { stages: Record<string, { calls: number; prompt: number; completion: number }> }).stages;
+  assert.deepEqual(stages.distill_extract, { calls: 1, prompt: 900, completion: 400 });
+  assert.deepEqual(stages.distill_fact_reconcile, { calls: 1, prompt: 2100, completion: 300 });
+  assert.deepEqual(stages.distill_reconcile, { calls: 1, prompt: 1800, completion: 250 });
+  assert.equal(stages.distill_subject_judge, undefined, "a failed call is not counted");
+  assert.deepEqual(stages.fact_cap, { calls: 1, prompt: 0, completion: 0 }, "bookkeeping entries count as a call but carry no tokens");
+
+  // A second run accumulates instead of replacing.
+  noteDistillStages([{ stage: "distill_extract", ok: true, prompt_tokens: 100, completion_tokens: 50 }]);
+  const again = (metricsSnapshot().distill as { stages: Record<string, { calls: number; prompt: number }> }).stages;
+  assert.deepEqual(again.distill_extract, { calls: 2, prompt: 1000, completion: 450 });
+
+  __resetMetrics();
+  assert.deepEqual((metricsSnapshot().distill as { stages: Record<string, unknown> }).stages, {}, "reset clears the profile");
+});

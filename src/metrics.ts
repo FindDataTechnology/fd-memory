@@ -122,6 +122,12 @@ export function sampleVectorsScale(perRootCounts: number[]): void {
 }
 
 const distillSamples: Array<{ items: number; calls: number; tokens: number; pages: number }> = [];
+// Per-stage token profile (optimize-yongyi-read-surfaces 7.1). A distill run is
+// several engine calls — extract, then a reconcile per stream — and "tokens per
+// call" says nothing about which stage to attack. The sidecar already reports
+// prompt/completion tokens per call with its audit_stage; aggregating them turns
+// "reduce cost" from a guess into a measurement.
+const distillStages: Record<string, { calls: number; prompt: number; completion: number }> = {};
 
 export function noteDistill(
   ok: boolean,
@@ -144,6 +150,20 @@ export function noteDistill(
   } else {
     distills.failures += 1;
     if (error) distills.lastError = String(error).slice(0, 300);
+  }
+}
+
+export function noteDistillStages(calls: unknown): void {
+  if (!Array.isArray(calls)) return;
+  for (const raw of calls) {
+    if (!raw || typeof raw !== "object") continue;
+    const c = raw as { stage?: unknown; prompt_tokens?: unknown; completion_tokens?: unknown; ok?: unknown };
+    if (c.ok === false) continue; // a failed call has no usable profile
+    const stage = String(c.stage ?? "?");
+    const slot = distillStages[stage] ?? (distillStages[stage] = { calls: 0, prompt: 0, completion: 0 });
+    slot.calls += 1;
+    slot.prompt += Number(c.prompt_tokens ?? 0) || 0;
+    slot.completion += Number(c.completion_tokens ?? 0) || 0;
   }
 }
 
@@ -222,6 +242,8 @@ export function metricsSnapshot(): Record<string, unknown> {
       last_error: distills.lastError,
       // Distribution over the last DISTILL_SAMPLE_MAX successful runs.
       recent: distillDistribution(),
+      // Per-stage token profile over the process lifetime.
+      stages: distillStages,
     },
     promotion: { ...promotion },
     meta_filter_queries: metaFilterQueries,
@@ -249,6 +271,7 @@ export function __resetMetrics(): void {
   distills.failures = 0;
   distills.lastError = "";
   distillSamples.length = 0;
+  for (const k of Object.keys(distillStages)) delete distillStages[k];
   vectors.mismatch_excluded = 0;
   vectors.writes_rejected = 0;
   vectors.writes_allowed = 0;

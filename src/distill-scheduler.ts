@@ -13,7 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
-import { noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
+import { noteDistillStages, noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -493,6 +493,7 @@ export class DistillScheduler {
             const rel = root.writeDistillPage(project, "experience", entry, audit);
             writeEntryVector(root, rel, exp, this.log);
           }
+          for (const c of result.llm_calls ?? []) stageCalls.push(c);
           spentTotal += result.tokens ?? 0;
           // Written per call, not once per run — this is what makes the gate
           // bind for a concurrent sibling run (7.3).
@@ -501,6 +502,7 @@ export class DistillScheduler {
         };
         let wrote = 0;
         let chunksIssued = 0;
+        const stageCalls: unknown[] = [];
         // A chunk that hits the cap stops the run cleanly: cursors keep the work
         // that already landed, and the gap is recorded for the next day.
         const runChunks = async (batches: Array<() => Promise<void>>) => {
@@ -529,6 +531,7 @@ export class DistillScheduler {
         // The ledger was already fed per call (7.3); only the run-level metrics
         // report the total here.
         noteDistill(true, wrote, spentTotal, undefined, { items: handoffs.length + notes.length, calls: chunksIssued });
+        noteDistillStages(stageCalls);
         this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
         return;
       }
@@ -600,6 +603,7 @@ export class DistillScheduler {
         items: items.length,
         calls: result.llm_calls?.length ?? 0,
       });
+      noteDistillStages(result.llm_calls);
       this.log.log(`[distill] ${key}: ${result.facts?.length ?? 0} facts, ${result.experiences?.length ?? 0} experiences, ${(result.tokens ?? 0).toLocaleString()} tokens`);
     } catch (e) {
       const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
