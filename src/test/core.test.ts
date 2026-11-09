@@ -863,3 +863,72 @@ test("mcp read faces: read_page pages by byte offset and never splits a characte
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("mcp read faces: a retired page is out of every read face, and history is opt-in", () => {
+  const data = tmpData();
+  try {
+    const a = memberTools(data, "d/p/retired");
+    const call = a.call;
+    const root = a.root;
+    // Discover the partition this token actually reads (a deployment token's
+    // own area is not "default").
+    const probe = call("memory_write_page", { title: "probe", body: "probe" });
+    const project = String(probe.body.path).split("/")[0];
+    // Two L2 pages where the newer names the older in its supersedes list —
+    // written through the production index path, so the edge table is built by
+    // the same code that builds it in production (3.1).
+    root.writeDistillPage(project, "experience", { id: "exp_old", engine: "e", confidence: 0.8, task: "巡检口径 甲", search_keys: ["巡检"], solution: "旧口径", sources: [], supersedes: [] });
+    root.writeDistillPage(project, "experience", { id: "exp_new", engine: "e", confidence: 0.9, task: "巡检口径 乙", search_keys: ["巡检"], solution: "新口径", sources: [], supersedes: ["exp_old"] });
+
+    const q = call("memory_query", { q: "巡检口径" });
+    const paths = q.body.results.map((r: { path: string }) => r.path as string);
+    assert.ok(paths.some((p: string) => p.includes("exp_new")), "the successor is served");
+    assert.ok(!paths.some((p: string) => p.includes("exp_old")), "the retired page is not (search face)");
+    const recent = call("memory_recent", {});
+    assert.ok(!recent.body.pages.some((p: { path: string }) => p.path.includes("exp_old")), "nor in the recency face");
+
+    // Explicit history: visible again, on both faces.
+    const qHist = call("memory_query", { q: "巡检口径", include_superseded: true });
+    assert.ok(qHist.body.results.some((r: { path: string }) => r.path.includes("exp_old")), "history opt-in on search");
+    const rHist = call("memory_recent", { include_superseded: true });
+    assert.ok(rHist.body.pages.some((p: { path: string }) => p.path.includes("exp_old")), "history opt-in on recency");
+
+    // The edge table describes exactly what the pages say (3.2 self-check).
+    const audit = root.db.supersedeEdgeAudit();
+    assert.equal(audit.ok, true);
+    assert.equal(audit.distinct_targets, 1);
+    assert.equal(audit.edges, 1);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("supersede edges: rebuilt by reindex, and the audit catches a short table (3.2)", () => {
+  const data = tmpData();
+  try {
+    const a = memberTools(data, "d/p/edges");
+    const root = a.root;
+    const project = String(a.call("memory_write_page", { title: "probe", body: "probe" }).body.path).split("/")[0];
+    root.writeDistillPage(project, "experience", { id: "exp_a", engine: "e", confidence: 0.8, task: "甲", search_keys: [], solution: "a", sources: [], supersedes: [] });
+    root.writeDistillPage(project, "experience", { id: "exp_b", engine: "e", confidence: 0.8, task: "乙", search_keys: [], solution: "b", sources: [], supersedes: ["exp_a"] });
+    assert.equal(root.db.supersedeEdgeAudit().edges, 1);
+
+    // Rewriting the successor without the supersede link must retract the edge
+    // (the page no longer retires anything).
+    root.writeDistillPage(project, "experience", { id: "exp_b", engine: "e", confidence: 0.8, task: "乙", search_keys: [], solution: "b2", sources: [], supersedes: [] });
+    assert.equal(root.db.supersedeEdgeAudit().edges, 0, "the stale edge is retracted on rewrite");
+
+    // reindex rebuilds both index and edges from the markdown truth.
+    root.writeDistillPage(project, "experience", { id: "exp_c", engine: "e", confidence: 0.8, task: "丙", search_keys: [], solution: "c", sources: [], supersedes: ["exp_a"] });
+    root.db.reindexFromWiki(root.wikiDir);
+    const after = root.db.supersedeEdgeAudit();
+    assert.equal(after.ok, true, "reindex leaves a self-consistent edge table");
+    assert.equal(after.edges, 1);
+
+    // A table that lost a row must be reported, not served silently.
+    root.db.db.prepare("DELETE FROM superseded_edges").run();
+    assert.equal(root.db.supersedeEdgeAudit().ok, false, "a short edge table fails the audit");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

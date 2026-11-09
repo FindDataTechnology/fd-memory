@@ -363,7 +363,17 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     {
       name: "memory_query",
       description: "Full-text search across your accessible partitions (each result carries its source). Optional filter: metadata key/values, time window, layer.",
-      inputSchema: { type: "object", properties: { q: { type: "string" }, limit: { type: "number" }, filter: FILTER_SCHEMA, ...targetProps }, required: ["q"] },
+      inputSchema: {
+        type: "object",
+        properties: {
+          q: { type: "string" },
+          limit: { type: "number" },
+          filter: FILTER_SCHEMA,
+          include_superseded: { type: "boolean", description: "Include pages retired by a newer page (history opt-in)." },
+          ...targetProps,
+        },
+        required: ["q"],
+      },
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
@@ -373,7 +383,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         const meta: { total?: number } = {};
         // `_total` is the window-function count from the same statement (see
         // StoreDb.searchPages): the true match count, not the page size.
-        const results = root.db.searchPages(String(args.q), cap, r.projects, f.filter, meta).map((row) => {
+        const results = root.db.searchPages(String(args.q), cap, r.projects, f.filter, meta, { includeSuperseded: args.include_superseded === true }).map((row) => {
           const { _total, ...rest } = row as typeof row & { _total?: number };
           void _total;
           return {
@@ -391,7 +401,15 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     {
       name: "memory_recent",
       description: "Recent pages and observations across your accessible partitions (each row carries its source). Optional filter: metadata key/values, time window, layer.",
-      inputSchema: { type: "object", properties: { limit: { type: "number" }, filter: FILTER_SCHEMA, ...targetProps } },
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "number" },
+          filter: FILTER_SCHEMA,
+          include_superseded: { type: "boolean", description: "Include pages retired by a newer page (history opt-in)." },
+          ...targetProps,
+        },
+      },
       handler: (args) => {
         const r = readProjects(args.target);
         if (r.error) return r.error;
@@ -404,7 +422,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         const layer = (args.filter as { layer?: string } | undefined)?.layer;
         const pagesMeta: { total?: number } = {};
         const obsMeta: { total?: number } = {};
-        const pages = layer === "L0" ? [] : root.db.recentPages(limit, r.projects, filter, pagesMeta).map((p) => {
+        const pages = layer === "L0" ? [] : root.db.recentPages(limit, r.projects, filter, pagesMeta, { includeSuperseded: args.include_superseded === true }).map((p) => {
           const { _total, ...rest } = p as typeof p & { _total?: number };
           void _total;
           return {

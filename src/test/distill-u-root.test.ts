@@ -264,7 +264,12 @@ test("patrol-echo dedup: a new L2 with the same 16-char title prefix supersedes 
     // a note triggers the distill; the engine returns the same-titled experience
     root.writePage("default", "notes", "n1", { frontmatter: { type: "note", title: "t", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } }, body: "又巡检了一遍" } as never);
     await sched.distillNow("u-dedup@test", "default");
-    const rows = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience");
+    // optimize-yongyi-read-surfaces 3.3: every read face now hides a retired
+    // page, so the raw page is read through the explicit history opt-in — the
+    // default face must NOT list it.
+    const liveRows = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience");
+    assert.ok(!liveRows.some((r) => r.path.includes("exp_r1")), "the retired page is out of the default recency face");
+    const rows = root.db.recentPages(50, ["default"], undefined, undefined, { includeSuperseded: true }).filter((p) => p.type === "experience");
     const r1 = rows.find((r) => r.path.includes("exp_r1"));
     const other = rows.find((r) => r.path.includes("exp_other"));
     const r2 = rows.find((r) => r.path.includes("exp_r2"));

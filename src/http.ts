@@ -1252,8 +1252,17 @@ export class Service {
     if (path === "/admin/reindex") {
       const root = this.rootFor(scope);
       const count = root.db.reindexFromWiki(root.wikiDir);
+      // Self-check (optimize-yongyi-read-surfaces 3.2): the edge table is what
+      // every read face consults to decide "retired". A short table hides the
+      // wrong pages, so the rebuild fails loudly instead of serving a face
+      // built from a half-populated derivation.
+      const audit = root.db.supersedeEdgeAudit();
+      if (!audit.ok) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "supersede_edge_audit_failed", reindexed: count, audit }));
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ reindexed: count }));
+      return void res.end(JSON.stringify({ reindexed: count, supersede_edges: audit.edges }));
     }
 
     // Rebuild EVERY vector of one root under the sidecar's CURRENT model

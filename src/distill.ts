@@ -62,7 +62,11 @@ export function distillCandidates(root: StoreRoot, projects: string[], queryFor:
       if (c) live.push(c);
     }
   }
-  const superseded = new Set(live.flatMap((c) => c.supersedes));
+  // ONE definition of "retired" (optimize-yongyi-read-surfaces 3.4): read the
+  // edge table the write path maintains, instead of re-deriving the set from
+  // this project's page files. The old shape also missed a page retired by a
+  // supersede that lives outside the requested project set.
+  const superseded = root.db.supersededIds();
   const active = live.filter((c) => !superseded.has(c.id));
   if (active.length === 0) return [];
   // keyword overlap ranking; empty query degrades to recency-ish (order kept)

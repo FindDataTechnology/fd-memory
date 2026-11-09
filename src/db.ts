@@ -158,6 +158,14 @@ export class RootDb {
       CREATE TABLE IF NOT EXISTS page_vectors (
         page_rel TEXT PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL
       );
+      -- Supersede edges (optimize-yongyi-read-surfaces 3): one row per retired
+      -- page, so "is this page still alive" is an index probe instead of a
+      -- JSON parse of every page on every read. Derived data: rebuilt by
+      -- reindex, droppable, never the truth (the truth stays in frontmatter).
+      CREATE TABLE IF NOT EXISTS superseded_edges (
+        superseded_id TEXT PRIMARY KEY, by_path TEXT NOT NULL, project TEXT
+      );
+      CREATE INDEX IF NOT EXISTS superseded_edges_by ON superseded_edges(by_path);
       CREATE TABLE IF NOT EXISTS tier_proposals (
         project TEXT NOT NULL, page_rel TEXT NOT NULL,
         proposed_tier TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
@@ -238,6 +246,62 @@ export class RootDb {
     if (!dsCols.has("promotion_cursor")) {
       this.db.exec("ALTER TABLE distill_state ADD COLUMN promotion_cursor TEXT NOT NULL DEFAULT ''");
     }
+    // Supersede edges (optimize-yongyi-read-surfaces 3): page_id is the
+    // basename every supersede list speaks in, so the alive-check is a key
+    // lookup instead of a LIKE across the path. Backfilled once from the paths
+    // that already exist; reindex rebuilds both columns and the edge table.
+    if (!pageCols.has("page_id")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN page_id TEXT");
+      this.db.exec("CREATE INDEX IF NOT EXISTS pages_page_id ON pages(page_id)");
+    }
+    const nullIds = this.db.prepare("SELECT path FROM pages WHERE page_id IS NULL").all() as Array<{ path: string }>;
+    if (nullIds.length > 0) {
+      const upd = this.db.prepare("UPDATE pages SET page_id=? WHERE path=?");
+      for (const row of nullIds) upd.run(this.idOfPath(row.path), row.path);
+    }
+    // Edge backfill runs only when the table is empty but pages already carry
+    // supersede lists — a one-time catch-up for roots that predate the table.
+    const edgeCount = this.db.prepare("SELECT COUNT(*) AS n FROM superseded_edges").get() as { n: number };
+    if (Number(edgeCount.n) === 0) this.rebuildSupersedeEdges();
+  }
+
+  // A page id is the file basename without the extension — the vocabulary
+  // `supersedes` lists already speak.
+  private idOfPath(relPath: string): string {
+    const base = String(relPath).split(/[\\/]/).pop() ?? "";
+    return base.replace(/\.md$/, "");
+  }
+
+  // Rebuild the whole edge table from the pages index (which mirrors
+  // frontmatter). Used by reindex, the first-open backfill, and the self-check.
+  rebuildSupersedeEdges(): number {
+    this.db.exec("DELETE FROM superseded_edges");
+    const rows = this.db.prepare("SELECT path, project, supersedes FROM pages WHERE supersedes IS NOT NULL AND supersedes != '[]'").all() as Array<{ path: string; project: string; supersedes: string }>;
+    const ins = this.db.prepare("INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)");
+    let edges = 0;
+    for (const r of rows) {
+      let ids: string[] = [];
+      try { ids = JSON.parse(r.supersedes) as string[]; } catch { continue; }
+      for (const id of ids) {
+        if (!id) continue;
+        ins.run(id, r.path, r.project);
+        edges++;
+      }
+    }
+    return edges;
+  }
+
+  // Self-check (3.2): the edge table must describe exactly the supersede lists
+  // the pages index carries. A short count means the read face hides the wrong
+  // pages — fail loudly rather than serve it.
+  supersedeEdgeAudit(): { pages_with_supersedes: number; distinct_targets: number; edges: number; ok: boolean } {
+    const rows = this.db.prepare("SELECT supersedes FROM pages WHERE supersedes IS NOT NULL AND supersedes != '[]'").all() as Array<{ supersedes: string }>;
+    const targets = new Set<string>();
+    for (const r of rows) {
+      try { for (const id of JSON.parse(r.supersedes) as string[]) if (id) targets.add(id); } catch { /* malformed row: not a target source */ }
+    }
+    const edges = Number((this.db.prepare("SELECT COUNT(*) AS n FROM superseded_edges").get() as { n: number }).n);
+    return { pages_with_supersedes: rows.length, distinct_targets: targets.size, edges, ok: edges === targets.size };
   }
 
   close(): void {
@@ -254,23 +318,34 @@ export class RootDb {
     const sourceRef = meta?.source_ref ?? null;
     const metadata = meta?.metadata && Object.keys(meta.metadata).length > 0 ? JSON.stringify(meta.metadata) : null;
     this.db.prepare(
-      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref, metadata) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref, metadata, page_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
          title=excluded.title, body=excluded.body, updated_at=excluded.updated_at,
          sources=excluded.sources, supersedes=excluded.supersedes,
-         tags=excluded.tags, tier=excluded.tier, source_ref=excluded.source_ref, metadata=excluded.metadata`,
-    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes, tags, tier, sourceRef, metadata);
+         tags=excluded.tags, tier=excluded.tier, source_ref=excluded.source_ref, metadata=excluded.metadata,
+         page_id=excluded.page_id`,
+    ).run(relPath, project, type, title ?? "", body ?? "", new Date().toISOString(), sources, supersedes, tags, tier, sourceRef, metadata, this.idOfPath(relPath));
+    // Supersede edges follow the write (3.1): the row is retired the moment a
+    // page names it, in the same transaction-free step the index takes.
+    this.db.prepare("DELETE FROM superseded_edges WHERE by_path=?").run(relPath);
+    const insEdge = this.db.prepare("INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)");
+    for (const id of (meta?.supersedes ?? [])) if (id) insEdge.run(String(id), relPath, project);
     this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
   }
 
   deletePageIndex(relPath: string): void {
+    const id = this.idOfPath(relPath);
     this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("DELETE FROM pages WHERE path=?").run(relPath);
+    // Both directions: this page no longer retires anything, and nothing it
+    // used to retire stays hidden (3.1).
+    this.db.prepare("DELETE FROM superseded_edges WHERE by_path=?").run(relPath);
+    this.db.prepare("DELETE FROM superseded_edges WHERE superseded_id=?").run(id);
   }
 
-  searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null; _total?: number }> {
+  searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null; _total?: number }> {
     const pf = projectFilterSql(projects, "p.project");
     // mf is the FULL page predicate (project + time + type + metadata) built
     // for the joined columns; pf alone is kept for the observations leg below.
@@ -286,7 +361,7 @@ export class RootDb {
           .prepare(
             `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip, COUNT(*) OVER () AS _total
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
-             WHERE pages_fts MATCH ?${mf.clause} ORDER BY rank LIMIT ?`,
+             WHERE pages_fts MATCH ?${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY rank LIMIT ?`,
           )
           .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>;
       } catch {
@@ -301,7 +376,7 @@ export class RootDb {
         this.db
           .prepare(
             `SELECT path, title, project, type, sources, metadata, substr(body, max(1, instr(lower(body), lower(?)) - 40), 120) AS snippet, COUNT(*) OVER () AS _total
-             FROM pages WHERE title LIKE ? OR body LIKE ?${pfq.clause} LIMIT ${Math.max(1, limit | 0)}`,
+             FROM pages WHERE (title LIKE ? OR body LIKE ?)${pfq.clause}${RootDb.aliveSql("", opts?.includeSuperseded)} LIMIT ${Math.max(1, limit | 0)}`,
           )
           .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
       );
@@ -329,14 +404,22 @@ export class RootDb {
     return [...rows, ...obs].slice(0, limit);
   }
 
+  // Alive predicate (optimize-yongyi-read-surfaces 3.3): one definition of
+  // "retired" for every read face. A page named by any live supersede list is
+  // history — the digest already hid it, while search/recent still served it.
+  // `includeSuperseded` is the explicit history opt-in.
+  private static aliveSql(alias: string, includeSuperseded?: boolean): string {
+    return includeSuperseded ? "" : ` AND ${alias}page_id NOT IN (SELECT superseded_id FROM superseded_edges)`;
+  }
+
   private ftsQuery(q: string): string {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
+  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
     const mf = pageFilterSql(filter, projects, "f.project", "f.updated_at", "p.type");
     const rows = this.db
-      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata, COUNT(*) OVER () AS _total FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause} ORDER BY f.updated_at DESC LIMIT ?`)
+      .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata, COUNT(*) OVER () AS _total FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY f.updated_at DESC LIMIT ?`)
       .all(...mf.args, limit) as unknown as Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total: number }>;
     if (meta) meta.total = rows.length ? Number(rows[0]._total ?? rows.length) : 0;
     return rows;
@@ -446,9 +529,9 @@ export class RootDb {
   // /digest L1 segment (2026-10-26 benchmark): a type-blind recentPages window
   // loses notes whenever fresh L2/handoff pages churn above them — query the
   // type directly so note recall never depends on other page kinds' activity.
-  recentNotes(project: string, limit = 5): Array<{ path: string; title: string; body: string; updated_at: string }> {
+  recentNotes(project: string, limit = 5, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; body: string; updated_at: string }> {
     return this.db
-      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT ?")
+      .prepare(`SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note'${RootDb.aliveSql("", opts?.includeSuperseded)} ORDER BY updated_at DESC LIMIT ?`)
       .all(project, limit) as never;
   }
 
@@ -456,9 +539,9 @@ export class RootDb {
   // recency-ranked — anything older than rank-5 is invisible until distillation
   // catches up (lossy + latent). Score title+body against the same terms rules
   // as the L2 keyword path; returns matched notes with scores (ties by recency).
-  queryNotes(project: string, queryFor: string, limit = 3): Array<{ path: string; title: string; body: string; updated_at: string; score: number }> {
+  queryNotes(project: string, queryFor: string, limit = 3, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; body: string; updated_at: string; score: number }> {
     const rows = this.db
-      .prepare("SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note' ORDER BY updated_at DESC LIMIT 200")
+      .prepare(`SELECT path, title, body, updated_at FROM pages WHERE project=? AND type='note'${RootDb.aliveSql("", opts?.includeSuperseded)} ORDER BY updated_at DESC LIMIT 200`)
       .all(project) as Array<{ path: string; title: string; body: string | null; updated_at: string }>;
     const terms = String(queryFor ?? "").toLowerCase().split(/[^\p{L}\p{N}_-]+/u).filter((t) => t.length >= 2);
     if (terms.length === 0) return rows.slice(0, limit).map((r) => ({ ...r, body: r.body ?? "", score: 0 }));
@@ -494,11 +577,11 @@ export class RootDb {
   // vector lane reads page_vectors directly — without this set it resurrects
   // pages a newer distillation already retired.
   supersededIds(): Set<string> {
-    const rows = this.db.prepare("SELECT supersedes FROM pages WHERE supersedes IS NOT NULL AND supersedes != '[]'").all() as Array<{ supersedes: string }>;
+    // Reads the edge table (optimize-yongyi-read-surfaces 3.4): the old shape
+    // parsed every page's supersedes JSON on every call, once per digest.
+    const rows = this.db.prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
     const ids = new Set<string>();
-    for (const r of rows) {
-      try { for (const id of JSON.parse(r.supersedes) as string[]) ids.add(id); } catch { /* malformed supersedes — ignore row */ }
-    }
+    for (const r of rows) if (r.superseded_id) ids.add(r.superseded_id);
     return ids;
   }
 
@@ -780,6 +863,9 @@ export class RootDb {
   reindexFromWiki(wikiDir: string): number {
     this.db.exec("DELETE FROM pages");
     this.db.exec("DELETE FROM pages_fts");
+    // Edges are derived from the pages index; a rebuild repopulates them
+    // through indexPage (3.2).
+    this.db.exec("DELETE FROM superseded_edges");
     let count = 0;
     let forgotten = 0;
     const walk = (dir: string) => {
