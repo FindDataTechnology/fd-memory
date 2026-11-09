@@ -42,7 +42,7 @@ export interface RecordedCall {
 // 铸造 + /pages + /digest 的通用路由桩（记录每次调用）。
 export function mintRoutesMinder(opts: {
   mintStatus?: number;
-  digest?: (project: string, q: string) => { status?: number; body: unknown };
+  digest?: (project: string, q: string, url: URL) => { status?: number; body: unknown };
   pages?: (project: string) => { status?: number; body: unknown };
   pagesPost?: (body: any) => { status?: number; body?: unknown };
 } = {}) {
@@ -57,7 +57,7 @@ export function mintRoutesMinder(opts: {
     }
     if (u.includes("/digest")) {
       const uo = new URL(u);
-      const d = opts.digest?.(uo.searchParams.get("project") || "", uo.searchParams.get("q") || "") ?? { body: {} };
+      const d = opts.digest?.(uo.searchParams.get("project") || uo.searchParams.get("projects") || "", uo.searchParams.get("q") || "", uo) ?? { body: {} };
       return res(d.status == null || d.status === 200, d.status ?? 200, d.body);
     }
     if (u.includes("/pages")) {

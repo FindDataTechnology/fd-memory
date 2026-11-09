@@ -302,3 +302,62 @@ test("成员令牌铸造失败：own/shared 两段都丢，legacy 独存（成�
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("合并读（opt-in）：own+shared 一次请求，legacy 仍单独；默认路径逐字节不变（6.2）", async () => {
+  const data = tmpData();
+  try {
+    const urls: URL[] = [];
+    const bodies: Record<string, string> = {
+      "writer-a,shared": "合并块：岗位 + 团队",
+      "f/fleet-9": "旧集群：部署完成",
+    };
+    const minder = mintRoutesMinder({
+      digest: (project, _q, u) => {
+        urls.push(u);
+        return { body: { digest: bodies[project] ?? "" } };
+      },
+    });
+    const fm = await fleetMemoryFor(baseEnv(data), "owner@test.local", minder.impl)!;
+
+    // Opt-in: two requests total (own+shared merged, legacy separate).
+    const out = await fm!.readDigest("fleet-9", "writer-a", "q", { mergeOwnShared: true });
+    assert.deepEqual(out!.sources, ["own+shared", "legacy"]);
+    assert.equal(urls.length, 2, "own 与 shared 合并为一次请求");
+    const mergedUrl = urls.find((u) => u.searchParams.get("projects") !== null)!;
+    assert.equal(mergedUrl.searchParams.get("projects"), "writer-a,shared");
+    assert.equal(mergedUrl.searchParams.get("project"), null, "合并形状不发单 project 参数");
+    // One budget for the merge, twice a single slice — not a slice per partition.
+    assert.equal(Number(mergedUrl.searchParams.get("budget")), Math.floor(1200 / 3) * 2);
+    assert.match(out!.block, /【本岗位与团队记忆】/);
+
+    // Default path still issues the three single reads and keeps the old shape.
+    urls.length = 0;
+    const plain = await fm!.readDigest("fleet-9", "writer-a", "q");
+    assert.equal(urls.length, 3, "默认仍是三段");
+    for (const u of urls) assert.equal(u.searchParams.get("projects"), null, "默认不发 projects 参数");
+    assert.deepEqual(plain!.sources.filter((s) => s !== "own+shared"), ["own", "shared", "legacy"].filter((s) => plain!.sources.includes(s as never)));
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("合并读：服务端不认 projects（400）时退回单段，不丢记忆（6.2 版本差）", async () => {
+  const data = tmpData();
+  try {
+    const urls: URL[] = [];
+    const minder = mintRoutesMinder({
+      digest: (project, _q, u) => {
+        urls.push(u);
+        if (u.searchParams.get("projects") !== null) return { status: 400, body: { error: "project_required" } };
+        return { body: { digest: `块-${project}` } };
+      },
+    });
+    const fm = await fleetMemoryFor(baseEnv(data), "owner@test.local", minder.impl)!;
+    const out = await fm!.readDigest("fleet-9", "writer-a", "q", { mergeOwnShared: true });
+    assert.deepEqual(out!.sources, ["own", "shared", "legacy"], "退回三段，一段不少");
+    assert.ok(urls.some((u) => u.searchParams.get("projects") !== null), "先试过合并形状");
+    assert.equal(urls.filter((u) => u.searchParams.get("project") !== null).length, 3);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

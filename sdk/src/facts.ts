@@ -152,20 +152,23 @@ export interface FleetMemory {
     fleetId: string,
     memberId: string,
     q?: string,
-    opts?: { k?: number; budget?: number; scope?: "own+shared" | "shared" | "off" },
+    opts?: { k?: number; budget?: number; scope?: "own+shared" | "shared" | "off"; mergeOwnShared?: boolean },
   ): Promise<{ sources: string[]; block: string } | null>;
 }
 
 export interface FleetDigestSegment {
-  source: "own" | "shared" | "legacy";
+  source: "own" | "shared" | "legacy" | "own+shared";
   block: string;
 }
 
 // 三段标签：旗舰现行字符串，逐字节金样（test/goldens/fleet-digest-block.txt）。
+// `own+shared` 只在 mergeOwnShared 合并读生效时出现（服务端一次请求返回两个分区）；
+// 默认路径不会产生它，所以既有金样逐字节不变。
 export const FLEET_SEGMENT_LABELS: Record<FleetDigestSegment["source"], string> = {
   own: "本岗位记忆",
   shared: "团队记忆",
   legacy: "历史团队记忆",
+  "own+shared": "本岗位与团队记忆",
 };
 
 // 返回 { writeFact, writeSharedPage, readDigest } 或 null（配置关 / 无 owner /
@@ -202,9 +205,12 @@ export async function fleetMemoryFor(
       if (!r.ok) throw new Error(`pages HTTP ${r.status}`);
       return await r.json();
     };
-    const digestOnce = async (tok: string, project: string, q: string, { k = 5, budget = 1200 } = {}) => {
+    const digestOnce = async (tok: string, project: string, q: string, { k = 5, budget = 1200, merged = false } = {}) => {
       const u = new URL(`${cfg.url}/digest`);
-      u.searchParams.set("project", project);
+      // merged: the project argument is already a comma list → ask the server for
+      // one multi-partition read; otherwise keep the single `project` parameter.
+      if (merged) u.searchParams.set("projects", project);
+      else u.searchParams.set("project", project);
       if (q) u.searchParams.set("q", String(q));
       u.searchParams.set("k", String(k));
       u.searchParams.set("budget", String(budget));
@@ -248,7 +254,7 @@ export async function fleetMemoryFor(
       // 以及经 person 令牌的遗留 f/ digest（过渡窗；随停写自然衰减）。每段
       // 以同样的预算纪律服务端渲染；任何一段失败只丢那一段，绝不丢整节。
       // scope "shared" 跳过自有探测；"off" 到不了这个调用（调用方先查）。
-      async readDigest(fleetId, memberId, q, { k = 5, budget = 1200, scope = "own+shared" } = {}) {
+      async readDigest(fleetId, memberId, q, { k = 5, budget = 1200, scope = "own+shared", mergeOwnShared = false } = {}) {
         const segBudget = Math.max(64, Math.floor(budget / 3));
         let memberTok: string | null = null;
         if (scope === "own+shared") {
@@ -260,11 +266,35 @@ export async function fleetMemoryFor(
           }
         }
         const segments: FleetDigestSegment[] = [];
-        const probes = [
-          { name: "own" as const, project: memberProjectId(memberId), token: memberTok, q: q ?? "" },
-          { name: "shared" as const, project: "shared", token: memberTok, q: q ?? "" },
-          { name: "legacy" as const, project: fleetProjectId(fleetId), token, q: (q ?? "") || String(memberId ?? "") },
-        ];
+        let merged = false;
+        // 合并读（optimize-yongyi-read-surfaces 6.2）：own 与 shared 在同一个根、同一枚
+        // 成员令牌下，服务端一次请求即可跨分区返回（`?projects=a,shared`）。默认关闭
+        // ——沿用单段读取与既有金样；打开后少一次请求，也少一次整根召回与向量解码。
+        // 老服务端不认识 `projects`（会回 400 project_required），此时退回单段路径，
+        // 不把版本差变成丢记忆。
+        if (scope === "own+shared" && mergeOwnShared && memberTok) {
+          try {
+            const out = await digestOnce(
+              memberTok,
+              `${memberProjectId(memberId)},shared`,
+              q ?? "",
+              { k, budget: segBudget * 2, merged: true },
+            );
+            if (typeof out?.block === "string" && out.block.trim()) {
+              segments.push({ source: "own+shared", block: out.block });
+              merged = true;
+            }
+          } catch {
+            merged = false; // fall through to the two single-partition reads
+          }
+        }
+        const probes = merged
+          ? [{ name: "legacy" as const, project: fleetProjectId(fleetId), token, q: (q ?? "") || String(memberId ?? "") }]
+          : [
+            { name: "own" as const, project: memberProjectId(memberId), token: memberTok, q: q ?? "" },
+            { name: "shared" as const, project: "shared", token: memberTok, q: q ?? "" },
+            { name: "legacy" as const, project: fleetProjectId(fleetId), token, q: (q ?? "") || String(memberId ?? "") },
+          ];
         for (const probe of probes) {
           if (!probe.token) continue;
           try {
