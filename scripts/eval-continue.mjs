@@ -25,11 +25,30 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { StoreRoot } from "../dist/store.js";
-import { hybridCandidates } from "../dist/distill-scheduler.js";
-import { renderDigest } from "../dist/digest.js";
-import { validateScenes } from "../dist/continue-scenes.js";
-import { newPage } from "../dist/okf.js";
+import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+
+// Build before importing (optimize-yongyi-read-surfaces 5.5). The eval measures
+// ../dist/*, so a stale build silently reports numbers for code that is no
+// longer in src/ — the worst kind of green. Building here makes "what we
+// measured" and "what is in the tree" the same thing; EVAL_SKIP_BUILD=1 opts
+// out deliberately.
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+if (process.env.EVAL_SKIP_BUILD !== "1") {
+  try {
+    execFileSync("npm", ["run", "build"], { cwd: REPO_ROOT, stdio: "inherit" });
+  } catch {
+    console.error("[eval-continue] build failed — refusing to measure a stale artifact (set EVAL_SKIP_BUILD=1 to measure the existing dist deliberately)");
+    process.exit(1);
+  }
+}
+const { StoreRoot } = await import("../dist/store.js");
+const { hybridCandidates } = await import("../dist/distill-scheduler.js");
+const { renderDigest } = await import("../dist/digest.js");
+const { validateScenes } = await import("../dist/continue-scenes.js");
+const { newPage } = await import("../dist/okf.js");
+const { computeGates } = await import("../dist/continue-gate.js");
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
 const ARMS = ["none", "titles", "digest"];
@@ -459,62 +478,43 @@ async function main() {
     }
 
     // paired aggregation (design D6)
-    const byScene = new Map();
-    for (const r of perScene) {
-      if (!byScene.has(r.scene)) byScene.set(r.scene, {});
-      byScene.get(r.scene)[r.arm] = r;
-    }
-    const pairs = [...byScene.values()].filter((x) => x.none && x.digest);
-    const diffsRe = pairs.map((x) => x.digest.re_derivation - x.none.re_derivation);
-    const diffsFs = pairs.map((x) => x.digest.first_step - x.none.first_step);
-    const wins = pairs.filter((x) => x.digest.re_derivation > x.none.re_derivation).length;
-    const tiesRe = pairs.filter((x) => x.digest.re_derivation === x.none.re_derivation).length;
-    const winsFs = pairs.filter((x) => x.digest.first_step > x.none.first_step).length;
-    const tiesFs = pairs.filter((x) => x.digest.first_step === x.none.first_step).length;
-    const n = pairs.length;
-    const winRateRe = n ? wins / n : 0;
-    const nonInferiorFs = n ? (winsFs + tiesFs) / n : 0;
+    // Gate arithmetic lives in src/continue-gate.ts so it is unit-testable
+    // without spending a model budget (5.1).
+    const G = computeGates(perScene.map((r) => ({ scene: r.scene, arm: r.arm, re_derivation: r.re_derivation, first_step: r.first_step })));
+    const { n, headroom, nonInferior, firstStep, noteDepth: nd, gates: g, verdict } = G;
     const titlesAvgRe = avg(perScene.filter((r) => r.arm === "titles").map((r) => r.re_derivation));
-    const gate1 = avg(diffsRe) >= 0.5 && winRateRe >= 0.7;
-    const gate2 = avg(diffsFs) >= 0.5 && nonInferiorFs >= 0.7;
-    // old-note depth gate (add-u-root-distillation 3.1): distilled digest must
-    // beat the plain digest on the deep scenes by ≥1 avg re_derivation
-    const ddRows = perScene.filter((r) => r.arm === "digest+distill");
-    let noteDepthGate = null, noteDepthDelta = null, noteDepthCeiling = 0;
-    if (ddRows.length) {
-      const ddByScene = new Map(ddRows.map((r) => [r.scene, r]));
-      const deepAll = perScene.filter((r) => r.arm === "digest" && r.scene.startsWith("deep-") && ddByScene.has(r.scene));
-      // Ceiling awareness (run15): when the plain digest arm already scores 5
-      // (max) there is nothing for distillation to add — that scene measures
-      // nothing about depth. Judge the gate on scenes that still have headroom.
-      const deepPlain = deepAll.filter((r) => r.re_derivation < 5);
-      noteDepthCeiling = deepAll.length - deepPlain.length;
-      if (deepPlain.length === 0) {
-        noteDepthGate = true; // all deep scenes already ceilinged by plain digest
-        noteDepthDelta = 0;
-        console.log(`  note-depth: all ${deepAll.length} deep scenes already at ceiling (plain digest = 5) — gate vacuous, PASS`);
-      } else {
-        noteDepthDelta = avg(deepPlain.map((r) => ddByScene.get(r.scene).re_derivation - r.re_derivation));
-        noteDepthGate = noteDepthDelta >= 1;
-        console.log(`  note-depth: distilled vs plain over ${deepPlain.length} deep scenes with headroom${noteDepthCeiling ? ` (${noteDepthCeiling} at ceiling, excluded)` : ""}: avg re delta ${noteDepthDelta.toFixed(2)} (gate ≥1.0) -> ${noteDepthGate ? "PASS" : "FAIL"}`);
-      }
-    }
-    const verdict = n >= 12 ? (gate1 && gate2 && (noteDepthGate === null || noteDepthGate) ? "PASS" : "FAIL") : `INSUFFICIENT_N(${n})`;
 
-    console.log(`\n[eval-continue] paired n=${n}`);
-    console.log(`  re_derivation: avg diff ${avg(diffsRe).toFixed(2)} (gate ≥0.5), win ${wins}/${n} = ${(winRateRe * 100).toFixed(0)}% (gate ≥70%) -> ${gate1 ? "PASS" : "FAIL"}`);
-    console.log(`  first_step:    avg diff ${avg(diffsFs).toFixed(2)} (gate ≥0.5), win+tie ${(winsFs + tiesFs)}/${n} = ${(nonInferiorFs * 100).toFixed(0)}% (gate ≥70%) -> ${gate2 ? "PASS" : "FAIL"}`);
+        console.log(`\n[eval-continue] paired n=${n}`);
+    console.log(`  re_derivation: avg diff ${G.avgDiffRe.toFixed(2)} (gate ≥0.5)`);
+    console.log(`  win (full set, legacy caliber): ${G.full.wins}/${G.full.n} = ${(G.full.rate * 100).toFixed(0)}%`);
+    console.log(`  win (headroom-calibrated, none≤3): ${headroom.wins}/${headroom.n}${headroom.rate === null ? " (no headroom scenes — gate cannot pass)" : ` = ${(headroom.rate * 100).toFixed(0)}% (gate ≥70%)`} -> ${g.reDerivation ? "PASS" : "FAIL"}`);
+    console.log(`  non-inferior (digest ≥ none−1, full set): ${nonInferior.count}/${nonInferior.n} = ${(nonInferior.rate * 100).toFixed(0)}% (gate ≥70%) -> ${g.nonInferior ? "PASS" : "FAIL"}`);
+    console.log(`  first_step:    avg diff ${firstStep.avgDiff.toFixed(2)} (gate ≥0.5), win+tie ${firstStep.wins + firstStep.ties}/${firstStep.n} = ${(firstStep.rate * 100).toFixed(0)}% (gate ≥70%) -> ${g.firstStep ? "PASS" : "FAIL"}`);
+    console.log(nd.status === "not_run"
+      ? `  note-depth: NOT RUN — ${nd.reason}. This gate does NOT count toward the verdict.`
+      : `  note-depth: distilled vs plain over ${nd.scenes} deep scene(s) with headroom${nd.ceilinged ? ` (${nd.ceilinged} at ceiling, excluded)` : ""}: avg re delta ${(nd.avgDelta ?? 0).toFixed(2)} (gate ≥1.0) -> ${nd.status === "pass" ? "PASS" : "FAIL"}`);
     console.log(`  titles arm (reference, no gate): avg re_derivation ${titlesAvgRe.toFixed(2)}`);
     console.log(`[eval-continue] VERDICT: ${verdict} | tokens ${spent.toLocaleString()}/${TOKEN_LIMIT.toLocaleString()} | embed lane ${embedLane ? "on" : "OFF (keyword-only digest)"}`);
 
     const record = {
       ran_at: new Date().toISOString(),
+      code_version: codeVersion,
+      scenes_sha: scenesSha,
+      replay: `node scripts/eval-continue.mjs --scenes ${scenesFile}` + (arg("only") ? ` --only ${arg("only")}` : ""),
       scenes_file: scenesFile, scenes_version: `${selected.length} scenes`,
       agent_model: agentModel, judge_model: judgeModel,
       top_k: Number(process.env.EVAL_TOP_K ?? 5), budget_tokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500),
       embed_lane: embedLane,
       thresholds: { avg_diff_min: 0.5, win_rate_min: 0.7, noninferior_min: 0.7, min_n: 12 },
-      note_depth: ddRows.length ? { scenes: ddRows.length, avg_re_delta: noteDepthDelta, ceilinged: noteDepthCeiling, gate: noteDepthGate } : undefined,
+      // Both calibers ride the baseline (spec: 两套口径数字均入 continue-baseline).
+      win_rates: {
+        full_set: G.full,
+        headroom: G.headroom,
+        non_inferior_full: G.nonInferior,
+        first_step_win_tie: { count: firstStep.wins + firstStep.ties, n: firstStep.n, rate: firstStep.rate },
+      },
+      gates: { re_derivation: g.reDerivation, non_inferior: g.nonInferior, first_step: g.firstStep, note_depth: nd.status },
+      note_depth: { scenes: nd.scenes, avg_re_delta: nd.avgDelta, ceilinged: nd.ceilinged, gate: nd.status, reason: nd.reason },
       per_scene: perScene.map(({ digest_items, ...r }) => ({ ...r, ...(digest_items != null ? { digest_items } : {}) })),
       verdict, tokens: spent,
       run_dir_local: runDir,

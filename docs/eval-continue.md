@@ -27,13 +27,43 @@ node scripts/eval-continue.mjs --only sh-1,wx-4 # 子集（显式选择时跳过
 硬上限 `EVAL_TOKEN_LIMIT`（默认 600k）超限中止、部分结果不落基线。参数：`EVAL_TOP_K`（默认 5）、
 `EVAL_BUDGET_TOKENS`（默认 1500）。可调点见 `scripts/eval-continue.mjs` 头注。
 
-## 判门（design D6，数字定死）
+## 判门（optimize-yongyi-read-surfaces 5；口径与 `memory-eval` spec 对齐）
 
-- 门 1 重推导度：digest−none 平均分差 ≥ 0.5 **且** 配对胜率 ≥ 70%
-- 门 2 首步正确性：平均分差 ≥ 0.5 **且** 胜+平率 ≥ 70%
-- 两门同过 = PASS（v4 注入线立项依据）；n ≥ 12 才出裁决；标题臂只报告不设门。
-- 裁决仅凭 `fixtures/eval/continue-baseline.json` 的 per_scene 明细可复算（基线是本地产物，
-  首次运行自动生成，**不入库**）。
+四组数字，全部由脚本自身计算并在运行输出里带出分母（不再靠人工事后统计）：
+
+| 口径 | 定义 | 门 |
+|---|---|---|
+| 平均分差 | `avg(digest.re_derivation − none.re_derivation)` | ≥ 0.5 |
+| headroom 校准胜率 | 只在 `none ≤ 3` 的场景上算「digest 更好」的比例 | ≥ 70% |
+| 全集非劣率 | 全集上 `digest ≥ none − 1` 的比例 | ≥ 70% |
+| 首步正确性 | 平均分差 ≥ 0.5 且 胜+平率 ≥ 70% | 两条件 |
+
+- 全集胜率（旧口径）仍然打印并写入基线，只作对照，不参与判定——无头部空间的场景
+  （`none ≥ 4`）本来就只能打平，计进分母度量的是场景集构成，不是注入价值。
+- **note-depth 门有三种结局**：`PASS` / `FAIL` / `not_run`。`not_run`（没有任何场景的
+  注入 note 数超过 L1 段容量，或全部已在天花板）只报告、不参与通过条件；「没测」永远
+  不会显示成「通过」。
+- n ≥ 12 才出裁决；标题臂只报告不设门。
+- 裁决仅凭 `fixtures/eval/continue-baseline.json` 的 per_scene 明细可复算。基线是本地
+  产物、**不入库**，但每条记录都带 `code_version`（git rev）、`scenes_sha`（场景集指纹）
+  与 `replay`（可直接重放的命令）。
+
+### 场景集版本与不可复现的历史数字
+
+`fixtures/eval/continue-scenes.json` 在公开化时被整体替换为合成场景（脱敏）。文档下方
+run5–run15 的数字产生于**替换前的场景集**，用当前 21+2 个场景**无法复现**——它们是历史
+记录，不是可比基线。新的基线序列从 2026-11-10 起算。
+
+### 深 note 场景（note-depth 门的真实分母）
+
+`deep-3` / `deep-4` 各带 7 条 note，其中承载期望背景的两条是**按新近排序的旧 note**
+（排在第 6、7 位），L1 段（至多 5 条）够不到，只有蒸馏后的 L2 能召回。离线核查过：
+这两条背景在 plain digest 输出里 0/3 可见——门有真分母，不是空转。
+
+### 评测跑的是源还是产物
+
+脚本从 `../dist/*` 导入。为杜绝「量的代码已经不是 src 里的代码」，脚本启动时**先构建**
+（`npm run build`），构建失败即中止。要故意量现有产物请设 `EVAL_SKIP_BUILD=1`。
 
 ## judge 人工校准（本 change 首轮记录，2026-10-25）
 
