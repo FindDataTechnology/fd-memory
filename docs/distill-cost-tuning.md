@@ -1,6 +1,6 @@
 # 蒸馏成本与分片参数：要不要改 CHUNK
 
-> 2026-11-10 结论。数字取自现网 `tokens.db.distill_budget`（fd-prod，cheap-ts）与
+> 2026-11-10 结论。数字取自一次生产部署的 `tokens.db.distill_budget` 与
 > `distill-scheduler.ts` 的常量。**结论：不改 `CHUNK=2`。**
 
 ## 一、现网实测
