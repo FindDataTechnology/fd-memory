@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Service } from "../http.js";
+import { TokenStore } from "../auth.js";
 import { __resetMetrics, noteDigestRung, noteEmbedSample, noteDistill, metricsSnapshot } from "../metrics.js";
 import { __resetEmbedGate } from "../embed-gate.js";
 
@@ -174,4 +175,24 @@ test("distill truncation: the ceiling signal is narrow and changes nothing by it
   assert.equal(after.truncated.runs, 3);
   assert.equal(after.truncated.truncated, 1);
   assert.equal(after.truncated.ratio, 0.333, "one hit in three runs");
+});
+
+test("distill ledger: run/truncation counters survive a restart (change 1.2, cross-roll)", async () => {
+  const data = mkdtempSync(join(tmpdir(), "fdm-runledger-"));
+  try {
+    const day = new Date().toISOString().slice(0, 10);
+    // Two separate stores over the SAME file = two process lifetimes.
+    const first = new TokenStore(join(data, "tokens.db"), "p");
+    first.distillRunAdd("u-a", day, false);
+    first.distillRunAdd("u-a", day, true);
+
+    const second = new TokenStore(join(data, "tokens.db"), "p");
+    second.distillRunAdd("u-a", day, true);
+    const row = second.distillBudgetRows("u-a", 7)[0];
+    assert.equal(row.runs, 3, "runs accumulate across lifetimes");
+    assert.equal(row.truncated_runs, 2, "so does the truncation count");
+    assert.equal(row.tokens, 0, "unrelated columns untouched");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
 });

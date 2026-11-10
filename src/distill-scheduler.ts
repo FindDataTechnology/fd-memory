@@ -543,6 +543,8 @@ export class DistillScheduler {
         noteDistill(true, wrote, spentTotal, undefined, { items: handoffs.length + notes.length, calls: chunksIssued });
         noteDistillStages(stageCalls);
         noteDistillTruncation(truncatedRuns > 0);
+        // Persisted too: the in-process ratio resets on every roll.
+        this.opts.tokens.distillRunAdd(rootKey, day, truncatedRuns > 0);
         if (truncatedRuns > 0) this.log.warn(`[distill] ${key}: extract hit the completion ceiling in ${truncatedRuns} chunk(s) — output may be truncated (trunc=yes)`);
         this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
         return;
@@ -618,6 +620,7 @@ export class DistillScheduler {
       noteDistillStages(result.llm_calls);
       const truncated = extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS);
       noteDistillTruncation(truncated);
+      this.opts.tokens.distillRunAdd(rootKey, day, truncated);
       if (truncated) this.log.warn(`[distill] ${key}: extract hit the completion ceiling — output may be truncated (trunc=yes)`);
       this.log.log(`[distill] ${key}: ${result.facts?.length ?? 0} facts, ${result.experiences?.length ?? 0} experiences, ${(result.tokens ?? 0).toLocaleString()} tokens`);
     } catch (e) {

@@ -113,12 +113,23 @@ export class TokenStore {
       );
       CREATE TABLE IF NOT EXISTS distill_budget (
         owner_key TEXT, day TEXT, tokens INTEGER NOT NULL DEFAULT 0, llm_calls INTEGER NOT NULL DEFAULT 0,
+        -- Run/truncation counters persist across restarts (fix-distill-extract-
+        -- truncation): the in-process metrics reset on every roll, which is
+        -- exactly when an operator most wants the historical ratio.
+        runs INTEGER NOT NULL DEFAULT 0, truncated_runs INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (owner_key, day)
       );
       CREATE TABLE IF NOT EXISTS root_owner (
         root_key TEXT PRIMARY KEY, owner_user TEXT NOT NULL, bound_at TEXT NOT NULL, source TEXT
       )`,
     );
+    // Pre-existing ledgers: add the run counters once (SQLite has no
+    // ADD COLUMN IF NOT EXISTS).
+    const budgetCols = new Set(
+      (this.db.prepare("PRAGMA table_info(distill_budget)").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!budgetCols.has("runs")) this.db.exec("ALTER TABLE distill_budget ADD COLUMN runs INTEGER NOT NULL DEFAULT 0");
+    if (!budgetCols.has("truncated_runs")) this.db.exec("ALTER TABLE distill_budget ADD COLUMN truncated_runs INTEGER NOT NULL DEFAULT 0");
     this.backfillDefaultGrants();
   }
 
@@ -225,10 +236,22 @@ export class TokenStore {
     return { tokens: Number(row?.tokens ?? 0), llm_calls: Number(row?.llm_calls ?? 0) };
   }
 
-  distillBudgetRows(ownerKey: string, limitDays = 7): Array<{ owner_key: string; day: string; tokens: number; llm_calls: number }> {
+  distillBudgetRows(ownerKey: string, limitDays = 7): Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number }> {
     return this.db
-      .prepare("SELECT owner_key, day, tokens, llm_calls FROM distill_budget WHERE owner_key=? ORDER BY day DESC LIMIT ?")
-      .all(ownerKey, limitDays) as unknown as Array<{ owner_key: string; day: string; tokens: number; llm_calls: number }>;
+      .prepare("SELECT owner_key, day, tokens, llm_calls, runs, truncated_runs FROM distill_budget WHERE owner_key=? ORDER BY day DESC LIMIT ?")
+      .all(ownerKey, limitDays) as unknown as Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number }>;
+  }
+
+  // One row per distill run, with whether its extract hit the completion ceiling.
+  // Persisted rather than in-memory because a roll resets the process counters,
+  // and "did we lose output before the roll" is the question being asked.
+  distillRunAdd(ownerKey: string, day: string, truncated: boolean): void {
+    this.db
+      .prepare(
+        `INSERT INTO distill_budget (owner_key, day, runs, truncated_runs) VALUES (?,?,1,?)
+         ON CONFLICT(owner_key, day) DO UPDATE SET runs = runs + 1, truncated_runs = truncated_runs + excluded.truncated_runs`,
+      )
+      .run(ownerKey, day, truncated ? 1 : 0);
   }
 
   distillBudgetAdd(ownerKey: string, day: string, tokens: number, llmCalls: number): void {
