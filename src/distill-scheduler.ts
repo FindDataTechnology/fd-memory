@@ -13,7 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
-import { noteDistillStages, noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
+import { noteDistillStages, noteDistillTruncation, extractHitCeiling, noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -57,6 +57,10 @@ const FALLBACK_CURSOR_LAG = 200;
 // only runs while comfortable budget headroom remains — session-triggered
 // (active) projects keep their claim on the limit up to the hard stop.
 const FALLBACK_BUDGET_RESERVE = 100_000;
+// The extractor's completion ceiling, mirrored from distiller/engine.py
+// (CodingMemoryExtractor(max_tokens=6000)). Only used to DETECT truncation; the
+// value itself is the engine's, so the two must move together.
+const EXTRACT_MAX_TOKENS = Number(process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 6000) || 6000;
 const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
@@ -494,6 +498,11 @@ export class DistillScheduler {
             writeEntryVector(root, rel, exp, this.log);
           }
           for (const c of result.llm_calls ?? []) stageCalls.push(c);
+          // Truncation visibility only (fix-distill-extract-truncation 1.1/1.3):
+          // this run's extract output may have been cut at the completion
+          // ceiling. Counted and logged; the retry/rollback semantics land in a
+          // later step so this one cannot change behavior.
+          if (extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS)) truncatedRuns += 1;
           spentTotal += result.tokens ?? 0;
           // Written per call, not once per run — this is what makes the gate
           // bind for a concurrent sibling run (7.3).
@@ -502,6 +511,7 @@ export class DistillScheduler {
         };
         let wrote = 0;
         let chunksIssued = 0;
+        let truncatedRuns = 0;
         const stageCalls: unknown[] = [];
         // A chunk that hits the cap stops the run cleanly: cursors keep the work
         // that already landed, and the gap is recorded for the next day.
@@ -532,6 +542,8 @@ export class DistillScheduler {
         // report the total here.
         noteDistill(true, wrote, spentTotal, undefined, { items: handoffs.length + notes.length, calls: chunksIssued });
         noteDistillStages(stageCalls);
+        noteDistillTruncation(truncatedRuns > 0);
+        if (truncatedRuns > 0) this.log.warn(`[distill] ${key}: extract hit the completion ceiling in ${truncatedRuns} chunk(s) — output may be truncated (trunc=yes)`);
         this.log.log(`[distill] ${key}: ${wrote} pages from ${handoffs.length} handoffs + ${notes.length} notes (chunked), ${(spentTotal).toLocaleString()} tokens`);
         return;
       }
@@ -604,6 +616,9 @@ export class DistillScheduler {
         calls: result.llm_calls?.length ?? 0,
       });
       noteDistillStages(result.llm_calls);
+      const truncated = extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS);
+      noteDistillTruncation(truncated);
+      if (truncated) this.log.warn(`[distill] ${key}: extract hit the completion ceiling — output may be truncated (trunc=yes)`);
       this.log.log(`[distill] ${key}: ${result.facts?.length ?? 0} facts, ${result.experiences?.length ?? 0} experiences, ${(result.tokens ?? 0).toLocaleString()} tokens`);
     } catch (e) {
       const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);

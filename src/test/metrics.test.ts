@@ -144,3 +144,34 @@ test("distill metrics: per-stage prompt/completion profile answers 'which stage 
   __resetMetrics();
   assert.deepEqual((metricsSnapshot().distill as { stages: Record<string, unknown> }).stages, {}, "reset clears the profile");
 });
+
+test("distill truncation: the ceiling signal is narrow and changes nothing by itself (change 1.1/1.2)", async () => {
+  const { extractHitCeiling, noteDistillTruncation, metricsSnapshot, __resetMetrics } = await import("../metrics.js");
+  __resetMetrics();
+
+  // Only a SUCCESSFUL coding_extract that reached the ceiling counts.
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 3000 }], 6000), false, "well under");
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 6000 }], 6000), true, "exactly at");
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 5900 }], 6000), true, "within the 2% slack");
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 5700 }], 6000), false, "outside the slack");
+  // A failed call proves nothing about truncation — it never produced output.
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: false, completion_tokens: 6000 }], 6000), false);
+  // Other stages reaching their own limits must not be mistaken for the extract.
+  assert.equal(extractHitCeiling([{ stage: "distill_reconcile", ok: true, completion_tokens: 9999 }], 6000), false);
+  // Malformed input degrades to "not truncated" instead of throwing.
+  assert.equal(extractHitCeiling(null, 6000), false);
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 6000 }], 0), false);
+  // The ratio is configurable for providers that round differently.
+  assert.equal(extractHitCeiling([{ stage: "coding_extract", ok: true, completion_tokens: 5600 }], 6000, 0.9), true);
+
+  const before = metricsSnapshot().distill as { truncated: { runs: number; truncated: number; ratio: number | null } };
+  assert.deepEqual({ runs: before.truncated.runs, truncated: before.truncated.truncated, ratio: before.truncated.ratio }, { runs: 0, truncated: 0, ratio: null }, "no runs yet → ratio is null, not 0");
+
+  noteDistillTruncation(true);
+  noteDistillTruncation(false);
+  noteDistillTruncation(false);
+  const after = metricsSnapshot().distill as { truncated: { runs: number; truncated: number; ratio: number } };
+  assert.equal(after.truncated.runs, 3);
+  assert.equal(after.truncated.truncated, 1);
+  assert.equal(after.truncated.ratio, 0.333, "one hit in three runs");
+});

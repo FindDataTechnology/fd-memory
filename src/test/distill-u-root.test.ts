@@ -358,3 +358,51 @@ test("u-root: two projects of one owner never both pass the budget gate (7.3 con
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("u-root: a run that hit the extract ceiling is counted and logged, but changes nothing yet (change 1.3)", async () => {
+  // Step 1 of fix-distill-extract-truncation is observation only: the run must
+  // behave EXACTLY as before (pages land, cursor advances, budget billed) while
+  // the ceiling hit becomes visible. If this test ever needs changing to make
+  // step 1 pass, the step stopped being observation-only.
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      // A successful extract that reached its 6,000-token ceiling.
+      return { ok: true, status: 200, json: async () => ({
+        facts: [],
+        experiences: [{ id: "exp_ceil", engine: "engine:test/1", task: "触顶批次", search_keys: [], solution: "仍应落库", sources: [], supersedes: [] }],
+        cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        tokens: 24000, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const { noteDistillTruncation: _unused, ...metrics } = await import("../metrics.js");
+    metrics.__resetMetrics();
+    const fx = fixture(data, sidecar, { ...GATES });
+    const root = fx.openRoot("u-ceil@test");
+    root.writePage("default", "notes", "n1", {
+      frontmatter: { type: "note", title: "触顶材料", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } },
+      body: "正文",
+    } as never);
+    await new Promise((r) => setTimeout(r, 5));
+
+    await fx.sched.distillNow("u-ceil@test", "default");
+
+    // Behavior identical to before: the page landed and the cursor moved.
+    const l2 = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience" || p.type === "fact");
+    assert.equal(l2.length, 1, "the run still writes its page");
+    assert.ok(root.db.getDistillState("default")!.note_cursor, "the cursor still advances");
+
+    // And the ceiling hit is now visible.
+    const snap = metrics.metricsSnapshot().distill as { truncated: { runs: number; truncated: number; ratio: number } };
+    assert.equal(snap.truncated.runs, 1);
+    assert.equal(snap.truncated.truncated, 1, "the ceiling hit is counted");
+    assert.equal(snap.truncated.ratio, 1);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

@@ -128,6 +128,12 @@ const distillSamples: Array<{ items: number; calls: number; tokens: number; page
 // prompt/completion tokens per call with its audit_stage; aggregating them turns
 // "reduce cost" from a guess into a measurement.
 const distillStages: Record<string, { calls: number; prompt: number; completion: number }> = {};
+// Truncation visibility (fix-distill-extract-truncation 1.2). A distill run that
+// hit the extract completion ceiling and one that genuinely found nothing are
+// today indistinguishable in every surface we have — both are pages=0 with a
+// clean cursor. Counting the ceiling hits is the first step to telling them
+// apart; it changes no behavior on its own.
+const distillTruncation = { runs: 0, truncated: 0 };
 
 export function noteDistill(
   ok: boolean,
@@ -165,6 +171,32 @@ export function noteDistillStages(calls: unknown): void {
     slot.prompt += Number(c.prompt_tokens ?? 0) || 0;
     slot.completion += Number(c.completion_tokens ?? 0) || 0;
   }
+}
+
+/**
+ * Was this run's extract output cut off by the completion ceiling?
+ *
+ * The signal is deliberately narrow: a successful (ok) coding_extract call whose
+ * completion_tokens reached `maxTokens * ratio`. Parse failures are NOT used —
+ * they can come from malformed output too, and retrying on those would loop
+ * forever. The 2% slack absorbs provider rounding of the token count.
+ */
+export function extractHitCeiling(calls: unknown, maxTokens: number, ratio = Number(process.env.FD_MEMORY_EXTRACT_CEILING_RATIO ?? 0.98)): boolean {
+  if (!Array.isArray(calls) || !(maxTokens > 0)) return false;
+  const ceiling = maxTokens * (Number.isFinite(ratio) && ratio > 0 ? ratio : 0.98);
+  for (const raw of calls) {
+    if (!raw || typeof raw !== "object") continue;
+    const c = raw as { stage?: unknown; ok?: unknown; completion_tokens?: unknown };
+    if (String(c.stage) !== "coding_extract") continue;
+    if (c.ok === false) continue;
+    if (Number(c.completion_tokens ?? 0) >= ceiling) return true;
+  }
+  return false;
+}
+
+export function noteDistillTruncation(truncated: boolean): void {
+  distillTruncation.runs += 1;
+  if (truncated) distillTruncation.truncated += 1;
 }
 
 function distillDistribution(): {
@@ -244,6 +276,13 @@ export function metricsSnapshot(): Record<string, unknown> {
       recent: distillDistribution(),
       // Per-stage token profile over the process lifetime.
       stages: distillStages,
+      // How often a run's extract output reached the completion ceiling.
+      truncated: {
+        runs: distillTruncation.runs,
+        truncated: distillTruncation.truncated,
+        ratio: distillTruncation.runs ? Number((distillTruncation.truncated / distillTruncation.runs).toFixed(3)) : null,
+        ceiling_ratio: Number(process.env.FD_MEMORY_EXTRACT_CEILING_RATIO ?? 0.98),
+      },
     },
     promotion: { ...promotion },
     meta_filter_queries: metaFilterQueries,
@@ -272,6 +311,8 @@ export function __resetMetrics(): void {
   distills.lastError = "";
   distillSamples.length = 0;
   for (const k of Object.keys(distillStages)) delete distillStages[k];
+  distillTruncation.runs = 0;
+  distillTruncation.truncated = 0;
   vectors.mismatch_excluded = 0;
   vectors.writes_rejected = 0;
   vectors.writes_allowed = 0;
