@@ -359,20 +359,19 @@ test("u-root: two projects of one owner never both pass the budget gate (7.3 con
   }
 });
 
-test("u-root: a run that hit the extract ceiling is counted and logged, but changes nothing yet (change 1.3)", async () => {
-  // Step 1 of fix-distill-extract-truncation is observation only: the run must
-  // behave EXACTLY as before (pages land, cursor advances, budget billed) while
-  // the ceiling hit becomes visible. If this test ever needs changing to make
-  // step 1 pass, the step stopped being observation-only.
+test("u-root: a truncated extract now holds the cursor and retries instead of silently dropping the batch (change 2.1/2.2)", async () => {
+  // Step 1 made truncation visible; step 2 acts on it. This test REPLACES the
+  // step-1 assertion "the cursor still advances" on purpose: that guard fired
+  // the moment step 2 changed the contract, which is exactly what it was for.
   const data = tmpData();
   const sidecar = {
     calls: [] as Array<Record<string, unknown>>,
     impl: (async (url: RequestInfo | URL) => {
       if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
-      // A successful extract that reached its 6,000-token ceiling.
+      // Every call is truncated, even when the batch is split down to one item.
       return { ok: true, status: 200, json: async () => ({
         facts: [],
-        experiences: [{ id: "exp_ceil", engine: "engine:test/1", task: "触顶批次", search_keys: [], solution: "仍应落库", sources: [], supersedes: [] }],
+        experiences: [{ id: `exp_${Math.random().toString(36).slice(2, 8)}`, engine: "engine:test/1", task: "触顶批次", search_keys: [], solution: "仍应落库", sources: [], supersedes: [] }],
         cursor_next: {},
         llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
         tokens: 24000, errors: [],
@@ -380,28 +379,103 @@ test("u-root: a run that hit the extract ceiling is counted and logged, but chan
     }) as unknown as typeof fetch,
   };
   try {
-    const { noteDistillTruncation: _unused, ...metrics } = await import("../metrics.js");
+    const metrics = await import("../metrics.js");
     metrics.__resetMetrics();
     const fx = fixture(data, sidecar, { ...GATES });
-    const root = fx.openRoot("u-ceil@test");
+    const root = fx.openRoot("u-hold@test");
+    for (let i = 1; i <= 4; i++) {
+      root.writePage("default", "notes", `n${i}`, {
+        frontmatter: { type: "note", title: `触顶材料 ${i}`, generated: { by: "test", at: `2026-10-26T0${i}:00:00.000Z` } },
+        body: "正文",
+      } as never);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const before = root.db.notesAfter("default", "", 120).map((r) => r.path).sort();
+
+    await fx.sched.distillNow("u-hold@test", "default");
+
+    // Split: 4 notes = 2 chunks of 2; the first chunk truncates, gets split into
+    // 1+1, both still truncate → the run stops and the cursor never moved.
+    assert.equal(fx.tokens.distillBudgetRows("u-hold@test", 7)[0]?.truncated_runs, 1, "the run is booked as truncated");
+    const st = root.db.getDistillState("default")!;
+    assert.equal(st.note_cursor, "", "the cursor did not advance past a truncated batch");
+    assert.equal(st.last_error, "extract_truncated");
+    assert.ok((st.gaps ?? 0) >= 1);
+
+    // The material is therefore still there for the next round.
+    const after = root.db.notesAfter("default", "", 120).map((r) => r.path).sort();
+    assert.deepEqual(after, before, "every note is still pending");
+
+    // And the split was actually attempted: >1 engine call for one 2-item chunk.
+    const distillCalls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    assert.ok(distillCalls.length >= 3, `expected the chunk to be split and retried, saw ${distillCalls.length} call(s)`);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("u-root: a clean run still advances the cursor and books no gap (change 2.3)", async () => {
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [], cursor_next: {},
+        // Well under the ceiling: the model simply found nothing.
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 900 }],
+        tokens: 19000, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = fixture(data, sidecar, { ...GATES });
+    const root = fx.openRoot("u-clean@test");
     root.writePage("default", "notes", "n1", {
-      frontmatter: { type: "note", title: "触顶材料", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } },
+      frontmatter: { type: "note", title: "普通材料", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } },
+      body: "正文",
+    } as never);
+    await new Promise((r) => setTimeout(r, 5));
+    await fx.sched.distillNow("u-clean@test", "default");
+    const st = root.db.getDistillState("default")!;
+    assert.ok(st.note_cursor, "a clean run advances the cursor");
+    assert.equal(st.last_error ?? null, null, "no error recorded");
+    assert.equal(st.gaps ?? 0, 0, "no gap recorded");
+    assert.equal(fx.tokens.distillBudgetRows("u-clean@test", 7)[0]?.truncated_runs, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("u-root: a batch that never stops truncating is stepped over after the gap limit, and says so (change 2.4)", async () => {
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [], cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        tokens: 24000, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = fixture(data, sidecar, { ...GATES, FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS: "2" });
+    const root = fx.openRoot("u-giveup@test");
+    root.writePage("default", "notes", "n1", {
+      frontmatter: { type: "note", title: "永不收敛", generated: { by: "test", at: "2026-10-26T00:00:00.000Z" } },
       body: "正文",
     } as never);
     await new Promise((r) => setTimeout(r, 5));
 
-    await fx.sched.distillNow("u-ceil@test", "default");
-
-    // Behavior identical to before: the page landed and the cursor moved.
-    const l2 = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience" || p.type === "fact");
-    assert.equal(l2.length, 1, "the run still writes its page");
-    assert.ok(root.db.getDistillState("default")!.note_cursor, "the cursor still advances");
-
-    // And the ceiling hit is now visible.
-    const snap = metrics.metricsSnapshot().distill as { truncated: { runs: number; truncated: number; ratio: number } };
-    assert.equal(snap.truncated.runs, 1);
-    assert.equal(snap.truncated.truncated, 1, "the ceiling hit is counted");
-    assert.equal(snap.truncated.ratio, 1);
+    for (let round = 0; round < 2; round++) {
+      root.db.upsertDistillState("default", { next_attempt_at: 0 });
+      await fx.sched.distillNow("u-giveup@test", "default");
+    }
+    const st = root.db.getDistillState("default")!;
+    assert.equal(st.last_error, "extract_truncated_skipped", "the step-over leaves its own error code");
+    assert.equal(st.note_cursor, "", "the cursor still does not jump by itself — it is the gap count that bounds the retries");
   } finally {
     rmSync(data, { recursive: true, force: true });
   }

@@ -61,6 +61,15 @@ const FALLBACK_BUDGET_RESERVE = 100_000;
 // (CodingMemoryExtractor(max_tokens=6000)). Only used to DETECT truncation; the
 // value itself is the engine's, so the two must move together.
 const EXTRACT_MAX_TOKENS = Number(process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 6000) || 6000;
+const EXTRACT_TRUNCATED_MAX_GAPS = Math.max(1, Number(process.env.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
+// Step 2 of fix-distill-extract-truncation. Measured 2/2 runs at exactly the
+// 6,000 ceiling with 120 items → 4 pages, so a truncated batch is not a rare
+// wobble: the batch is simply bigger than the extractor can answer. Halving it
+// once is the smallest change that can actually recover the output.
+const EXTRACT_RETRY_ON_TRUNCATION = String(process.env.FD_MEMORY_EXTRACT_RETRY_ON_TRUNCATION ?? "1") !== "0";
+// The escape hatch (2.4): a batch that truncates even when split must not stall
+// its project forever. After this many consecutive runs, step over it — loudly.
+
 const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
@@ -507,7 +516,23 @@ export class DistillScheduler {
           // Written per call, not once per run — this is what makes the gate
           // bind for a concurrent sibling run (7.3).
           if ((result.tokens ?? 0) > 0) this.opts.tokens.distillBudgetAdd(rootKey, day, result.tokens ?? 0, 1);
-          return (result.facts?.length ?? 0) + (result.experiences?.length ?? 0);
+          return {
+            written: (result.facts?.length ?? 0) + (result.experiences?.length ?? 0),
+            truncated: extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS),
+          };
+        };
+        // Split-and-retry once (2.1). A half that still truncates leaves the
+        // batch unresolved, which is what stops the cursor below.
+        const callWithSplit = async (items: DistillItem[]): Promise<{ written: number; unresolved: boolean }> => {
+          const first = await callEngine(items);
+          if (!first.truncated) return { written: first.written, unresolved: false };
+          if (!retryOnTruncation || items.length <= 1) return { written: first.written, unresolved: true };
+          const mid = Math.ceil(items.length / 2);
+          const halves = await Promise.all([callEngine(items.slice(0, mid)), callEngine(items.slice(mid))]);
+          return {
+            written: first.written + halves.reduce((a, h) => a + h.written, 0),
+            unresolved: halves.some((h) => h.truncated),
+          };
         };
         let wrote = 0;
         let chunksIssued = 0;
@@ -515,7 +540,13 @@ export class DistillScheduler {
         const stageCalls: unknown[] = [];
         // A chunk that hits the cap stops the run cleanly: cursors keep the work
         // that already landed, and the gap is recorded for the next day.
-        const runChunks = async (batches: Array<() => Promise<void>>) => {
+        let truncationStalled = false;
+        // Read from opts.env, not process.env: the scheduler's configuration
+        // surface is opts.env everywhere else (dailyLimit, gates), and a knob
+        // that only honours process.env is untestable and silently divergent.
+        const retryOnTruncation = String(this.opts.env?.FD_MEMORY_EXTRACT_RETRY_ON_TRUNCATION ?? "1") !== "0";
+        const gapsLimit = Math.max(1, Number(this.opts.env?.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
+        const runChunks = async (batches: Array<() => Promise<void>>): Promise<void> => {
           for (const run of batches) {
             try { await run(); }
             catch (e) {
@@ -526,16 +557,24 @@ export class DistillScheduler {
               }
               throw e;
             }
+            // The batch could not be distilled without truncation: leave the
+            // cursor where it is so the material comes back next round, and
+            // stop the run (a bigger batch behind it would truncate too).
+            if (truncationStalled) return;
           }
         };
         await runChunks(Array.from({ length: Math.ceil(handoffs.length / CHUNK) }, (_, c) => async () => {
           const batch = handoffs.slice(c * CHUNK, c * CHUNK + CHUNK);
-          wrote += await callEngine(batch.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${cap(h.summary)}｜next: ${cap(h.next_steps)}`, agent: h.from_agent })));
+          const out = await callWithSplit(batch.map((h) => ({ kind: "handoff" as const, session_id: h.id, at: h.created_at, summary: `${cap(h.summary)}｜next: ${cap(h.next_steps)}`, agent: h.from_agent })));
+          wrote += out.written;
+          if (out.unresolved) { truncationStalled = true; return void holdCursorForTruncation(root, project, key, state, { log: (m) => this.log.warn(m), now: () => this.now(), maxGaps: gapsLimit }); }
           root.db.upsertDistillState(project, { handoff_cursor: batch[batch.length - 1].created_at, last_tokens: spentTotal });
         }));
         await runChunks(Array.from({ length: Math.ceil(notes.length / CHUNK) }, (_, c) => async () => {
           const batch = notes.slice(c * CHUNK, c * CHUNK + CHUNK);
-          wrote += await callEngine(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
+          const out = await callWithSplit(batch.map((n) => ({ kind: "observation" as const, session_id: n.path, at: n.updated_at, event: "user-prompt-submit", tool: "memory_write_page", summary: `${cap(n.title)}：${cap(n.body)}`, agent: "user" })));
+          wrote += out.written;
+          if (out.unresolved) { truncationStalled = true; return void holdCursorForTruncation(root, project, key, state, { log: (m) => this.log.warn(m), now: () => this.now(), maxGaps: gapsLimit }); }
           root.db.upsertDistillState(project, { note_cursor: batch[batch.length - 1].updated_at, last_tokens: spentTotal });
         }));
         // The ledger was already fed per call (7.3); only the run-level metrics
@@ -704,6 +743,32 @@ export async function sidecarEmbed(
 // selection by add-continuation-eval): vector cosine first, keyword fallback +
 // gap-filler, merged deduped, top-k. This is THE production recall path for
 // distiller candidates AND the eval digest arm — one implementation, no drift.
+// Cursor hold for a batch that truncates even when split (2.2 + 2.4).
+//
+// Holding the cursor is what keeps the material: the next run re-submits the
+// same batch. But a batch that can never be distilled would then stall its
+// project forever, so after a few consecutive holds we step over it — and the
+// step-over leaves a distinct error code, because "we skipped it on purpose" and
+// "we lost it silently" must not look the same in the ledger.
+function holdCursorForTruncation(
+  root: StoreRoot,
+  project: string,
+  key: string,
+  state: { gaps?: number } | undefined,
+  sched: { log: (m: string) => void; now: () => number; maxGaps: number },
+): void {
+  const gaps = (state?.gaps ?? 0) + 1;
+  const giveUp = gaps >= Math.max(1, sched.maxGaps);
+  root.db.upsertDistillState(project, {
+    last_error: giveUp ? "extract_truncated_skipped" : "extract_truncated",
+    gaps,
+    next_attempt_at: giveUp ? 0 : sched.now() + 15 * 60_000,
+  });
+  sched.log(giveUp
+    ? `[distill] ${key}: extract truncated ${gaps}x — stepping over this batch (extract_truncated_skipped); it will not be retried`
+    : `[distill] ${key}: extract truncated even after splitting — cursor held, this batch retries next round (gap ${gaps})`);
+}
+
 export async function hybridCandidates(opts: {
   root: StoreRoot;
   project: string;
