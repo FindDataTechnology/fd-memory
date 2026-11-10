@@ -352,31 +352,37 @@ export class DistillScheduler {
       // (add-u-root-distillation D3) have none — the pages index is their
       // project discovery surface.
       for (const row of root.db.recentObservations(2000) as unknown as Array<{ project: string }>) projects.add(row.project);
-      if (rootKey.startsWith("u-")) for (const p of root.db.distinctProjects()) projects.add(p);
+      // Discovery must not be observation-only (fix-distill-extract-truncation 6.2).
+      // A d-root whose material lives entirely in notes/handoffs has no
+      // observations at all, so it never entered `projects` and the scan could
+      // not even see it — measured on m_1793411839219_ld494z: 174 notes, 0
+      // observations, stranded for 162 minutes after a hold. The pages index is
+      // the only surface that knows such a project exists.
+      for (const p of root.db.distinctProjects()) projects.add(p);
       for (const project of projects) {
         const state = root.db.getDistillState(project);
+        // Note/handoff lag is meaningful for BOTH families now: u-roots have no
+        // observation stream at all, and d-roots stranded by a hold are the same
+        // shape (material in notes/handoffs, nothing new observed). Queuing is
+        // still budget-gated above, and distillOne honours next_attempt_at, so a
+        // held project is retried after its backoff rather than immediately.
+        const noteLag = root.db.notesAfter(project, state?.note_cursor ?? "", 1).length > 0;
+        let handoffLag = false;
+        try {
+          handoffLag = !!root.db
+            .db.prepare("SELECT id FROM handoffs WHERE project=? AND created_at>? LIMIT 1")
+            .get(project, state?.handoff_cursor ?? "");
+        } catch { /* best-effort */ }
+        const queue = () => {
+          const key = DistillScheduler.key(rootKey, project);
+          if (!this.pending.has(key)) this.pending.set(key, { rootKey, project, since: 0 });
+        };
         if (rootKey.startsWith("u-")) {
-          // Person roots have no observation stream — the cursor-lag gate below
-          // (maxObservationRowid - obs_cursor) is always 0 for them. Queue on
-          // note/handoff lag instead: any uncursored note or handoff qualifies.
-          const noteLag = root.db.notesAfter(project, state?.note_cursor ?? "", 1).length > 0;
-          let handoffLag = false;
-          try {
-            handoffLag = !!root.db
-              .db.prepare("SELECT id FROM handoffs WHERE project=? AND created_at>? LIMIT 1")
-              .get(project, state?.handoff_cursor ?? "");
-          } catch { /* best-effort */ }
-          if (noteLag || handoffLag) {
-            const key = DistillScheduler.key(rootKey, project);
-            if (!this.pending.has(key)) this.pending.set(key, { rootKey, project, since: 0 });
-          }
+          if (noteLag || handoffLag) queue();
           continue;
         }
         const lag = root.db.maxObservationRowid(project) - (state?.obs_cursor ?? 0);
-        if (lag >= FALLBACK_CURSOR_LAG) {
-          const key = DistillScheduler.key(rootKey, project);
-          if (!this.pending.has(key)) this.pending.set(key, { rootKey, project, since: 0 });
-        }
+        if (lag >= FALLBACK_CURSOR_LAG || noteLag || handoffLag) queue();
       }
     }
   }

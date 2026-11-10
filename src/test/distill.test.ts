@@ -471,3 +471,54 @@ test("d-root: a truncated single-batch run holds the cursor instead of advancing
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("d-root: a held batch is attempted again within 30 minutes (hold must not strand material)", async () => {
+  // 6.2 现场：d-fleet_1793411839219_jv6bm9/m_1793411839219_ld494z 在 2026-11-10T13:38 被扣住后
+  // 162 分钟无人重试，54 条 note 滞留。原因：hold 只写 last_error+next_attempt_at，不把 key 放回
+  // pending；而 fallbackScan 的 d-根分支只看观测 lag —— 该 project observations=0，lag 恒 0，
+  // 永远扫不到。本测试钉住「扣住之后必须有人再来试」。
+  const data = tmpData();
+  const calls: number[] = [];
+  let clock = Date.UTC(2026, 10, 10, 13, 38, 0); // 固定时钟，避免跨日/时区干扰
+  const sidecar = {
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      calls.push(clock);
+      // 每次抽取都顶到 6,000 天花板 → 必被扣住
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [], cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        tokens: 24000, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const tokens = new TokenStore(join(data, "tokens.db"), "p");
+    const root = new StoreRoot(data, "d-hold");
+    const roots = new Map([["d-hold", root]]);
+    const sched = new DistillScheduler({
+      roots, openRoot: (k) => roots.get(k)!, tokens,
+      env: { FD_MEMORY_DISTILLER_URL: "http://sidecar.test", FD_MEMORY_DISTILL_ENABLED: "1" } as unknown as NodeJS.ProcessEnv,
+      fetchImpl: sidecar.impl, now: () => clock,
+    });
+
+    // 只有 note、没有任何观测 —— 正是 6.2 滞留现场的形状
+    root.writePage("agentA", "notes", "n1", {
+      frontmatter: { type: "note", title: "滞留验证", generated: { by: "test", at: "2026-11-10T13:00:00.000Z" } },
+      body: "本体",
+    } as never);
+
+    await sched.drain();
+    assert.equal(calls.length, 1, "首轮兜底扫描应发现这个只有 note 的 d-根 project");
+    assert.equal(root.db.getDistillState("agentA")?.last_error, "extract_truncated", "首轮应被扣住");
+
+    // hold 设的 next_attempt_at 是 +15 分钟；20 分钟后必须有人再来一次（上限 30 分钟）
+    clock += 20 * 60_000;
+    await sched.drain();
+    assert.equal(calls.length, 2, "扣住后 30 分钟内必须有二次尝试，否则材料永久滞留");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
