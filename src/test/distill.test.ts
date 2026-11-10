@@ -425,3 +425,49 @@ test("candidate scoring: search_keys carries its x2 weight, and legacy pages sti
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("d-root: a truncated single-batch run holds the cursor instead of advancing past the material (step 2, formerly uncovered)", async () => {
+  // The d-root path is the one that produced "120 items -> 4 pages": one call
+  // for the whole backlog, ceiling hit, cursors advanced anyway. Step 2 covered
+  // the chunked u-root path first; this pins the other one.
+  const data = tmpData();
+  const calls: Array<{ items: number }> = [];
+  const sidecar = {
+    impl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      const body = JSON.parse(String(init?.body ?? "{}")) as { items?: unknown[] };
+      calls.push({ items: (body.items ?? []).length });
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [],
+        cursor_next: { obs: 9999, handoff: "2999-01-01T00:00:00.000Z" },
+        // Every call sits exactly on the ceiling, so splitting cannot rescue it.
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 30000, completion_tokens: 6000 }],
+        tokens: 36000, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const tokens = new TokenStore(join(data, "tokens.db"), "p");
+    const root = new StoreRoot(data, "d-big");
+    const roots = new Map([["d-big", root]]);
+    const sched = new DistillScheduler({
+      roots, openRoot: (k) => roots.get(k)!, tokens,
+      env: { FD_MEMORY_DISTILLER_URL: "http://sidecar.test", FD_MEMORY_DISTILL_ENABLED: "1" } as unknown as NodeJS.ProcessEnv,
+      fetchImpl: sidecar.impl, now: () => Date.now(),
+    });
+    for (let i = 0; i < 6; i++) {
+      root.db.addObservation({ session_id: `s${i}`, agent: "a", event: "stop", tool: null, summary: `观测 ${i}`, created_at: `2026-11-0${(i % 9) + 1}T00:00:0${i}.000Z`, project: "agentA" });
+    }
+    await sched.distillNow("d-big", "agentA");
+
+    const st = root.db.getDistillState("agentA")!;
+    assert.equal(st.obs_cursor, 0, "the cursor must not jump past material the engine never answered");
+    assert.equal(st.last_error, "extract_truncated");
+    assert.ok(calls.length >= 3, `expected one call plus a split retry, saw ${calls.length}`);
+    assert.equal(calls[0].items, 6, "the whole backlog went in as one batch first");
+    assert.ok(calls.slice(1).every((c) => c.items < 6), "the retry halves are smaller than the original batch");
+    assert.equal(tokens.distillBudgetRows("d-big", 7)[0]?.truncated_runs, 1, "booked as truncated");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

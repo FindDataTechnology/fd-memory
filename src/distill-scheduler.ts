@@ -600,68 +600,105 @@ export class DistillScheduler {
       ].sort((a, b) => (a.at < b.at ? -1 : 1));
 
       const queryFor = obs.slice(-40).map((o) => o.summary).join(" ");
-      const candidates = await this.selectCandidates(root, project, queryFor);
-
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
-      let res: Response;
-      try {
-        res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
-          body: JSON.stringify({ scope: `${rootKey}/${project}`, cursor: { obs: state?.obs_cursor ?? 0, handoff: state?.handoff_cursor ?? "" }, items, candidates }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) throw new Error(`sidecar HTTP ${res.status}`);
-      const result = (await res.json()) as {
-        facts: Array<Record<string, unknown>>;
-        experiences: Array<Record<string, unknown>>;
-        cursor_next: { obs: number; handoff: string };
-        llm_calls: Array<unknown>;
-        tokens: number;
-        errors: string[];
+      // d-root path (fix-distill-extract-truncation step 2). This is the shape
+      // that produced "120 items -> 4 pages": the whole backlog went in ONE
+      // extract call, hit the 6,000 ceiling, and the cursors advanced anyway —
+      // so the rest of the material was gone with no error recorded. Same
+      // treatment as the chunked u-root path: split once, and hold the cursors
+      // when a half still truncates.
+      const retryOnTruncation = String(this.opts.env?.FD_MEMORY_EXTRACT_RETRY_ON_TRUNCATION ?? "1") !== "0";
+      const gapsLimit = Math.max(1, Number(this.opts.env?.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
+      const stageCalls: unknown[] = [];
+      let wrote = 0;
+      let billed = 0;
+      let engineCalls = 0;
+      const callOnce = async (batch: DistillItem[]): Promise<{ written: number; truncated: boolean }> => {
+        const candidates = await this.selectCandidates(root, project, queryFor);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+        let res: Response;
+        try {
+          res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
+            body: JSON.stringify({ scope: `${rootKey}/${project}`, cursor: { obs: state?.obs_cursor ?? 0, handoff: state?.handoff_cursor ?? "" }, items: batch, candidates }),
+            signal: controller.signal,
+          });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!res.ok) throw new Error(`sidecar HTTP ${res.status}`);
+        const result = (await res.json()) as {
+          facts: Array<Record<string, unknown>>;
+          experiences: Array<Record<string, unknown>>;
+          cursor_next: { obs: number; handoff: string };
+          llm_calls: Array<unknown>;
+          tokens: number;
+          errors: string[];
+        };
+        if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
+        for (const fact of result.facts ?? []) {
+          const entry = normalizeEntry(fact, "fact");
+          entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
+          const rel = root.writeDistillPage(project, "fact", entry, audit);
+          writeEntryVector(root, rel, fact, this.log);
+        }
+        for (const exp of result.experiences ?? []) {
+          const entry = normalizeEntry(exp, "experience");
+          entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
+          const rel = root.writeDistillPage(project, "experience", entry, audit);
+          writeEntryVector(root, rel, exp, this.log);
+        }
+        for (const c of result.llm_calls ?? []) stageCalls.push(c);
+        engineCalls += result.llm_calls?.length ?? 0;
+        billed += result.tokens ?? 0;
+        const pages = (result.facts?.length ?? 0) + (result.experiences?.length ?? 0);
+        wrote += pages;
+        if ((result.tokens ?? 0) > 0) this.opts.tokens.distillBudgetAdd(rootKey, day, result.tokens ?? 0, result.llm_calls?.length ?? 0);
+        return { written: pages, truncated: extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS) };
       };
-      if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
 
-      for (const fact of result.facts ?? []) {
-        const entry = normalizeEntry(fact, "fact");
-        entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
-        const rel = root.writeDistillPage(project, "fact", entry, audit);
-        writeEntryVector(root, rel, fact, this.log);
+      let unresolved = false;
+      const first = await callOnce(items);
+      const truncated = first.truncated;
+      if (first.truncated) {
+        if (retryOnTruncation && items.length > 1) {
+          const mid = Math.ceil(items.length / 2);
+          const halves = await Promise.all([callOnce(items.slice(0, mid)), callOnce(items.slice(mid))]);
+          unresolved = halves.some((h) => h.truncated);
+        } else {
+          unresolved = true;
+        }
       }
-      for (const exp of result.experiences ?? []) {
-        const entry = normalizeEntry(exp, "experience");
-        entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
-        const rel = root.writeDistillPage(project, "experience", entry, audit);
-        writeEntryVector(root, rel, exp, this.log);
+
+      if (unresolved) {
+        holdCursorForTruncation(root, project, key, state, { log: (m) => this.log.warn(m), now: () => this.now(), maxGaps: gapsLimit });
+        noteDistillTruncation(true);
+        this.opts.tokens.distillRunAdd(rootKey, day, true);
+        noteDistillStages(stageCalls);
+        noteDistill(true, wrote, billed, undefined, { items: items.length, calls: engineCalls });
+        return;
       }
+
       const maxRid = obs.length ? Math.max(...obs.map((o) => o.rid)) : (state?.obs_cursor ?? 0);
       const maxHandoff = handoffs.length ? handoffs[handoffs.length - 1].created_at : (state?.handoff_cursor ?? "");
       // note cursor is scheduler-local (the engine knows nothing of notes):
       // last note's updated_at, monotonic like handoff_cursor
       const maxNote = notes.length ? notes[notes.length - 1].updated_at : (state?.note_cursor ?? "");
       root.db.upsertDistillState(project, {
-        obs_cursor: Math.max(state?.obs_cursor ?? 0, result.cursor_next?.obs ?? maxRid),
-        handoff_cursor: (result.cursor_next?.handoff ?? maxHandoff) > (state?.handoff_cursor ?? "") ? String(result.cursor_next?.handoff ?? maxHandoff) : maxHandoff,
+        obs_cursor: maxRid,
+        handoff_cursor: maxHandoff > (state?.handoff_cursor ?? "") ? String(maxHandoff) : (state?.handoff_cursor ?? ""),
         note_cursor: maxNote > (state?.note_cursor ?? "") ? maxNote : (state?.note_cursor ?? ""),
         last_error: null,
-        last_tokens: result.tokens ?? 0,
+        last_tokens: billed,
         next_attempt_at: 0,
       });
-      this.opts.tokens.distillBudgetAdd(rootKey, day, result.tokens ?? 0, result.llm_calls?.length ?? 0);
-      noteDistill(true, (result.facts?.length ?? 0) + (result.experiences?.length ?? 0), result.tokens ?? 0, undefined, {
-        items: items.length,
-        calls: result.llm_calls?.length ?? 0,
-      });
-      noteDistillStages(result.llm_calls);
-      const truncated = extractHitCeiling(result.llm_calls, EXTRACT_MAX_TOKENS);
+      noteDistill(true, wrote, billed, undefined, { items: items.length, calls: engineCalls });
+      noteDistillStages(stageCalls);
       noteDistillTruncation(truncated);
       this.opts.tokens.distillRunAdd(rootKey, day, truncated);
       if (truncated) this.log.warn(`[distill] ${key}: extract hit the completion ceiling — output may be truncated (trunc=yes)`);
-      this.log.log(`[distill] ${key}: ${result.facts?.length ?? 0} facts, ${result.experiences?.length ?? 0} experiences, ${(result.tokens ?? 0).toLocaleString()} tokens`);
+      this.log.log(`[distill] ${key}: ${wrote} pages from ${items.length} items, ${billed.toLocaleString()} tokens`);
     } catch (e) {
       const root = this.opts.roots.get(rootKey) ?? this.opts.openRoot(rootKey);
       const state = root.db.getDistillState(project);
