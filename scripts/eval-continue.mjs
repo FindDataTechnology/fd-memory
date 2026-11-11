@@ -48,10 +48,13 @@ const { hybridCandidates } = await import("../dist/distill-scheduler.js");
 const { renderDigest } = await import("../dist/digest.js");
 const { validateScenes, validateMergeCoverage } = await import("../dist/continue-scenes.js");
 const { buildDigestBlock, buildMergeArms } = await import("../dist/eval-digest-arm.js");
+const { computeMergeVerdict } = await import("../dist/merge-verdict.js");
 const { estimateTokens } = await import("../dist/digest.js");
 const { seedSceneHistory } = await import("../dist/eval-fixtures.js");
 const { computeGates } = await import("../dist/continue-gate.js");
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
+// Separate archive from the three-arm baseline: two experiments, two histories.
+const MERGE_BASELINE = new URL("../fixtures/eval/merge-baseline.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
 const ARMS = ["none", "titles", "digest"];
 // Merge comparison arms (add-digest-merge-eval-arm 2.2/2.3): own+shared in one
@@ -120,6 +123,7 @@ async function embedTexts(texts) {
 
 const embedLane = Boolean(process.env.DISTILLER_URL);
 const avg = (a) => (a.length ? a.reduce((s2, x) => s2 + x, 0) / a.length : 0);
+const round3 = (x) => Math.round(x * 1000) / 1000;
 const embed = embedLane ? embedTexts : async () => { throw new Error("no embed lane"); };
 
 // -- scene loading -----------------------------------------------------------
@@ -439,6 +443,50 @@ async function main() {
     if (calibN > 0) {
       console.log(`\n[eval-continue] CALIBRATION MODE — transcripts + judge scores in ${runDir}`);
       console.log(`[eval-continue] blind map (local only): ${JSON.stringify(blindMap)}`);
+      return;
+    }
+
+    // ── merge-arm comparison (add-digest-merge-eval-arm 3.2) ─────────────────
+    // A SEPARATE experiment and a SEPARATE record: merging the two verdicts into
+    // one baseline entry would make "digest helps" and "merging is not worse"
+    // indistinguishable in the history. Same reasoning as design D1.
+    if (mergeMode) {
+      const mv = computeMergeVerdict(perScene.map((r) => ({ scene: r.scene, arm: r.arm, re_derivation: r.re_derivation, first_step: r.first_step })));
+      const tieRate = mv.re_derivation.n ? mv.re_derivation.ties / mv.re_derivation.n : 0;
+      console.log(`\n[eval-continue] MERGE ARM COMPARISON (merged vs split) — n=${mv.n}`);
+      console.log(`  re_derivation: win+tie ${mv.re_derivation.wins + mv.re_derivation.ties}/${mv.re_derivation.n} = ${(mv.re_derivation.winTieRate * 100).toFixed(0)}% (bar ≥${mv.thresholds.winTieRate * 100}%), mean diff ${mv.re_derivation.meanDiff} (bar ≥${mv.thresholds.meanDiff})`);
+      console.log(`  first_step:    win+tie ${mv.first_step.wins + mv.first_step.ties}/${mv.first_step.n} = ${(mv.first_step.winTieRate * 100).toFixed(0)}% (bar ≥${mv.thresholds.winTieRate * 100}%), mean diff ${mv.first_step.meanDiff} (bar ≥${mv.thresholds.meanDiff})`);
+      console.log(`  ties: ${(tieRate * 100).toFixed(0)}% of pairs${tieRate >= 0.5 ? " — judge often cannot tell the arms apart; that IS evidence of no change, but say so in the record" : ""}`);
+      console.log(`  MERGE VERDICT: ${mv.verdict} — ${mv.reason}`);
+      if (mv.verdict === "REGRESSION") console.log(`  ROLLBACK: ${mv.rollback}`);
+      const record = {
+        ran_at: new Date().toISOString(),
+        kind: "merge-arm-comparison",
+        code_version: codeVersion,
+        scenes_sha: scenesSha,
+        replay: `node scripts/eval-continue.mjs --merge --scenes ${scenesFile}` + (arg("only") ? ` --only ${arg("only")}` : ""),
+        scenes_file: scenesFile,
+        scenes_version: `${selected.length} scenes`,
+        agent_model: agentModel,
+        judge_model: judgeModel,
+        embed_lane: embedLane,
+        total_budget_tokens: mergeBudget,
+        arm_budget_tokens: mergeArmsSeen.map((m) => ({ scene: m.scene, merged: m.mergedTokens, split: m.splitTokens, ceiling: m.totalBudget })),
+        thresholds: mv.thresholds,
+        pairing: { re_derivation: mv.re_derivation, first_step: mv.first_step, tie_rate: round3(tieRate) },
+        verdict: mv.verdict,
+        reason: mv.reason,
+        failures: mv.failures,
+        rollback: mv.rollback,
+        per_scene: perScene.map(({ digest_items, ...r }) => ({ ...r, ...(digest_items != null ? { digest_items } : {}) })),
+        tokens: spent,
+        run_dir_local: runDir,
+        blind_map_local_only: blindMap,
+      };
+      const base = existsSync(MERGE_BASELINE) ? JSON.parse(readFileSync(MERGE_BASELINE, "utf8")) : [];
+      base.push(record);
+      writeFileSync(MERGE_BASELINE, JSON.stringify(base, null, 2) + "\n");
+      console.log(`[eval-continue] merge-comparison record appended (${MERGE_BASELINE.pathname}); transcripts in ${runDir}`);
       return;
     }
 
