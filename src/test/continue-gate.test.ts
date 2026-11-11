@@ -96,3 +96,26 @@ test("gate: too few pairs yields INSUFFICIENT_N regardless of the numbers", () =
   const g = computeGates([row("a", "none", 1, 1), row("a", "digest", 5, 5)], { minN: 12 });
   assert.equal(g.verdict, "INSUFFICIENT_N(1)");
 });
+
+// 2.3 (add-digest-merge-eval-arm): the merge arms must never move the three-arm
+// verdict. computeGates pairs (none, digest) only, so this is the property that
+// makes "gates untouched" true rather than accidental — if someone later
+// generalises the pairing, this test goes red.
+test("merge arms cannot change the three-arm verdict", () => {
+  const base: SceneScore[] = [];
+  for (let i = 0; i < 12; i++) {
+    base.push(row(`s${i}`, "none", 2, 2), row(`s${i}`, "digest", 4, 4));
+  }
+  const withMerge: SceneScore[] = [
+    ...base,
+    ...base.map((r) => ({ ...r, arm: r.arm === "digest" ? "digest-merged" : "digest-split" })),
+    ...base.map((r) => ({ ...r, arm: "digest-merged", re_derivation: 1, first_step: 1 })),
+  ];
+  const a = computeGates(base, { minN: 12 });
+  const b = computeGates(withMerge, { minN: 12 });
+  assert.equal(b.n, a.n, "pair count changed — merge rows leaked into the pairing");
+  assert.equal(b.gates.reDerivation, a.gates.reDerivation);
+  assert.equal(b.gates.firstStep, a.gates.firstStep);
+  assert.equal(b.gates.nonInferior, a.gates.nonInferior);
+  assert.equal(b.verdict, a.verdict);
+});

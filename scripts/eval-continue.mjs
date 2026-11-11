@@ -46,12 +46,19 @@ if (process.env.EVAL_SKIP_BUILD !== "1") {
 const { StoreRoot } = await import("../dist/store.js");
 const { hybridCandidates } = await import("../dist/distill-scheduler.js");
 const { renderDigest } = await import("../dist/digest.js");
-const { validateScenes } = await import("../dist/continue-scenes.js");
+const { validateScenes, validateMergeCoverage } = await import("../dist/continue-scenes.js");
+const { buildDigestBlock, buildMergeArms } = await import("../dist/eval-digest-arm.js");
+const { estimateTokens } = await import("../dist/digest.js");
 const { seedSceneHistory } = await import("../dist/eval-fixtures.js");
 const { computeGates } = await import("../dist/continue-gate.js");
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
 const ARMS = ["none", "titles", "digest"];
+// Merge comparison arms (add-digest-merge-eval-arm 2.2/2.3): own+shared in one
+// request vs two single-partition reads. They carry their own verdict and never
+// enter computeGates, which pairs (none, digest) only — see design D1.
+const MERGE_ARMS = ["digest-merged", "digest-split"];
+const MERGE_BUDGET_DEFAULT = 800; // production SDK budgets segBudget*2 = 800
 const SYSTEM_BASE =
   "你是一台长期独立运行的工作 agent（自部署）。现在开启一个全新会话。用户给出本轮任务；请直接给出你的执行计划与第一步动作（可含要执行的命令/工具调用），除非任务本身要求，不要向用户询问可自行获得的背景。";
 
@@ -122,9 +129,16 @@ const only = arg("only")?.split(",").map((s) => s.trim());
 let selected = only ? scenes.filter((s) => only.includes(s.id)) : scenes;
 const armFilter = arg("arm"); // e.g. "digest" — single-arm mode (grid runs): no pairing verdict
 const prepDistillOn = Boolean(process.env.EVAL_PREP_DISTILL); // old-note depth ablation (add-u-root-distillation)
-const v = validateScenes(selected);
-if (!v.ok && !arg("calib")) {
-  console.error("[eval-continue] scene gate REFUSED:\n" + v.errors.map((e) => `  - ${e}`).join("\n"));
+// Merge mode (add-digest-merge-eval-arm 2.3/3.x): run ONLY the two comparison
+// arms on the merge scene set. It is a separate experiment with its own verdict,
+// so it must not touch the three-arm gate — neither its scene gate nor its
+// scoring.
+const mergeMode = process.argv.includes("--merge") || Boolean(process.env.EVAL_MERGE_ARMS);
+const mergeBudget = Number(process.env.EVAL_MERGE_BUDGET ?? MERGE_BUDGET_DEFAULT);
+const mergeArmsSeen = [];
+const sceneGate = mergeMode ? validateMergeCoverage(selected) : validateScenes(selected);
+if (!sceneGate.ok && !arg("calib")) {
+  console.error(`[eval-continue] scene gate REFUSED (${mergeMode ? "merge coverage" : "three-arm entry"}):\n` + sceneGate.errors.map((e) => `  - ${e}`).join("\n"));
   process.exit(1);
 }
 if (only) console.log(`[eval-continue] --only subset: entry gate skipped by explicit selection (${selected.length} scenes)`);
@@ -137,13 +151,16 @@ mkdirSync(runDir, { recursive: true });
 const agentModel = process.env.EVAL_AGENT_MODEL ?? process.env.MEMORY_LLM_MODEL;
 const judgeModel = process.env.EVAL_JUDGE_MODEL ?? process.env.MEMORY_LLM_MODEL;
 
-// blind map: arms → A/B/C, shuffled once per run, stored in the run record
-const labels = ["A", "B", "C"];
+// blind map: active arms → one letter each, shuffled once per run, stored in the
+// run record. Labels are generated per run so a judge cannot learn "A is the
+// good one" across runs. Five arms (merge mode) ⇒ five letters.
+const activeArms = mergeMode ? MERGE_ARMS : ARMS;
+const labels = activeArms.map((_, i) => String.fromCharCode(65 + i));
 for (let i = labels.length - 1; i > 0; i--) {
   const j = Math.floor(Math.random() * (i + 1));
   [labels[i], labels[j]] = [labels[j], labels[i]];
 }
-const blindMap = Object.fromEntries(ARMS.map((a, i) => [a, labels[i]]));
+const blindMap = Object.fromEntries(activeArms.map((a, i) => [a, labels[i]]));
 
 // -- scratch loading ----------------------------------------------------------
 function loadScene(scene, dataDir) {
@@ -185,61 +202,18 @@ function titlesBlock(root, project) {
   return `【集群共享记忆】本集群此前回合的沉淀，供参考：\n${block}`;
 }
 
-async function digestBlock(root, project, scene) {
-  const k = Number(process.env.EVAL_TOP_K ?? 5);
-  const candidates = await hybridCandidates({ root, project, queryFor: scene.task, k, embed, log: { warn: (m) => console.warn(`[eval-continue] ${m}`) } });
-  const byId = new Map(scene.history.pages.map((p) => [p.id, p]));
-  const items = candidates
-    .map((c) => {
-      const meta = byId.get(c.id);
-      return {
-        id: c.id, layer: "L2", kind: c.kind, title: c.task,
-        // page bodies carry "## Task/## Solution" section headers — strip for
-        // the excerpt (render stays pure; this is producer-side hygiene)
-        excerpt: String(c.solution ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 150),
-        confidence: meta?.confidence ?? null, updated_at: meta?.updated_at ?? null,
-      };
-    });
-  // L1 notes appended after L2 — verbatim the production /digest face
-  // (http.ts add-digest-note-recall): top-3 recent notes of the project,
-  // headers stripped, 400-char excerpt. Notes ride recent-first, not query-
-  // matched, faithful to the seam the chat lane reads.
-  const NOTES_LIMIT = 5;
-  const matched = scene.task.trim() ? root.db.queryNotes(project, scene.task, 3) : [];
-  const matchedPaths = new Set(matched.map((p) => p.path));
-  const merged = [
-    ...matched,
-    ...root.db.recentNotes(project, NOTES_LIMIT).filter((p) => !matchedPaths.has(p.path)),
-  ].slice(0, NOTES_LIMIT);
-  const noteItems = merged.map((p) => {
-    const page = root.readPageByRel(p.path);
-    return {
-      id: p.path, layer: "L1", kind: "note", title: p.title,
-      excerpt: String(page?.body ?? "").replace(/^#{1,3} [^\n]*$/gm, "").replace(/[ \t]+/g, " ").trim().slice(0, 100),
-      confidence: null, updated_at: p.updated_at,
-    };
+async function digestBlock(root, project, scene, nowIso) {
+  // Delegates to src/eval-digest-arm.ts (add-digest-merge-eval-arm 2.1): the
+  // three-arm digest block and the merge arms must come from ONE implementation,
+  // or "same retrieval, same budget" is a claim rather than a property.
+  const r = await buildDigestBlock(root, scene, project, {
+    budget: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500),
+    k: Number(process.env.EVAL_TOP_K ?? 5),
+    embed,
+    now: nowIso,
+    ...(process.env.EVAL_NO_HANDOFFS ? { noHandoffs: true } : {}),
   });
-  // Reference 名份车道（add-unified-memory-and-outputs）：与生产 /digest
-  // 同规则——citation-by-name（name-only）条目排在 L2/note 之前，
-  // canonical 顺位在前；草稿不 query 命中不入。
-  const refs = scene.task.trim() ? root.db.queryReferences(project, scene.task, Math.min(3, Math.max(1, Math.floor(k / 2)))) : root.db.queryReferences(project, "", Math.min(3, Math.max(1, Math.floor(k / 2))));
-  const refItems = refs.map((p) => ({
-    id: p.path, layer: "L2", kind: "reference", title: `见资料库《${p.title}》`,
-    excerpt: String(p.body ?? "").replace(/\s+/g, " ").trim().slice(0, 120),
-    confidence: null, updated_at: p.updated_at,
-  }));
-  const allItems = [...refItems, ...items, ...noteItems];
-  // mirror the production /digest assembly (open-handoffs cap at 3,
-  // digest-lane starvation fix) so eval conclusions extrapolate
-  // mirror the production recency gate (48h): "待认领" = actionable now
-  const HANDOFF_MAX_AGE_MS = 48 * 3600_000;
-  // ABLATION (adjudication, 2026-10-26): EVAL_NO_HANDOFFS=1 renders the digest
-  // without the open-handoffs segment at all — isolates the handoff segment's
-  // pull from the memory content's value.
-  const handoffs = process.env.EVAL_NO_HANDOFFS ? [] : scene.history.handoffs.filter((h) => h.state === "open" && Date.now() - Date.parse(h.created_at) < HANDOFF_MAX_AGE_MS).slice(0, 3)
-    .map((h) => ({ id: h.id, summary: h.summary, to_agent: h.to_agent, created_at: h.created_at }));
-  const block = renderDigest({ items: allItems, handoffs, budgetTokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500), now: new Date().toISOString() });
-  return { block, nItems: allItems.length };
+  return { block: r.block, nItems: r.nItems };
 }
 
 // -- judge ----------------------------------------------------------------------
@@ -336,17 +310,35 @@ async function main() {
   const perScene = [];
   try {
     for (const scene of selected) {
-      const { root, project } = loadScene(scene, data);
+      const { root, project, sharedProject } = loadScene(scene, data);
+      // One frozen `now` per scene: two arms rendered at different wall-clock
+      // instants would differ in the recency gate and the header date.
+      const sceneNow = new Date().toISOString();
       if (embedLane) {
         try { await vectorize(root, project, scene); } catch (e) { console.warn(`[eval-continue] ${scene.id}: vectorize failed (${e.message}) — digest arm keyword-only`); }
       }
       const blocks = {};
       blocks.none = null;
       blocks.titles = titlesBlock(root, project);
-      const d = await digestBlock(root, project, scene);
+      const d = await digestBlock(root, project, scene, sceneNow);
       blocks.digest = d.block;
+      // Merge comparison (add-digest-merge-eval-arm 2.2): both arms read the
+      // SAME partitions with the SAME total budget; only segmentation differs.
+      // Built only in merge mode — the three-arm gate must not pay for them.
+      if (mergeMode) {
+        const arms = await buildMergeArms(root, scene, project, {
+          embed,
+          now: sceneNow,
+          totalBudget: mergeBudget,
+          sharedProject,
+          ...(process.env.EVAL_NO_HANDOFFS ? { noHandoffs: true } : {}),
+        });
+        blocks["digest-merged"] = arms.merged.block;
+        blocks["digest-split"] = arms.split.block;
+        mergeArmsSeen.push({ scene: scene.id, mergedTokens: estimateTokens(arms.merged.block), splitTokens: arms.split.block ? estimateTokens(arms.split.block) : 0, totalBudget: arms.totalBudget });
+      }
 
-      for (const arm of armFilter ? [armFilter] : ARMS) {
+      for (const arm of armFilter ? [armFilter] : activeArms) {
         const inject = blocks[arm];
         const system = inject ? `${SYSTEM_BASE}\n\n${inject}` : SYSTEM_BASE;
         // Reasoning lane: a tight budget burns out in reasoning with an EMPTY
@@ -391,7 +383,7 @@ async function main() {
       const noteDepth = (scene.history.notes?.length ?? 0) > 3;
       if (prepDistillOn && noteDepth && !armFilter) {
         const wrote = await prepDistill(root, project, scene);
-        const dd = await digestBlock(root, project, scene);
+        const dd = await digestBlock(root, project, scene, sceneNow);
         const arm = "digest+distill";
         const inject = dd.block;
         let agent = await chat(agentModel, [
@@ -453,7 +445,14 @@ async function main() {
     // paired aggregation (design D6)
     // Gate arithmetic lives in src/continue-gate.ts so it is unit-testable
     // without spending a model budget (5.1).
-    const G = computeGates(perScene.map((r) => ({ scene: r.scene, arm: r.arm, re_derivation: r.re_derivation, first_step: r.first_step })));
+    // Only the three pinned arms reach the gate (add-digest-merge-eval-arm 2.3):
+    // computeGates pairs (none, digest), so a digest-* row would be ignored
+    // anyway — filtering here keeps that explicit instead of relying on it.
+    const G = computeGates(
+      perScene
+        .filter((r) => ARMS.includes(r.arm))
+        .map((r) => ({ scene: r.scene, arm: r.arm, re_derivation: r.re_derivation, first_step: r.first_step }))
+    );
     const { n, headroom, nonInferior, firstStep, noteDepth: nd, gates: g, verdict } = G;
     const titlesAvgRe = avg(perScene.filter((r) => r.arm === "titles").map((r) => r.re_derivation));
 
