@@ -5,7 +5,10 @@ COPY distiller/requirements.txt ./requirements.txt
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && pip install --no-cache-dir -r requirements.txt \
     && apt-get purge -y git && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-COPY distiller/app.py distiller/engine.py ./
+# embed_body.py holds the response classification (kept dependency-free so it is
+# testable without openai/hy-memory). It MUST be copied: engine.py imports it,
+# and a missing module here fails at container start, not at build time.
+COPY distiller/app.py distiller/engine.py distiller/embed_body.py ./
 # Container deployments reach this port over the compose/k8s pod network, not
 # loopback — bind all interfaces here, while the app still refuses to start
 # without DISTILLER_SHARED_TOKEN (docker-compose and the k8s manifest set it).
