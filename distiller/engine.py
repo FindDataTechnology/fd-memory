@@ -23,6 +23,8 @@ import uuid
 
 import openai
 
+from embed_body import parse_embeddings_response
+
 from hy_memory.agent.llm_provider import LLMProvider
 from hy_memory.config import MemoryConfig
 from hy_memory.coding.extractor import CodingMemoryExtractor
@@ -202,8 +204,15 @@ async def embed_texts(provider_factory, texts):
     client = openai.AsyncOpenAI(api_key=k, base_url=b or None)
     try:
         resp = await client.embeddings.create(model=EMBED_MODEL, input=list(texts)[:EMBED_BATCH_MAX])
-        vectors = [d.embedding for d in resp.data]
-        tokens = getattr(resp.usage, "total_tokens", 0) or 0
+        # Body classification lives in embed_body.py (no heavy imports) so the
+        # two failure shapes are assertable without a python env: the lane
+        # sometimes answers 200 with HTML/plain text, which used to surface as
+        # `AttributeError: 'str' object has no attribute 'data'` — a name that
+        # reads like our bug and hides the upstream entirely.
+        vectors, tokens, err = parse_embeddings_response(resp)
+        if err:
+            errors.append(err)
+            return [], EMBED_MODEL, 0, errors
         return vectors, EMBED_MODEL, tokens, errors
     except Exception as e:
         errors.append(f"embed {type(e).__name__}: {str(e)[:160]}")
