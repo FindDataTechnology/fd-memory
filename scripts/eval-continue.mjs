@@ -163,9 +163,20 @@ const prepDistillOn = Boolean(process.env.EVAL_PREP_DISTILL); // old-note depth 
 const mergeMode = process.argv.includes("--merge") || Boolean(process.env.EVAL_MERGE_ARMS);
 const mergeBudget = Number(process.env.EVAL_MERGE_BUDGET ?? MERGE_BUDGET_DEFAULT);
 const mergeArmsSeen = [];
-const sceneGate = mergeMode ? validateMergeCoverage(selected) : validateScenes(selected);
+// Merge mode needs BOTH gates. Coverage alone would let an UNREVIEWED scene set
+// through: `validateMergeCoverage` only counts partitions, while the review flag
+// (脱敏复核 is a human act) is enforced by `validateScenes`. A merge run that
+// silently skipped the human gate would spend real tokens on numbers nobody
+// vetted — which is exactly what this comparison is supposed to be immune to.
+const sceneGate = mergeMode
+  ? (() => {
+      const shape = validateScenes(selected);
+      const cover = validateMergeCoverage(selected);
+      return { ok: shape.ok && cover.ok, errors: [...shape.errors, ...cover.errors] };
+    })()
+  : validateScenes(selected);
 if (!sceneGate.ok && !arg("calib")) {
-  console.error(`[eval-continue] scene gate REFUSED (${mergeMode ? "merge coverage" : "three-arm entry"}):\n` + sceneGate.errors.map((e) => `  - ${e}`).join("\n"));
+  console.error(`[eval-continue] scene gate REFUSED (${mergeMode ? "merge: shape+review then coverage" : "three-arm entry"}):\n` + sceneGate.errors.map((e) => `  - ${e}`).join("\n"));
   process.exit(1);
 }
 if (only) console.log(`[eval-continue] --only subset: entry gate skipped by explicit selection (${selected.length} scenes)`);

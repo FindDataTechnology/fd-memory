@@ -180,3 +180,30 @@ test("shared-only history is not 'empty history'", () => {
   const v = validateScenes(Array.from({ length: 11 }, (_, i) => scene({ id: `s${i}` })).concat([s]));
   assert.ok(!v.errors.join(";").match(/sh-only: 前史为空/), v.errors.join(";"));
 });
+
+// 4.1 gate (add-digest-merge-eval-arm): merge mode must NOT be able to skip the
+// human review gate. Coverage counts partitions; `validateScenes` enforces
+// `review: reviewed`. A merge run that consulted only the coverage gate would
+// spend real tokens on unvetted scenes — the one thing the comparison must not
+// inherit. This asserts both gates are needed, which is what the runner now does.
+test("merge coverage alone is not a sufficient entry gate", () => {
+  // 12 scenes: the shape gate's own minimum, so the refusal below is about
+  // review, not about sample size.
+  const scenes: ContinueScene[] = [];
+  for (let i = 0; i < 4; i++) {
+    const both = scene({ id: `both-${i}`, review: "pending" });
+    both.history.sharedPages = [sharedPage(`sh_${i}`)];
+    both.shared_expected_background = ["共享解法是切备用 DNS"];
+    scenes.push(both);
+    scenes.push(scene({ id: `own-${i}`, review: "pending" }));
+    const so = scene({ id: `so-${i}`, review: "pending" });
+    so.history = { observations: [], handoffs: [], pages: [], sharedPages: [sharedPage(`x_${i}`)] };
+    so.shared_expected_background = ["共享解法是切备用 DNS"];
+    scenes.push(so);
+  }
+  // Coverage is satisfied…
+  assert.equal(validateMergeCoverage(scenes).ok, true, JSON.stringify(validateMergeCoverage(scenes).errors));
+  // …but the review gate still refuses, so a merge run must consult both.
+  assert.equal(validateScenes(scenes).ok, false);
+  assert.match(validateScenes(scenes).errors.join(";"), /review != reviewed/);
+});
