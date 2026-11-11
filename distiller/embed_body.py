@@ -77,6 +77,28 @@ def retry_backoff_ms(attempt):
     return min(800, 150 * (2 ** (attempt - 1)))
 
 
+def parse_deadline_s(raw, default=150.0):
+    """Parse DISTILL_LLM_DEADLINE_S; empty/invalid/non-positive => default.
+
+    Why a deadline exists at all: the extraction client is built INSIDE hy-memory
+    (LLMProvider(MemoryConfig())), so its read timeout is the openai SDK default
+    of 600 s — longer than the caller's 180 s sidecar budget (SIDECCAR_TIMEOUT_MS
+    in fd-memory). A hung call therefore burned the caller's whole budget and came
+    back to us as a bare `This operation was aborted` with nothing in the
+    distiller log. Measured 2026-11-11 on deepseek-v4.1-flash: 3 of 6 /distill
+    calls aborted at exactly 180 s, the distiller logged ZERO LLM errors, and a
+    max-size 120-item batch only takes 10-16 s — so the hang, not the workload,
+    was the cost. Answering first with a named error is what makes it debuggable.
+    """
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def should_retry(attempt, attempts, elapsed_s, budget_s, exc):
     """Whether to spend another attempt on `exc`.
 

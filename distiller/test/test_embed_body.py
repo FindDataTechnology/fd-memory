@@ -56,7 +56,7 @@ class TestParseEmbeddingsResponse(unittest.TestCase):
 # transient (6x 503, 5x embed deadline, 2x dropped connection) and scattered in
 # time. Before this, the embed call did not retry at all.
 
-from embed_body import is_retryable, retry_backoff_ms, should_retry, RETRYABLE_STATUS
+from embed_body import is_retryable, parse_deadline_s, retry_backoff_ms, should_retry, RETRYABLE_STATUS
 
 
 class _Status(Exception):
@@ -136,6 +136,31 @@ class TestShouldRetryBudget(unittest.TestCase):
 
     def test_zero_budget_means_no_retry(self):
         self.assertFalse(should_retry(1, 3, 0.0, 0.0, _Status(503)))
+
+
+class TestParseDeadline(unittest.TestCase):
+    """The /distill deadline answers BEFORE the caller's 180 s abort, so a hung
+    LLM call leaves a named error instead of silence. Measured: 3 of 6 calls
+    aborted at exactly 180 s while the distiller logged zero LLM errors."""
+
+    def test_default_when_unset(self):
+        self.assertEqual(parse_deadline_s(None), 150.0)
+
+    def test_default_when_empty(self):
+        self.assertEqual(parse_deadline_s("   "), 150.0)
+
+    def test_override_is_honoured(self):
+        self.assertEqual(parse_deadline_s("60"), 60.0)
+
+    def test_garbage_falls_back_to_default(self):
+        self.assertEqual(parse_deadline_s("abc"), 150.0)
+
+    def test_non_positive_falls_back_to_default(self):
+        self.assertEqual(parse_deadline_s("0"), 150.0)
+        self.assertEqual(parse_deadline_s("-5"), 150.0)
+
+    def test_custom_default_is_respected(self):
+        self.assertEqual(parse_deadline_s(None, default=90.0), 90.0)
 
 
 if __name__ == "__main__":

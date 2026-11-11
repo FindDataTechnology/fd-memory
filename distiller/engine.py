@@ -24,7 +24,7 @@ import uuid
 
 import openai
 
-from embed_body import parse_embeddings_response, retry_backoff_ms, should_retry
+from embed_body import parse_embeddings_response, parse_deadline_s, retry_backoff_ms, should_retry
 
 from hy_memory.agent.llm_provider import LLMProvider
 from hy_memory.config import MemoryConfig

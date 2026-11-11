@@ -55,9 +55,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             self._json(400, {"error": "invalid_body"})
             return
+        # Answer before the caller's own budget runs out. fd-memory aborts a
+        # /distill call at SIDECCAR_TIMEOUT_MS = 180 s (fd-memory side), and when
+        # it does we get no signal at all: the extraction client lives inside
+        # hy-memory with the SDK's 600 s read timeout, so a hung call surfaced as
+        # a bare `This operation was aborted` on their side and NOTHING in our
+        # log (measured 2026-11-11: 3 of 6 calls aborted at exactly 180 s while
+        # this process logged zero LLM errors, and a max-size 120-item batch
+        # needs only 10-16 s). Timing out here turns that silence into a named
+        # error the scheduler can show and retry.
+        deadline = engine.parse_deadline_s(os.environ.get("DISTILL_LLM_DEADLINE_S"))
         try:
-            result = asyncio.run(engine.distill(request))
+            result = asyncio.run(asyncio.wait_for(engine.distill(request), timeout=deadline))
             self._json(200, result)
+        except asyncio.TimeoutError:
+            self._json(200, {
+                "facts": [], "experiences": [], "cursor_next": {},
+                "llm_calls": [], "tokens": 0,
+                "errors": [f"distill_deadline_exceeded: no result within {deadline:.0f}s "
+                           f"(one LLM call most likely hung; the caller would otherwise "
+                           f"abort at its own budget and record nothing)"],
+            })
         except Exception as e:  # engine-level failure: report, keep caller's cursor
             import traceback; traceback.print_exc()
             self._json(200, {
