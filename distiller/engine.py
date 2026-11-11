@@ -15,6 +15,7 @@
 #       DistillResult.errors so "nothing worth keeping" and "call failed" are
 #       distinguishable in OUR books (S1 pass-1 s08).
 
+import asyncio
 import json
 import os
 import re
