@@ -72,9 +72,22 @@ function arg(name) {
 
 // -- lane helpers ------------------------------------------------------------
 let spent = 0;
+const DRY_RUN = process.argv.includes("--dry") || process.env.EVAL_DRY === "1";
 const TOKEN_LIMIT = Number(process.env.EVAL_TOKEN_LIMIT ?? 600_000);
 
 async function chat(model, messages, { maxTokens = 1600, temperature = 0 } = {}) {
+  // Dry run (add-digest-merge-eval-arm 4.1 rehearsal): the whole path — block
+  // construction, transcript files, verdict, run record — executes for real,
+  // only the model is a stub. It exists because the record/verdict half had
+  // never been executed before a paid run, and a wiring bug found after paying
+  // for 24 calls is the worst way to find it. A dry record is NEVER appended to
+  // a baseline: history must not contain numbers nobody computed.
+  if (DRY_RUN) {
+    const isJudge = messages.some((m) => String(m.content ?? "").startsWith(JUDGE_SYSTEM.slice(0, 24)));
+    return isJudge
+      ? { text: '{"re_derivation":3,"first_step":3,"evidence":["dry-run 桩：不参与任何结论"]}', tokens: 0 }
+      : { text: "（dry-run 桩响应：链路已跑通，未调用模型）", tokens: 0 };
+  }
   if (spent >= TOKEN_LIMIT) throw new Error(`token limit reached (${spent}/${TOKEN_LIMIT}) — run aborted, partial state kept`);
   // transient lane failures (503/502/429) get 3 attempts with backoff — a
   // single blip must not kill a multi-minute run (production lanes jitter;
@@ -129,6 +142,16 @@ const embed = embedLane ? embedTexts : async () => { throw new Error("no embed l
 // -- scene loading -----------------------------------------------------------
 const scenesFile = arg("scenes") ?? SCENES_DEFAULT.pathname;
 const scenes = JSON.parse(readFileSync(scenesFile, "utf8"));
+// Baseline provenance (memory-eval「基线 MUST 绑定两组版本标识」): the record has
+// carried `code_version` / `scenes_sha` since that requirement, but the two
+// variables were NEVER DEFINED — so every three-arm run that reached record
+// assembly threw `ReferenceError: codeVersion is not defined`, and no baseline
+// entry was ever appended. Found by the --dry rehearsal (4.1), not by a paid run.
+const codeVersion = (() => {
+  try { return execFileSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO_ROOT, encoding: "utf8" }).trim(); }
+  catch { return "unknown"; }
+})();
+const scenesSha = createHash("sha256").update(readFileSync(scenesFile)).digest("hex").slice(0, 16);
 const only = arg("only")?.split(",").map((s) => s.trim());
 let selected = only ? scenes.filter((s) => only.includes(s.id)) : scenes;
 const armFilter = arg("arm"); // e.g. "digest" — single-arm mode (grid runs): no pairing verdict
@@ -428,15 +451,19 @@ async function main() {
       const avgRe = avg(perScene.map((r) => r.re_derivation));
       const avgFs = avg(perScene.map((r) => r.first_step));
       console.log(`\n[eval-continue] GRID (arm=${armFilter}, k=${process.env.EVAL_TOP_K ?? 5}, budget=${process.env.EVAL_BUDGET_TOKENS ?? 1500}): avg re=${avgRe.toFixed(2)} fs=${avgFs.toFixed(2)} over ${perScene.length} scenes | tokens ${spent.toLocaleString()}`);
-      const baseline = existsSync(BASELINE) ? JSON.parse(readFileSync(BASELINE, "utf8")) : [];
-      baseline.push({
+      if (DRY_RUN) {
+        console.log(`[eval-continue] DRY RUN — grid mode records are not appended (arm=${armFilter})`);
+        return;
+      }
+      const gridBaseline = existsSync(BASELINE) ? JSON.parse(readFileSync(BASELINE, "utf8")) : [];
+      gridBaseline.push({
         ran_at: new Date().toISOString(), scenes_version: `${selected.length} scenes`,
         agent_model: agentModel, judge_model: judgeModel,
         top_k: Number(process.env.EVAL_TOP_K ?? 5), budget_tokens: Number(process.env.EVAL_BUDGET_TOKENS ?? 1500),
         embed_lane: embedLane, arm_filter: armFilter, per_scene: perScene,
         verdict: "GRID", tokens: spent, run_dir_local: runDir,
       });
-      writeFileSync(BASELINE, JSON.stringify(baseline, null, 2) + "\n");
+      writeFileSync(BASELINE, JSON.stringify(gridBaseline, null, 2) + "\n");
       return;
     }
 
@@ -483,6 +510,12 @@ async function main() {
         run_dir_local: runDir,
         blind_map_local_only: blindMap,
       };
+      if (DRY_RUN) {
+        record.dry_run = true;
+        writeFileSync(join(runDir, "merge-record.dry.json"), JSON.stringify(record, null, 2) + "\n");
+        console.log(`[eval-continue] DRY RUN — record written to ${runDir}/merge-record.dry.json, NOT appended to the baseline`);
+        return;
+      }
       const base = existsSync(MERGE_BASELINE) ? JSON.parse(readFileSync(MERGE_BASELINE, "utf8")) : [];
       base.push(record);
       writeFileSync(MERGE_BASELINE, JSON.stringify(base, null, 2) + "\n");
@@ -540,6 +573,12 @@ async function main() {
       run_dir_local: runDir,
       blind_map_local_only: blindMap,
     };
+    if (DRY_RUN) {
+      record.dry_run = true;
+      writeFileSync(join(runDir, "three-arm-record.dry.json"), JSON.stringify(record, null, 2) + "\n");
+      console.log(`[eval-continue] DRY RUN — record in ${runDir}/three-arm-record.dry.json, NOT appended to the baseline`);
+      return;
+    }
     const baseline = existsSync(BASELINE) ? JSON.parse(readFileSync(BASELINE, "utf8")) : [];
     baseline.push(record);
     writeFileSync(BASELINE, JSON.stringify(baseline, null, 2) + "\n");
