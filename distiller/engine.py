@@ -23,7 +23,7 @@ import uuid
 
 import openai
 
-from embed_body import parse_embeddings_response, is_retryable, retry_backoff_ms
+from embed_body import parse_embeddings_response, retry_backoff_ms, should_retry
 
 from hy_memory.agent.llm_provider import LLMProvider
 from hy_memory.config import MemoryConfig
@@ -201,8 +201,16 @@ async def embed_texts(provider_factory, texts):
     # MEMORY_EMBED_* → MEMORY_LLM_* → LLM_*) — a construction-time empty key
     # raises outside the try below, so resolve before touching openai.
     k, b = embed_credentials()
-    client = openai.AsyncOpenAI(api_key=k, base_url=b or None)
+    # max_retries=0 on purpose: the SDK already retries twice by default, so a
+    # 503 reaching this loop had been tried 3 times (measured: 3.03 s per such
+    # round). Letting our loop stack on top of that multiplies the attempts and
+    # blows the caller's 8 s embed budget — which turns "fall back to keyword in
+    # 3 s" into "hit the deadline and fall back anyway", hiding the real cause.
+    # One retry policy, owned here, so EMBED_ATTEMPTS means what it says.
+    client = openai.AsyncOpenAI(api_key=k, base_url=b or None, max_retries=0)
     attempts = max(1, int(os.environ.get("EMBED_ATTEMPTS", "3")))
+    budget_s = max(0.0, int(os.environ.get("EMBED_RETRY_BUDGET_MS", "6000")) / 1000.0)
+    started = time.monotonic()
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -225,7 +233,8 @@ async def embed_texts(provider_factory, texts):
             # whole turn its vector recall (13/82 digest reads fell back to
             # keyword-only in a measured 3 h window; the failures were scattered
             # in time, i.e. exactly what a short retry recovers).
-            if attempt >= attempts or not is_retryable(e):
+            elapsed = time.monotonic() - started
+            if not should_retry(attempt, attempts, elapsed, budget_s, e):
                 break
             await asyncio.sleep(retry_backoff_ms(attempt) / 1000.0)
     errors.append(f"embed {type(last_err).__name__}: {str(last_err)[:160]}")

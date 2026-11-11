@@ -51,16 +51,12 @@ class TestParseEmbeddingsResponse(unittest.TestCase):
         self.assertEqual(tokens, 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ── retry policy (2026-11-11) ────────────────────────────────────────────────
 # Measured: 13 of 82 digest reads in 3 h fell back to keyword-only, causes all
 # transient (6x 503, 5x embed deadline, 2x dropped connection) and scattered in
 # time. Before this, the embed call did not retry at all.
 
-from embed_body import is_retryable, retry_backoff_ms, RETRYABLE_STATUS
+from embed_body import is_retryable, retry_backoff_ms, should_retry, RETRYABLE_STATUS
 
 
 class _Status(Exception):
@@ -117,3 +113,30 @@ class TestRetryPolicy(unittest.TestCase):
         self.assertEqual(delays[0], 150)
         self.assertLessEqual(max(retry_backoff_ms(i) for i in range(1, 10)), 800)
         self.assertLess(sum(delays), 1600)
+
+
+class TestShouldRetryBudget(unittest.TestCase):
+    """The budget gate exists because a retry that ignores the clock can turn a
+    fast keyword fallback into a deadline hit. Measured on the real lane: one
+    successful embed takes 2.4-6.9 s, and the SDK's own 2 retries make an
+    exhausted 503 round cost 3.03 s."""
+
+    def test_retries_a_fresh_transient_failure(self):
+        self.assertTrue(should_retry(1, 3, 0.8, 6.0, _Status(503)))
+
+    def test_stops_when_attempts_are_exhausted(self):
+        self.assertFalse(should_retry(3, 3, 0.1, 6.0, _Status(503)))
+
+    def test_stops_when_the_budget_is_spent(self):
+        # 6.9 s elapsed on a slow attempt: there is no room for another.
+        self.assertFalse(should_retry(1, 3, 6.9, 6.0, _Status(503)))
+
+    def test_budget_does_not_make_client_errors_retryable(self):
+        self.assertFalse(should_retry(1, 3, 0.1, 6.0, _BadRequestError()))
+
+    def test_zero_budget_means_no_retry(self):
+        self.assertFalse(should_retry(1, 3, 0.0, 0.0, _Status(503)))
+
+
+if __name__ == "__main__":
+    unittest.main()

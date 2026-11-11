@@ -76,3 +76,21 @@ def retry_backoff_ms(attempt):
     caller gives the whole embed call 8 s, and the failures we see return fast."""
     return min(800, 150 * (2 ** (attempt - 1)))
 
+
+def should_retry(attempt, attempts, elapsed_s, budget_s, exc):
+    """Whether to spend another attempt on `exc`.
+
+    Why this is not just `attempt < attempts and is_retryable(exc)`: measured on
+    the production lane (2026-11-11), a successful embed takes 2.4-6.9 s, and the
+    caller's whole embed budget is 8 s. A retry that ignores the clock therefore
+    converts "degrade to keyword in 3 s" into "hit the 8 s deadline and degrade
+    anyway" — the same outcome, slower, and it masks the real cause behind a
+    deadline note. So: retry only while the wall clock says there is room.
+    """
+    if attempt >= attempts:
+        return False
+    if elapsed_s >= budget_s:
+        return False
+    return is_retryable(exc)
+
+
