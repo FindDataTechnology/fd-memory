@@ -10,7 +10,8 @@
     "boundary_at": "2026-11-09T04:00:00.000Z",
     "task": "线上抓取 5xx 的排查结论与下一步：先给结论，再给下一步动作，并说明依据来自哪一层记忆。",
     "expected_background": [
-      "抓取 5xx 的根因是上游 DNS 超时，已验证切备用 DNS 可恢复",
+      "抓取 5xx 的根因是上游 DNS 超时",
+      "验证方式：同一 URL 连打 20 次，若失败集中在前几百毫秒即为 DNS 阶段而非上游业务",
       "团队共享的重试退避参数：3 次指数退避，上限 60s"
     ],
     "shared_expected_background": [
@@ -34,7 +35,7 @@
           "search_keys": [
             "site-heal"
           ],
-          "solution": "抓取 5xx 的根因是上游 DNS 超时，已验证切备用 DNS 可恢复",
+          "solution": "抓取 5xx 的根因是上游 DNS 超时",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -43,8 +44,8 @@
       "notes": [
         {
           "id": "mx-1_note",
-          "title": "本轮口径笔记",
-          "body": "同时使用备用 DNS 与共享退避参数时必须先确认退避不会放大 DNS 查询量",
+          "title": "验证笔记",
+          "body": "验证方式：同一 URL 连打 20 次，若失败集中在前几百毫秒即为 DNS 阶段而非上游业务",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -77,7 +78,8 @@
     "boundary_at": "2026-11-09T04:00:00.000Z",
     "task": "digest 预算超限时的取舍与下一步：先给结论，再给下一步动作，并说明依据来自哪一层记忆。",
     "expected_background": [
-      "digest 预算 1500 tokens，超限按优先级截断，handoffs 段最先保留",
+      "digest 默认预算 1500 tokens，超限按优先级截断",
+      "截断顺序可从日志的 rendered 与 allItems 计数差看出被丢了哪些",
       "团队共享的优先级顺序：handoffs > L2 经验 > L1 note"
     ],
     "shared_expected_background": [
@@ -101,7 +103,7 @@
           "search_keys": [
             "digest-pipeline"
           ],
-          "solution": "digest 预算 1500 tokens，超限按优先级截断，handoffs 段最先保留",
+          "solution": "digest 默认预算 1500 tokens，超限按优先级截断",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -110,8 +112,8 @@
       "notes": [
         {
           "id": "mx-2_note",
-          "title": "本轮口径笔记",
-          "body": "截断顺序要在两处一致：单根与合并读",
+          "title": "验证笔记",
+          "body": "截断顺序可从日志的 rendered 与 allItems 计数差看出被丢了哪些",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -144,11 +146,12 @@
     "boundary_at": "2026-11-09T04:00:00.000Z",
     "task": "舰队回合记忆注入变慢的定位：先给结论，再给下一步动作，并说明依据来自哪一层记忆。",
     "expected_background": [
-      "单回合 digest 三次请求，own 与 shared 同根不同分区",
-      "合并读把 own 与 shared 合成一次请求，预算不翻倍"
+      "单回合 digest 原为三次请求：own、shared、legacy",
+      "判别方法：看同一舰队各请求的时间戳间隔，三次连发即未合并",
+      "合并读把 own 与 shared 合成一次请求，总预算不翻倍"
     ],
     "shared_expected_background": [
-      "合并读把 own 与 shared 合成一次请求，预算不翻倍"
+      "合并读把 own 与 shared 合成一次请求，总预算不翻倍"
     ],
     "history": {
       "observations": [
@@ -168,7 +171,7 @@
           "search_keys": [
             "fleet-planner"
           ],
-          "solution": "单回合 digest 三次请求，own 与 shared 同根不同分区",
+          "solution": "单回合 digest 原为三次请求：own、shared、legacy",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -177,8 +180,8 @@
       "notes": [
         {
           "id": "mx-3_note",
-          "title": "本轮口径笔记",
-          "body": "合并后要按回合而非按请求比延迟",
+          "title": "验证笔记",
+          "body": "判别方法：看同一舰队各请求的时间戳间隔，三次连发即未合并",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -191,7 +194,7 @@
             "shared",
             "fleet-planner"
           ],
-          "solution": "合并读把 own 与 shared 合成一次请求，预算不翻倍",
+          "solution": "合并读把 own 与 shared 合成一次请求，总预算不翻倍",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -211,7 +214,8 @@
     "boundary_at": "2026-11-09T04:00:00.000Z",
     "task": "OCR 车道失败的处置与下一步：先给结论，再给下一步动作，并说明依据来自哪一层记忆。",
     "expected_background": [
-      "OCR 失败多数是图片旋转未校正，先纠偏再识别",
+      "OCR 失败多数是图片旋转未校正",
+      "先看失败样本的 EXIF Orientation，非 1 的占比过半即确认",
       "共享的车道降级顺序：主模型超时→备用模型→关键词兜底"
     ],
     "shared_expected_background": [
@@ -235,7 +239,7 @@
           "search_keys": [
             "crawl-ops"
           ],
-          "solution": "OCR 失败多数是图片旋转未校正，先纠偏再识别",
+          "solution": "OCR 失败多数是图片旋转未校正",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -244,8 +248,8 @@
       "notes": [
         {
           "id": "mx-4_note",
-          "title": "本轮口径笔记",
-          "body": "降级顺序与纠偏顺序不能互相抵消",
+          "title": "验证笔记",
+          "body": "先看失败样本的 EXIF Orientation，非 1 的占比过半即确认",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -276,10 +280,10 @@
       "project": "site-heal"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "自建爬虫代理池耗尽后的处置：先给结论，再给下一步动作。",
+    "task": "自建爬虫的代理池刚刚耗尽，继续把这批抓取跑完。先给结论（该降并发还是换池），再给下一步动作。",
     "expected_background": [
-      "代理池耗尽时先降并发再换池，不要直接放量重试",
-      "该结论只存在于本岗位分区"
+      "代理池耗尽时先降并发再换池",
+      "降并发按当前并发的一半执行，连续两次才降到下限"
     ],
     "history": {
       "observations": [
@@ -299,7 +303,7 @@
           "search_keys": [
             "site-heal"
           ],
-          "solution": "代理池耗尽时先降并发再换池，不要直接放量重试",
+          "solution": "代理池耗尽时先降并发再换池",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -308,8 +312,8 @@
       "notes": [
         {
           "id": "mo-1_note",
-          "title": "结论笔记",
-          "body": "代理池耗尽时先降并发再换池，不要直接放量重试",
+          "title": "处置笔记",
+          "body": "降并发按当前并发的一半执行，连续两次才降到下限",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -326,10 +330,10 @@
       "project": "digest-pipeline"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "note 未游标化导致蒸馏不跑的定位：先给结论，再给下一步动作。",
+    "task": "有 project 的 note 一直没被蒸馏掉，定位为什么。先给结论，再给下一步动作。",
     "expected_background": [
-      "游标只推进到已成功抽取的条目，失败保留游标",
-      "该结论只存在于本岗位分区"
+      "游标只推进到已成功抽取的条目",
+      "失败批次的游标保留，重试从同一条目重新开始"
     ],
     "history": {
       "observations": [
@@ -349,7 +353,7 @@
           "search_keys": [
             "digest-pipeline"
           ],
-          "solution": "游标只推进到已成功抽取的条目，失败保留游标",
+          "solution": "游标只推进到已成功抽取的条目",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -358,8 +362,8 @@
       "notes": [
         {
           "id": "mo-2_note",
-          "title": "结论笔记",
-          "body": "游标只推进到已成功抽取的条目，失败保留游标",
+          "title": "处置笔记",
+          "body": "失败批次的游标保留，重试从同一条目重新开始",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -376,10 +380,10 @@
       "project": "fleet-planner"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "回合排队超时与看门狗的判别：先给结论，再给下一步动作。",
+    "task": "某舰队回合长时间停在排队状态并最终超时，判断是排队饥饿还是看门狗误杀。先给结论，再给下一步动作。",
     "expected_background": [
       "排队超时看 queue.queued 与 fairness.pending 的差值",
-      "该结论只存在于本岗位分区"
+      "差值为正说明任务已入队但不在公平链上"
     ],
     "history": {
       "observations": [
@@ -408,8 +412,8 @@
       "notes": [
         {
           "id": "mo-3_note",
-          "title": "结论笔记",
-          "body": "排队超时看 queue.queued 与 fairness.pending 的差值",
+          "title": "处置笔记",
+          "body": "差值为正说明任务已入队但不在公平链上",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -426,10 +430,10 @@
       "project": "crawl-ops"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "解析器版本回退的验证方法：先给结论，再给下一步动作。",
+    "task": "解析器回退到上一版之后要验证什么才算真的回退成功。先给结论，再给下一步动作。",
     "expected_background": [
-      "回退后必须用同一批样本复跑并比对字段覆盖率",
-      "该结论只存在于本岗位分区"
+      "回退后必须用同一批样本复跑",
+      "比对口径是字段覆盖率而非条数"
     ],
     "history": {
       "observations": [
@@ -449,7 +453,7 @@
           "search_keys": [
             "crawl-ops"
           ],
-          "solution": "回退后必须用同一批样本复跑并比对字段覆盖率",
+          "solution": "回退后必须用同一批样本复跑",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -458,8 +462,8 @@
       "notes": [
         {
           "id": "mo-4_note",
-          "title": "结论笔记",
-          "body": "回退后必须用同一批样本复跑并比对字段覆盖率",
+          "title": "处置笔记",
+          "body": "比对口径是字段覆盖率而非条数",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ],
@@ -476,13 +480,10 @@
       "project": "site-heal"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "团队共享的限速契约怎么落到实现：先给结论，再给下一步动作。",
+    "task": "要给一个新接入的源加上限速，按团队既有契约说清具体参数怎么落。先给结论，再给下一步动作。",
     "expected_background": [
-      "限速契约：单源并发 ≤4，间隔 ≥200ms，超限即排队而非丢弃",
-      "该结论只存在于团队共享分区"
-    ],
-    "shared_expected_background": [
-      "限速契约：单源并发 ≤4，间隔 ≥200ms，超限即排队而非丢弃"
+      "限速契约：单源并发 ≤4，间隔 ≥200ms",
+      "超限时排队等待而不是丢弃请求"
     ],
     "history": {
       "observations": [],
@@ -498,7 +499,7 @@
             "shared",
             "site-heal"
           ],
-          "solution": "限速契约：单源并发 ≤4，间隔 ≥200ms，超限即排队而非丢弃",
+          "solution": "限速契约：单源并发 ≤4，间隔 ≥200ms",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -507,12 +508,16 @@
       "sharedNotes": [
         {
           "id": "ms-1_shnote",
-          "title": "共享口径笔记",
-          "body": "限速契约：单源并发 ≤4，间隔 ≥200ms，超限即排队而非丢弃",
+          "title": "共享处置笔记",
+          "body": "超限时排队等待而不是丢弃请求",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ]
-    }
+    },
+    "shared_expected_background": [
+      "限速契约：单源并发 ≤4，间隔 ≥200ms",
+      "超限时排队等待而不是丢弃请求"
+    ]
   },
   {
     "id": "ms-2",
@@ -523,13 +528,10 @@
       "project": "digest-pipeline"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "共享优先级顺序在合并读里怎么保证：先给结论，再给下一步动作。",
+    "task": "合并读上线后，注入块的条目优先级是否还和单读时一致。先给结论，再给下一步动作。",
     "expected_background": [
-      "优先级顺序 handoffs > L2 > L1，合并两分区后仍按该顺序渲染",
-      "该结论只存在于团队共享分区"
-    ],
-    "shared_expected_background": [
-      "优先级顺序 handoffs > L2 > L1，合并两分区后仍按该顺序渲染"
+      "优先级顺序 handoffs > L2 经验 > L1 note",
+      "合并两分区后仍按该顺序渲染，不因合并改变"
     ],
     "history": {
       "observations": [],
@@ -545,7 +547,7 @@
             "shared",
             "digest-pipeline"
           ],
-          "solution": "优先级顺序 handoffs > L2 > L1，合并两分区后仍按该顺序渲染",
+          "solution": "优先级顺序 handoffs > L2 经验 > L1 note",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -554,12 +556,16 @@
       "sharedNotes": [
         {
           "id": "ms-2_shnote",
-          "title": "共享口径笔记",
-          "body": "优先级顺序 handoffs > L2 > L1，合并两分区后仍按该顺序渲染",
+          "title": "共享处置笔记",
+          "body": "合并两分区后仍按该顺序渲染，不因合并改变",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ]
-    }
+    },
+    "shared_expected_background": [
+      "优先级顺序 handoffs > L2 经验 > L1 note",
+      "合并两分区后仍按该顺序渲染，不因合并改变"
+    ]
   },
   {
     "id": "ms-3",
@@ -570,13 +576,10 @@
       "project": "fleet-planner"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "共享的退避参数与队列容量的关系：先给结论，再给下一步动作。",
+    "task": "提高舰队队列容量之前，先判断退避上限与之如何共同影响实际吞吐。先给结论，再给下一步动作。",
     "expected_background": [
-      "退避上限 60s 与队列容量 23 位共同决定实际吞吐",
-      "该结论只存在于团队共享分区"
-    ],
-    "shared_expected_background": [
-      "退避上限 60s 与队列容量 23 位共同决定实际吞吐"
+      "退避上限 60s 与队列容量共同决定吞吐",
+      "队列容量 23 位，退避到顶的任务不再占位"
     ],
     "history": {
       "observations": [],
@@ -592,7 +595,7 @@
             "shared",
             "fleet-planner"
           ],
-          "solution": "退避上限 60s 与队列容量 23 位共同决定实际吞吐",
+          "solution": "退避上限 60s 与队列容量共同决定吞吐",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -601,12 +604,16 @@
       "sharedNotes": [
         {
           "id": "ms-3_shnote",
-          "title": "共享口径笔记",
-          "body": "退避上限 60s 与队列容量 23 位共同决定实际吞吐",
+          "title": "共享处置笔记",
+          "body": "队列容量 23 位，退避到顶的任务不再占位",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ]
-    }
+    },
+    "shared_expected_background": [
+      "退避上限 60s 与队列容量共同决定吞吐",
+      "队列容量 23 位，退避到顶的任务不再占位"
+    ]
   },
   {
     "id": "ms-4",
@@ -617,13 +624,10 @@
       "project": "crawl-ops"
     },
     "boundary_at": "2026-11-09T04:00:00.000Z",
-    "task": "共享的车道降级顺序：先给结论，再给下一步动作。",
+    "task": "主模型车道超时后应当降级到哪一层、降到什么程度停。先给结论，再给下一步动作。",
     "expected_background": [
-      "降级顺序：主模型→备用模型→关键词兜底，任一层成功即停",
-      "该结论只存在于团队共享分区"
-    ],
-    "shared_expected_background": [
-      "降级顺序：主模型→备用模型→关键词兜底，任一层成功即停"
+      "降级顺序：主模型→备用模型→关键词兜底",
+      "任一层成功即停，不再继续降级"
     ],
     "history": {
       "observations": [],
@@ -639,7 +643,7 @@
             "shared",
             "crawl-ops"
           ],
-          "solution": "降级顺序：主模型→备用模型→关键词兜底，任一层成功即停",
+          "solution": "降级顺序：主模型→备用模型→关键词兜底",
           "confidence": 0.8,
           "updated_at": "2026-11-09T02:00:00.000Z",
           "supersedes": []
@@ -648,11 +652,15 @@
       "sharedNotes": [
         {
           "id": "ms-4_shnote",
-          "title": "共享口径笔记",
-          "body": "降级顺序：主模型→备用模型→关键词兜底，任一层成功即停",
+          "title": "共享处置笔记",
+          "body": "任一层成功即停，不再继续降级",
           "updated_at": "2026-11-09T03:00:00.000Z"
         }
       ]
-    }
+    },
+    "shared_expected_background": [
+      "降级顺序：主模型→备用模型→关键词兜底",
+      "任一层成功即停，不再继续降级"
+    ]
   }
 ]
