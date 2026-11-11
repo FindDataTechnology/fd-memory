@@ -47,7 +47,7 @@ const { StoreRoot } = await import("../dist/store.js");
 const { hybridCandidates } = await import("../dist/distill-scheduler.js");
 const { renderDigest } = await import("../dist/digest.js");
 const { validateScenes } = await import("../dist/continue-scenes.js");
-const { newPage } = await import("../dist/okf.js");
+const { seedSceneHistory } = await import("../dist/eval-fixtures.js");
 const { computeGates } = await import("../dist/continue-gate.js");
 const SCENES_DEFAULT = new URL("../fixtures/eval/continue-scenes.json", import.meta.url);
 const BASELINE = new URL("../fixtures/eval/continue-baseline.json", import.meta.url);
@@ -148,57 +148,30 @@ const blindMap = Object.fromEntries(ARMS.map((a, i) => [a, labels[i]]));
 // -- scratch loading ----------------------------------------------------------
 function loadScene(scene, dataDir) {
   const root = new StoreRoot(dataDir, `d-eval-${scene.id}`);
-  const project = "agentEval";
-  for (const p of scene.history.pages) {
-    root.writeDistillPage(project, p.kind, {
-      id: p.id,
-      engine: "engine:fixture/0",
-      confidence: p.confidence ?? undefined,
-      sources: [],
-      supersedes: p.supersedes ?? [],
-      ...(p.kind === "fact"
-        ? { statement: p.task, subject: p.id, details: p.solution }
-        : { task: p.task, search_keys: p.search_keys, solution: p.solution, boundary_envs: p.boundary_envs }),
-    });
-  }
-  for (const h of scene.history.handoffs) {
-    root.db.upsertHandoff({
-      id: h.id, project, from_agent: "fixture", summary: h.summary,
-      open_questions: "[]", next_steps: h.next_steps, files_touched: "[]",
-      to_agent: h.to_agent ?? null, state: h.state, accepted_by: null, accepted_at: null, created_at: h.created_at,
-    });
-  }
-  // L1 notes (add-chat-memory-injection): seeded exactly as the chat lane's
-  // MCP write-back produces them — note pages under the project's notes/.
-  // Recency backfill: indexPage stamps updated_at at load time (all notes in
-  // one burst = same ms), which makes the digest L1 "recent 3" cut arbitrary
-  // and the old-note ablation meaningless — restore the fixture's timestamps.
-  // Reference 页（add-unified-memory-and-outputs eval 场景）: seed 薄索引
-  // 页，digest 名份车道在生产同款代码下读（只不过这里借 route 读面镜像）。
-  for (const r of scene.history.references ?? []) {
-    const rel = root.writePage(project, "references", r.id, newPage("reference", r.title, r.summary ?? "", { source_ref: r.source_ref ?? "resource:fixture", tags: r.tags ?? [], tier: r.tier ?? "draft" }), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
-    if (r.updated_at) {
-      root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(r.updated_at, rel);
-      root.db.db.prepare("UPDATE pages_fts SET updated_at=? WHERE path=?").run(r.updated_at, rel);
-    }
-  }
-  for (const n of scene.history.notes ?? []) {
-    const rel = root.writePage(project, "notes", n.id, newPage("note", n.title, n.body), { principal: "eval:fixture", scope: `d-eval-${scene.id}/${project}` });
-    root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(n.updated_at, rel);
-    root.db.db.prepare("UPDATE pages_fts SET updated_at=? WHERE path=?").run(n.updated_at, rel);
-  }
-  return { root, project };
+  // Seeding lives in src/eval-fixtures.ts so the two-partition fixture shape is
+  // unit-testable without an LLM call (add-digest-merge-eval-arm 1.2).
+  const { project, sharedProject } = seedSceneHistory(root, scene);
+  return { root, project, sharedProject };
 }
 
 async function vectorize(root, project, scene) {
-  const pages = scene.history.pages.filter((p) => p.task || p.solution);
-  for (let i = 0; i < pages.length; i += 64) {
-    const batch = pages.slice(i, i + 64);
-    const texts = batch.map((p) => `${p.task} ${p.search_keys.join(" ")} ${p.solution}`.slice(0, 1500));
-    const r = await embed(texts);
-    batch.forEach((p, j) => {
-      if (r.vectors[j]) root.db.setPageVector(`${project}/${p.kind === "fact" ? "facts" : "experiences"}/${p.id}.md`, r.model, new Float32Array(r.vectors[j]));
-    });
+  // Both partitions, same embed lane: a shared partition left un-vectorized
+  // would only be reachable by keyword recall, and the merged arm would then
+  // lose to the split arm for a reason that has nothing to do with merging.
+  const sharedProject = "shared";
+  const groups = [
+    { project, pages: scene.history.pages.filter((p) => p.task || p.solution) },
+    { project: sharedProject, pages: (scene.history.sharedPages ?? []).filter((p) => p.task || p.solution) },
+  ];
+  for (const g of groups) {
+    for (let i = 0; i < g.pages.length; i += 64) {
+      const batch = g.pages.slice(i, i + 64);
+      const texts = batch.map((p) => `${p.task} ${p.search_keys.join(" ")} ${p.solution}`.slice(0, 1500));
+      const r = await embed(texts);
+      batch.forEach((p, j) => {
+        if (r.vectors[j]) root.db.setPageVector(`${g.project}/${p.kind === "fact" ? "facts" : "experiences"}/${p.id}.md`, r.model, new Float32Array(r.vectors[j]));
+      });
+    }
   }
 }
 

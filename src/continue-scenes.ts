@@ -62,12 +62,21 @@ export interface ContinueScene {
   boundary_at: string;
   task: string;
   expected_background: string[];
+  // Merge-arm fixtures (add-digest-merge-eval-arm 1.1): history may also sit in
+  // the pack's SHARED partition — production reads own+shared in one request
+  // under the merge lever, so an arm that only has `pages`/`notes` cannot
+  // reproduce the injected shape. Both are optional: the three-arm gate keeps
+  // running on the old own-only sets, and `validateMergeCoverage` (not
+  // `validateScenes`) is what enforces cross-partition coverage.
+  shared_expected_background?: string[];
   history: {
     observations: SceneObservation[];
     handoffs: SceneHandoff[];
     pages: ScenePage[];
     references?: SceneReference[];
     notes?: SceneNote[];
+    sharedPages?: ScenePage[];
+    sharedNotes?: SceneNote[];
   };
 }
 
@@ -96,7 +105,13 @@ export function validateScenes(scenes: ContinueScene[]): SceneValidation {
     if (!Array.isArray(s.expected_background) || s.expected_background.length < 2) errors.push(`${s.id}: 期望背景集合 <2 条，无法判重推导`);
     const notes = s.history?.notes ?? [];
     const refs = s.history?.references ?? [];
-    if (!s.history?.pages?.length && !s.history?.handoffs?.length && !notes.length && !refs.length) errors.push(`${s.id}: 前史为空（无 L2 页、交接，也无 note）`);
+    // Shared-partition material counts as history: a scene whose whole prefix
+    // lives in the pack's shared partition is a legitimate (and necessary)
+    // fixture for the merge comparison, not an empty scene.
+    const sharedAny = (s.history?.sharedPages?.length ?? 0) + (s.history?.sharedNotes?.length ?? 0);
+    if (!s.history?.pages?.length && !s.history?.handoffs?.length && !notes.length && !refs.length && !sharedAny) {
+      errors.push(`${s.id}: 前史为空（无 L2 页、交接，也无 note）`);
+    }
     if (notes.length) {
       noteScenes += 1;
       for (const n of notes) {
@@ -111,8 +126,63 @@ export function validateScenes(scenes: ContinueScene[]): SceneValidation {
     for (const o of s.history?.observations ?? []) {
       if (!o.session_id || !o.created_at) { errors.push(`${s.id}: 观测缺 session_id/created_at`); break; }
     }
+    // Shared-partition material is optional here (old sets stay valid), but when
+    // present it must be shaped like the own-partition material it mirrors.
+    const sharedNotes = s.history?.sharedNotes ?? [];
+    if (sharedNotes.length) {
+      for (const n of sharedNotes) {
+        if (!n.id || !n.title || !n.body || !n.updated_at) {
+          errors.push(`${s.id}: shared note 缺 id/title/body/updated_at`);
+          break;
+        }
+      }
+    }
+    for (const p of s.history?.sharedPages ?? []) {
+      if (!p.id || !p.task || !p.updated_at) { errors.push(`${s.id}: shared page 缺 id/task/updated_at`); break; }
+    }
   }
   if (projects.size < MIN_PROJECTS) errors.push(`覆盖 project 数 ${projects.size} < ${MIN_PROJECTS}`);
   if (noteScenes < MIN_NOTE_SCENES) errors.push(`note 场景数 ${noteScenes} < ${MIN_NOTE_SCENES}（L1 召回面须持续受验）`);
+  return { ok: errors.length === 0, errors };
+}
+
+// ── merge-arm coverage gate (add-digest-merge-eval-arm 1.1) ───────────────────
+// Kept separate from validateScenes on purpose: the three-arm gate must keep
+// running on the existing own-only sets (changing its entry gate would reset the
+// v4 baseline — design D1). This gate only guards the merged-vs-split comparison.
+
+export type PartitionCoverage = "both" | "own-only" | "shared-only";
+
+/** Which partitions carry this scene's history. `references`/`observations` are
+ *  own-side by construction (they ride the member project, not the pack's shared
+ *  partition), so they are not counted as shared material. */
+export function partitionCoverage(s: ContinueScene): PartitionCoverage {
+  const own = (s.history?.pages?.length ?? 0) + (s.history?.notes?.length ?? 0) + (s.history?.handoffs?.length ?? 0) > 0;
+  const shared = (s.history?.sharedPages?.length ?? 0) + (s.history?.sharedNotes?.length ?? 0) > 0;
+  if (own && shared) return "both";
+  if (shared) return "shared-only";
+  return "own-only";
+}
+
+const MIN_MERGE_SCENES = 3;
+
+export function validateMergeCoverage(scenes: ContinueScene[]): SceneValidation {
+  const errors: string[] = [];
+  if (!Array.isArray(scenes) || !scenes.length) return { ok: false, errors: ["场景集为空"] };
+  const counts: Record<PartitionCoverage, number> = { both: 0, "own-only": 0, "shared-only": 0 };
+  for (const s of scenes) {
+    const cov = partitionCoverage(s);
+    counts[cov] += 1;
+    // A shared-partition fixture without a declared expectation cannot be scored
+    // per partition — the whole point of these scenes is locating a miss.
+    if (cov !== "own-only" && !(s.shared_expected_background?.length)) {
+      errors.push(`${s.id}: 有 shared 分区前史但未声明 shared_expected_background`);
+    }
+  }
+  for (const k of ["both", "own-only", "shared-only"] as PartitionCoverage[]) {
+    if (counts[k] < MIN_MERGE_SCENES) {
+      errors.push(`${k} 场景数 ${counts[k]} < ${MIN_MERGE_SCENES}（合并挤出风险须三类都覆盖）`);
+    }
+  }
   return { ok: errors.length === 0, errors };
 }
