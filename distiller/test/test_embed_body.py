@@ -53,3 +53,67 @@ class TestParseEmbeddingsResponse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── retry policy (2026-11-11) ────────────────────────────────────────────────
+# Measured: 13 of 82 digest reads in 3 h fell back to keyword-only, causes all
+# transient (6x 503, 5x embed deadline, 2x dropped connection) and scattered in
+# time. Before this, the embed call did not retry at all.
+
+from embed_body import is_retryable, retry_backoff_ms, RETRYABLE_STATUS
+
+
+class _Status(Exception):
+    def __init__(self, code):
+        super().__init__(f"Error code: {code}")
+        self.status_code = code
+
+
+# Named exactly like the openai SDK's classes — the policy matches on type
+# name, so a leading underscore here would test the wrong thing.
+class APIConnectionError(Exception):
+    pass
+
+
+class _BadRequestError(Exception):
+    def __init__(self):
+        super().__init__("model not found")
+        self.status_code = 400
+
+
+class _Wrapped(Exception):
+    def __init__(self, cause):
+        super().__init__("wrapped")
+        self.__cause__ = cause
+
+
+class TestRetryPolicy(unittest.TestCase):
+    def test_transient_statuses_are_retryable(self):
+        for code in (429, 500, 502, 503, 504):
+            self.assertTrue(is_retryable(_Status(code)), f"{code} should retry")
+
+    def test_client_errors_are_not_retried(self):
+        # 400/401/404 mean the request is wrong — retrying burns the caller's 8 s.
+        for code in (400, 401, 404):
+            self.assertFalse(is_retryable(_Status(code)), f"{code} must not retry")
+
+    def test_status_is_found_on_wrapped_response(self):
+        exc = Exception("boom")
+        exc.response = types.SimpleNamespace(status_code=503)
+        self.assertTrue(is_retryable(exc))
+
+    def test_transport_faults_are_retryable_by_name(self):
+        self.assertTrue(is_retryable(APIConnectionError("conn reset")))
+
+    def test_transport_fault_found_through_cause(self):
+        self.assertTrue(is_retryable(_Wrapped(APIConnectionError("reset"))))
+
+    def test_unknown_exception_is_not_retried(self):
+        self.assertFalse(is_retryable(ValueError("nope")))
+
+    def test_backoff_is_short_and_bounded(self):
+        # The caller gives the whole embed call ~8 s; keep the total retry cost small.
+        delays = [retry_backoff_ms(i) for i in (1, 2, 3)]
+        self.assertEqual(delays[0], 150)
+        self.assertLessEqual(max(retry_backoff_ms(i) for i in range(1, 10)), 800)
+        self.assertLess(sum(delays), 1600)

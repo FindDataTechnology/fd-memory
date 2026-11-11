@@ -23,7 +23,7 @@ import uuid
 
 import openai
 
-from embed_body import parse_embeddings_response
+from embed_body import parse_embeddings_response, is_retryable, retry_backoff_ms
 
 from hy_memory.agent.llm_provider import LLMProvider
 from hy_memory.config import MemoryConfig
@@ -202,21 +202,34 @@ async def embed_texts(provider_factory, texts):
     # raises outside the try below, so resolve before touching openai.
     k, b = embed_credentials()
     client = openai.AsyncOpenAI(api_key=k, base_url=b or None)
-    try:
-        resp = await client.embeddings.create(model=EMBED_MODEL, input=list(texts)[:EMBED_BATCH_MAX])
-        # Body classification lives in embed_body.py (no heavy imports) so the
-        # two failure shapes are assertable without a python env: the lane
-        # sometimes answers 200 with HTML/plain text, which used to surface as
-        # `AttributeError: 'str' object has no attribute 'data'` — a name that
-        # reads like our bug and hides the upstream entirely.
-        vectors, tokens, err = parse_embeddings_response(resp)
-        if err:
-            errors.append(err)
-            return [], EMBED_MODEL, 0, errors
-        return vectors, EMBED_MODEL, tokens, errors
-    except Exception as e:
-        errors.append(f"embed {type(e).__name__}: {str(e)[:160]}")
-        return [], EMBED_MODEL, 0, errors
+    attempts = max(1, int(os.environ.get("EMBED_ATTEMPTS", "3")))
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = await client.embeddings.create(model=EMBED_MODEL, input=list(texts)[:EMBED_BATCH_MAX])
+            # Body classification lives in embed_body.py (no heavy imports) so the
+            # two failure shapes are assertable without a python env: the lane
+            # sometimes answers 200 with HTML/plain text, which used to surface as
+            # `AttributeError: 'str' object has no attribute 'data'` — a name that
+            # reads like our bug and hides the upstream entirely.
+            vectors, tokens, err = parse_embeddings_response(resp)
+            if err:
+                # The lane answered; retrying would take the same path again.
+                errors.append(err)
+                return [], EMBED_MODEL, 0, errors
+            return vectors, EMBED_MODEL, tokens, errors
+        except Exception as e:
+            last_err = e
+            # This loop did not exist before 2026-11-11, while the sibling
+            # LLM-extract path retried 5x: one upstream 503 therefore cost the
+            # whole turn its vector recall (13/82 digest reads fell back to
+            # keyword-only in a measured 3 h window; the failures were scattered
+            # in time, i.e. exactly what a short retry recovers).
+            if attempt >= attempts or not is_retryable(e):
+                break
+            await asyncio.sleep(retry_backoff_ms(attempt) / 1000.0)
+    errors.append(f"embed {type(last_err).__name__}: {str(last_err)[:160]}")
+    return [], EMBED_MODEL, 0, errors
 
 LANG_PIN_ZH = "\n\n硬性要求（MUST）：task 与 search_keys 必须使用与会话相同的语言（本次会话为中文，就必须用中文书写 task 与 search_keys）。\n"
 LANG_PIN_EN = "\n\nHARD REQUIREMENT: task and search_keys MUST be written in the same language as the conversation.\n"

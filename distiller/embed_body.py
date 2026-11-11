@@ -28,3 +28,51 @@ def parse_embeddings_response(resp):
     usage = getattr(resp, "usage", None)
     tokens = getattr(usage, "total_tokens", 0) or 0
     return vectors, tokens, None
+
+
+# ── retry policy (2026-11-11) ────────────────────────────────────────────────
+# Measured on production before this existed: 13 of 82 digest reads (3 h) fell
+# back to keyword-only recall, and the causes were all transient — 6x upstream
+# 503, 5x the caller's 8 s embed deadline, 2x a dropped connection. The embed
+# call had NO retry, so a single blip cost the whole turn its vector recall,
+# while the sibling LLM-extract path in the same process retries 5 times. These
+# failures were scattered (17:00, 17:04, 17:13, 17:37, 18:00), i.e. exactly the
+# shape a short retry recovers from.
+
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Transient network faults with no HTTP status at all.
+RETRYABLE_NAMES = frozenset({
+    "APIConnectionError", "APITimeoutError", "ConnectError", "ConnectTimeout",
+    "ReadError", "ReadTimeout", "RemoteProtocolError", "TimeoutException",
+})
+
+
+def is_retryable(exc):
+    """True when trying again could plausibly succeed.
+
+    A 4xx that is not 408/425/429 means the request itself is wrong (bad model
+    name, malformed input) — retrying only burns the caller's deadline and
+    delays the keyword fallback. A non-JSON body is NOT retried here either: it
+    means the lane answered, so the next attempt hits the same path.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return status in RETRYABLE_STATUS
+    name = type(exc).__name__
+    if name in RETRYABLE_NAMES:
+        return True
+    # openai wraps transport faults; the cause is one level down.
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None and cause is not exc:
+        return type(cause).__name__ in RETRYABLE_NAMES
+    return False
+
+
+def retry_backoff_ms(attempt):
+    """Delay before attempt N+1 (attempt is 1-based). Short on purpose: the
+    caller gives the whole embed call 8 s, and the failures we see return fast."""
+    return min(800, 150 * (2 ** (attempt - 1)))
+
