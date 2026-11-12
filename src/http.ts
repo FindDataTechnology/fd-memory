@@ -21,7 +21,7 @@ import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-
 import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
-import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, resolvePolicy, unexecuted } from "./policy.js";
+import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -1150,13 +1150,44 @@ export class Service {
       const deployment = deploymentDefaults(rootKey, this.opts.env);
 
       if (req.method === "GET") {
-        const rows = resolvePolicy(
-          [
-            ["project", root.db.getMemoryPolicy(project)],
-            ["root", root.db.getMemoryPolicy("root")],
-          ],
-          deployment,
-        );
+        const stored: Array<[string, Record<string, string | number>]> = [
+          ["project", root.db.getMemoryPolicy(project)],
+          ["root", root.db.getMemoryPolicy("root")],
+        ];
+        const rows = resolvePolicy(stored, deployment);
+
+        // ── a stored row nobody validated must not read as "normal" ─────────
+        //
+        // The write face refuses a bad document, so a bad row can only arrive out
+        // of band: an older version, a hand edit, a restore. Measured
+        // 2026-11-12 — `{distil:"off"}` was silently dropped and the table showed
+        // the deployment default `on` as if everything were fine, and
+        // `{promote_after:"lots"}` was surfaced as the effective value. The spec
+        // forbids exactly that ("某轴无法解析为有效值时 MUST 报错并指名该轴，MUST NOT
+        // 以默认值呈现为正常"), so the read face names each one.
+        //
+        // Two markers, because there are two cases: a key this version does not
+        // know produces no row at all (only `stored_invalid` can name it), while a
+        // key with a bad value DOES reach its row (so the row itself is marked and
+        // its effective value cannot be mistaken for a declaration in force).
+        const storedInvalid: Array<{ level: string; key: string; code: string; message: string }> = [];
+        for (const [level, doc] of stored) {
+          const { errors } = normalizePolicyPartial(doc, "process");
+          for (const e of errors) {
+            const short = e.key.includes(".") ? e.key.slice(e.key.lastIndexOf(".") + 1) : e.key;
+            if ((PROCESS_KEYS as readonly string[]).includes(short)) {
+              const row = rows[short as keyof typeof rows];
+              // First (most specific) level wins the marker: that is where a fix
+              // belongs.
+              if (row && !(row as { invalid?: unknown }).invalid) {
+                (row as { invalid?: unknown }).invalid = { code: e.code, message: e.message, level };
+              }
+            } else {
+              storedInvalid.push({ level, key: e.key, code: e.code, message: e.message });
+            }
+          }
+        }
+
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(JSON.stringify({
           rootKey,
@@ -1164,6 +1195,7 @@ export class Service {
           rows,
           not_executed: unexecuted(rows),
           deployment_default: deployment,
+          ...(storedInvalid.length > 0 ? { stored_invalid: storedInvalid } : {}),
         }));
       }
 

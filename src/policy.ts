@@ -72,11 +72,20 @@ function isInt(value: unknown): value is number {
  * did nothing is worse than a loud rejection (same discipline as the knowledge
  * profile's closed key set).
  */
-export function normalizePolicy(raw: unknown, where = "process"): NormalizeResult {
-  if (raw === undefined || raw === null) return { ok: true, doc: {} };
+/**
+ * Normalize while KEEPING the valid keys.
+ *
+ * `normalizePolicy` answers "may I accept this document?" and therefore throws
+ * away everything it cannot accept. The READ face needs the other answer: a row
+ * that was written by an older version — or by hand — must be named as invalid
+ * WITHOUT its valid keys being forgotten, and without the invalid ones being
+ * presented as in force. Same rules, different discard policy.
+ */
+export function normalizePolicyPartial(raw: unknown, where = "process"): PartialNormalize {
+  if (raw === undefined || raw === null) return { doc: {}, errors: [] };
   if (typeof raw !== "object" || Array.isArray(raw)) {
     return {
-      ok: false,
+      doc: {},
       errors: [
         {
           key: where,
@@ -133,8 +142,22 @@ export function normalizePolicy(raw: unknown, where = "process"): NormalizeResul
     }
     doc.cold_after_days = value;
   }
+  return { doc, errors };
+}
+
+/**
+ * Accept-or-refuse view of the same rules. Kept as the thin wrapper so the two
+ * callers cannot drift: validation on write, and reporting on read.
+ */
+export function normalizePolicy(raw: unknown, where = "process"): NormalizeResult {
+  const { doc, errors } = normalizePolicyPartial(raw, where);
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, doc };
+}
+
+export interface PartialNormalize {
+  doc: PolicyDoc;
+  errors: PolicyError[];
 }
 
 export interface PolicyRow {

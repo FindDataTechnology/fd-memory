@@ -527,3 +527,53 @@ test("/policy: landing the same declaration twice leaves one row with the same c
     await close();
   }
 });
+
+// ── a stored row nobody validated must not read as "normal" ────────────────
+//
+// The write face refuses a bad document, so a bad row arrives out of band: an
+// older version of this service, a hand edit, a restore from a backup taken
+// before validation existed. Measured before the fix — a misspelled key was
+// dropped silently and the table showed the deployment default as if all were
+// well, and a wrong-typed value was surfaced AS the effective value. Both are
+// what the spec forbids ("MUST NOT 以默认值呈现为正常").
+//
+// Two shapes, asserted separately because they fail differently: an unknown key
+// produces no row (only stored_invalid names it), while a bad value reaches its
+// row (so the row itself must carry the marker).
+test("/policy: an unvalidated stored row is named, never presented as normal", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const platform = svc.tokens.mint("platform", "*").token;
+    const root = svc.rootForKey("d-legal-crew");
+    // Written straight to the store, bypassing the route's validation.
+    root.db.setMemoryPolicy("root", { distil: "off", promote_after: "lots" });
+
+    const got = await fetch(`${base}/policy?rootKey=d-legal-crew`, { headers: json(platform) });
+    assert.equal(got.status, 200);
+    const view = (await got.json()) as {
+      rows: Record<string, { declared: unknown; effective: unknown; executed: boolean; invalid?: { code: string; level: string } }>;
+      stored_invalid?: Array<{ level: string; key: string; code: string }>;
+    };
+
+    // (a) the misspelled key cannot enter any row, so the top-level list is the
+    // only place it can appear — and it must appear.
+    assert.ok(Array.isArray(view.stored_invalid), "a key nobody knows must be reported, not dropped");
+    assert.equal(view.stored_invalid![0].key, "process.distil");
+    assert.equal(view.stored_invalid![0].code, "policy_key_unknown");
+    assert.equal(view.stored_invalid![0].level, "root");
+
+    // (b) the wrong-typed value does reach its row; the row says so, and the
+    // reader is not left thinking `lots` was in force.
+    const promote = view.rows.promote_after;
+    assert.equal(promote.declared, "lots");
+    assert.ok(promote.invalid, "a value that cannot be parsed must be flagged on its row");
+    assert.equal(promote.invalid!.code, "policy_promote_after_invalid");
+    assert.equal(promote.invalid!.level, "root");
+
+    // (c) and a healthy row stays clean — the marker must not become noise.
+    assert.equal(view.rows.distill.invalid, undefined);
+    assert.equal(view.stored_invalid!.length, 1, "one bad key, one report");
+  } finally {
+    await close();
+  }
+});
