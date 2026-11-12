@@ -13,6 +13,7 @@ import { StoreRoot } from "./store.js";
 import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
+import { deploymentDefaults, distillEnabled } from "./policy.js";
 import { noteDistillStages, noteDistillTruncation, extractHitCeiling, noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
@@ -35,6 +36,10 @@ export interface DistillSchedulerOptions {
   // supplies the owner-dir listing; the scan opens uncached roots once (the
   // map is the cache) so every root distills regardless of traffic.
   discoverRoots?: () => string[];
+  // Declared process policy per root (add-agent-memory-declaration). Absent
+  // provider = deployment default only, which is exactly the pre-change
+  // behaviour, so callers that never inject one keep working unchanged.
+  policyFor?: (rootKey: string) => { root: Record<string, string | number>; projects: Record<string, Record<string, string | number>> };
   log?: { warn: (msg: string) => void; log: (msg: string) => void };
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
@@ -73,14 +78,16 @@ const EXTRACT_RETRY_ON_TRUNCATION = String(process.env.FD_MEMORY_EXTRACT_RETRY_O
 const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
-// Root-family gate (add-u-root-distillation D1): pack roots always distill;
-// person roots distill unless the deployment opts out. FD_MEMORY_DISTILL_U=0
-// is the kill switch — no pending marks, no fallback scan, byte-identical to
-// the pre-enablement behavior.
-function isDistillableRoot(rootKey: string, env: NodeJS.ProcessEnv | undefined): boolean {
-  if (rootKey.startsWith("d-")) return true;
-  if (rootKey.startsWith("u-")) return env?.FD_MEMORY_DISTILL_U !== "0";
-  return false;
+// Root-family gate. This used to be the whole decision: pack roots always
+// distilled, person roots distilled unless FD_MEMORY_DISTILL_U=0 — which made the
+// env var the ONLY way to answer "should this root distill", so a team that wanted
+// it on could not say so and one that wanted it off needed an operator.
+//
+// Now the family gate answers a narrower question ("does this root type
+// participate at all") and FD_MEMORY_DISTILL_U becomes a deployment DEFAULT
+// (policy.deploymentDefaults) that a declared root/project policy overrides.
+function isDistillableRootFamily(rootKey: string): boolean {
+  return rootKey.startsWith("d-") || rootKey.startsWith("u-");
 }
 
 export class DistillScheduler {
@@ -122,11 +129,40 @@ export class DistillScheduler {
   // pending. Projects are d/-member or shared projects only (design D1).
   notifyCapture(rootKey: string, project: string, events: Array<{ event?: string }>): void {
     if (!this.enabled()) return;
-    if (!isDistillableRoot(rootKey, this.opts.env)) return;
+    if (!this.distills(rootKey, project)) return;
     const boundary = events.some((e) => e?.event === "session-end" || e?.event === "stop");
     if (!boundary) return;
     const key = DistillScheduler.key(rootKey, project);
     if (!this.pending.has(key)) this.pending.set(key, { rootKey, project, since: this.now() });
+  }
+
+  /**
+   * Does this (root, project) participate in distillation right now?
+   *
+   * Resolves the declaration chain — project policy, then this root's policy,
+   * then the deployment default (FD_MEMORY_DISTILL_U demoted to exactly that).
+   * An undeclared root behaves as it did before this change, so the default
+   * path is byte-identical.
+   */
+  private distills(rootKey: string, project = ""): boolean {
+    if (!isDistillableRootFamily(rootKey)) return false;
+    const deployment = deploymentDefaults(rootKey, this.opts.env);
+    let docs: { root: Record<string, string | number>; projects: Record<string, Record<string, string | number>> } =
+      { root: {}, projects: {} };
+    try {
+      docs = this.opts.policyFor?.(rootKey) ?? docs;
+    } catch {
+      // A policy read must never stop distillation: degrade to the deployment
+      // default, which is the pre-change behaviour.
+      docs = { root: {}, projects: {} };
+    }
+    return distillEnabled(
+      [
+        ["project", project ? (docs.projects[project] ?? {}) : {}],
+        ["root", docs.root],
+      ],
+      deployment,
+    );
   }
 
   start(): void {
@@ -181,7 +217,7 @@ export class DistillScheduler {
     try {
       const keys = new Set<string>([...this.opts.roots.keys(), ...(this.opts.discoverRoots?.() ?? [])]);
       for (const key of keys) {
-        if (!isDistillableRoot(key, this.opts.env)) continue;
+        if (!this.distills(key)) continue;
         let root: StoreRoot;
         try { root = this.opts.roots.get(key) ?? this.opts.openRoot(key); } catch { continue; }
         const dom = root.db.dominantVectorModel();
@@ -337,13 +373,13 @@ export class DistillScheduler {
     this.lastFallback = this.now();
     if (this.opts.discoverRoots) {
       for (const rootKey of this.opts.discoverRoots()) {
-        if (isDistillableRoot(rootKey, this.opts.env) && !this.opts.roots.has(rootKey)) {
+        if (this.distills(rootKey) && !this.opts.roots.has(rootKey)) {
           try { this.opts.openRoot(rootKey); } catch { /* unreadable root — skip this scan */ }
         }
       }
     }
     for (const [rootKey, root] of this.opts.roots) {
-      if (!isDistillableRoot(rootKey, this.opts.env)) continue;
+      if (!this.distills(rootKey)) continue;
       const day = new Date().toISOString().slice(0, 10);
       const remaining = this.dailyLimit() - this.opts.tokens.distillBudgetUsed(rootKey, day).tokens;
       if (remaining < FALLBACK_BUDGET_RESERVE) continue; // active projects first
@@ -399,6 +435,11 @@ export class DistillScheduler {
     this.pending.delete(key);
     this.inflight.add(key);
     try {
+      // Per-project policy gate (add-agent-memory-declaration): a project may
+      // declare `process.distill: off` while its root stays on, or the reverse.
+      // Checked at drain time as well as at mark time, so a declaration that
+      // lands after a project was queued still takes effect on the next drain.
+      if (!this.distills(rootKey, project)) return;
       const root = this.opts.openRoot(rootKey);
       const state = root.db.getDistillState(project);
       if (state && state.next_attempt_at > this.now()) return;

@@ -21,12 +21,15 @@ import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-
 import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
+import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, resolvePolicy, unexecuted } from "./policy.js";
 
 export interface ServiceOptions {
   dataDir: string;
   port: number;
   pepper: string;
   host?: string;
+  /** Injected for tests; the process env when omitted. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export class Service {
@@ -48,7 +51,24 @@ export class Service {
           return readdirSync(join(this.opts.dataDir, "owners")).filter((d: string) => existsSync(join(this.opts.dataDir, "owners", d, "wiki")));
         } catch { return []; }
       },
-      env: process.env,
+      env: opts.env ?? process.env,
+      // Declared process policy per root (add-agent-memory-declaration). Read
+      // through the same root cache the scheduler uses, so a declaration takes
+      // effect on the next tick without reopening anything.
+      policyFor: (rootKey: string) => {
+        let root: StoreRoot;
+        try {
+          root = this.rootForKey(rootKey);
+        } catch {
+          return { root: {}, projects: {} };
+        }
+        const projects: Record<string, Record<string, string | number>> = {};
+        for (const project of root.db.memoryPolicyScopes()) {
+          if (project === "root") continue;
+          projects[project] = root.db.getMemoryPolicy(project);
+        }
+        return { root: root.db.getMemoryPolicy("root"), projects };
+      },
     });
   }
 
@@ -1094,6 +1114,94 @@ export class Service {
       const ok = root.forgetPage(rel, { principal, scope: fScope });
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ forgotten: ok ? rel : null, already: !ok }));
+    }
+
+    // ── /policy (add-agent-memory-declaration): the process axis, resolved ───
+    //
+    // Three columns, because the point of this face is to make "declared but not
+    // in force" visible: `declared` (what someone wrote), `inherited_from` (which
+    // level supplied the effective value), `effective`, and `executed` (whether
+    // this version has a consumer for that sub-key at all).
+    //
+    // Scope: person tokens resolve their own root, deployment/pod tokens their own
+    // namespace, platform/runner must name rootKey explicitly — the same seam as
+    // /pages and /memory, where the deployer mapping is the caller's job.
+    if (path === "/policy") {
+      const allowed = ["person", "deployment", "pod", "platform", "runner"];
+      if (!allowed.includes(scope.kind)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "token_kind_not_allowed" }));
+      }
+      const explicitRoot = String(url.searchParams.get("rootKey") || "");
+      const platformSeam = scope.kind === "platform" || scope.kind === "runner";
+      if (platformSeam && !explicitRoot) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "rootKey_required" }));
+      }
+      if (!platformSeam && explicitRoot) {
+        // A tenant token must not reach a sibling root by naming it.
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "rootKey_is_platform_seam_only" }));
+      }
+      const parts = namespaceParts(scope.namespace);
+      const rootKey = explicitRoot || parts.rootKey;
+      const project = String(url.searchParams.get("project") || parts.project || "default");
+      const root = this.rootForKey(rootKey);
+      const deployment = deploymentDefaults(rootKey, this.opts.env);
+
+      if (req.method === "GET") {
+        const rows = resolvePolicy(
+          [
+            ["project", root.db.getMemoryPolicy(project)],
+            ["root", root.db.getMemoryPolicy("root")],
+          ],
+          deployment,
+        );
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          rootKey,
+          project,
+          rows,
+          not_executed: unexecuted(rows),
+          deployment_default: deployment,
+        }));
+      }
+
+      if (req.method === "PUT" || req.method === "POST") {
+        const body = await this.body<{ process?: unknown; scope?: unknown }>(req);
+        // `scope` names WHICH level the write applies to; default = this project.
+        const target = String(body.scope ?? url.searchParams.get("scope") ?? "project");
+        if (target !== "project" && target !== "root") {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({ error: "scope_must_be_project_or_root" }));
+        }
+        const normalized = normalizePolicy(body.process, "process");
+        if (!normalized.ok) {
+          res.writeHead(400, { "content-type": "application/json" });
+          return void res.end(JSON.stringify({
+            error: "policy_invalid",
+            errors: normalized.errors,
+            known_keys: PROCESS_KEYS,
+          }));
+        }
+        const key = target === "root" ? "root" : project;
+        // An empty document is a DELETE, not an empty declaration: that is the
+        // rollback path — clear the row and the inherited/env behaviour returns.
+        const cleared = Object.keys(normalized.doc).length === 0;
+        if (cleared) root.db.deleteMemoryPolicy(key);
+        else root.db.setMemoryPolicy(key, normalized.doc);
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          rootKey,
+          target,
+          scope_key: key,
+          declared: normalized.doc,
+          cleared,
+        }));
+      }
+
+      res.writeHead(405, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ error: "method_not_allowed" }));
     }
 
     // namespace overrides never apply: the wire protocol has no namespace

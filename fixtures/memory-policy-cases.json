@@ -1,0 +1,202 @@
+{
+  "note": "Cross-implementation parity fixture for the process axis (add-agent-memory-declaration, task 3.5). Both resolvers read this file: fd-agent-graph (Python, offline roster validation) and fd-memory (TypeScript, runtime policy face). They must produce identical rows and reject the same offending keys. Only the process axis is compared: store/read/write are author-side axes the memory service does not implement, and duplicating them there would create a second source.",
+  "cases": [
+    {
+      "name": "project overrides root",
+      "levels": [
+        [
+          "project",
+          {
+            "distill": "off"
+          }
+        ],
+        [
+          "root",
+          {
+            "distill": "on"
+          }
+        ]
+      ],
+      "deployment": {
+        "distill": "on"
+      },
+      "expect": {
+        "distill": {
+          "declared": "off",
+          "inherited_from": "project",
+          "effective": "off",
+          "executed": true
+        },
+        "promote_after": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 3,
+          "executed": false
+        },
+        "cold_after_days": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 0,
+          "executed": false
+        }
+      },
+      "not_executed": []
+    },
+    {
+      "name": "inherit keeps looking upward",
+      "levels": [
+        [
+          "project",
+          {
+            "distill": "inherit"
+          }
+        ],
+        [
+          "root",
+          {
+            "distill": "off"
+          }
+        ]
+      ],
+      "deployment": {
+        "distill": "on"
+      },
+      "expect": {
+        "distill": {
+          "declared": "inherit",
+          "inherited_from": "root",
+          "effective": "off",
+          "executed": true
+        },
+        "promote_after": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 3,
+          "executed": false
+        },
+        "cold_after_days": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 0,
+          "executed": false
+        }
+      },
+      "not_executed": []
+    },
+    {
+      "name": "nothing declared lands on the deployment default",
+      "levels": [
+        [
+          "project",
+          {}
+        ],
+        [
+          "root",
+          {}
+        ]
+      ],
+      "deployment": {
+        "distill": "off"
+      },
+      "expect": {
+        "distill": {
+          "declared": null,
+          "inherited_from": "deployment",
+          "effective": "off",
+          "executed": true
+        },
+        "promote_after": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 3,
+          "executed": false
+        },
+        "cold_after_days": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": 0,
+          "executed": false
+        }
+      },
+      "not_executed": []
+    },
+    {
+      "name": "declared sub-keys with no consumer are listed as not executed",
+      "levels": [
+        [
+          "project",
+          {
+            "promote_after": 5,
+            "cold_after_days": 90
+          }
+        ],
+        [
+          "root",
+          {}
+        ]
+      ],
+      "deployment": {},
+      "expect": {
+        "distill": {
+          "declared": null,
+          "inherited_from": "platform",
+          "effective": "on",
+          "executed": true
+        },
+        "promote_after": {
+          "declared": 5,
+          "inherited_from": "project",
+          "effective": 5,
+          "executed": false
+        },
+        "cold_after_days": {
+          "declared": 90,
+          "inherited_from": "project",
+          "effective": 90,
+          "executed": false
+        }
+      },
+      "not_executed": [
+        "promote_after",
+        "cold_after_days"
+      ]
+    }
+  ],
+  "rejections": [
+    {
+      "name": "misspelled sub-key is refused by name",
+      "doc": {
+        "distil": "off"
+      },
+      "expect_key": "process.distil"
+    },
+    {
+      "name": "unknown sub-key is refused by name",
+      "doc": {
+        "promote_at": 3
+      },
+      "expect_key": "process.promote_at"
+    },
+    {
+      "name": "promote_after below 1 is refused, not clamped",
+      "doc": {
+        "promote_after": 0
+      },
+      "expect_key": "process.promote_after"
+    },
+    {
+      "name": "negative cold window is refused",
+      "doc": {
+        "cold_after_days": -1
+      },
+      "expect_key": "process.cold_after_days"
+    },
+    {
+      "name": "distill accepts only on/off/inherit",
+      "doc": {
+        "distill": "maybe"
+      },
+      "expect_key": "process.distill"
+    }
+  ]
+}

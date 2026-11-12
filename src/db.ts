@@ -189,6 +189,16 @@ export class RootDb {
         seen_at TEXT NOT NULL,
         PRIMARY KEY (project, idem_key)
       );
+      -- Process-axis policy (add-agent-memory-declaration). One row per scope
+      -- label inside this root's own DB: 'root' is this root's default, any other
+      -- value is a project (member) override. The doc column holds the canonical
+      -- JSON from src/policy.ts normalizePolicy — the declaration is the truth, so
+      -- the read face can show declared vs effective without inferring intent.
+      CREATE TABLE IF NOT EXISTS memory_policy (
+        scope TEXT PRIMARY KEY,
+        doc TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT
+      );
     `);
     // Pre-v2 databases: observations had no project column (the root was one
     // agent's), handoffs had no to_agent. Those rows belong to the agent's own
@@ -493,6 +503,49 @@ export class RootDb {
     return this.db
       .prepare(`SELECT * FROM handoffs WHERE state='open'${pf.clause} ORDER BY created_at`)
       .all(...pf.args) as unknown as HandoffRow[];
+  }
+
+  // -- memory policy (add-agent-memory-declaration) --------------------------
+
+  /**
+   * Read one scope's PERSISTED declaration ({} when nothing was declared).
+   *
+   * Deliberately returns the raw document, not a resolved policy: resolution
+   * needs the whole inheritance chain and the deployment default, and doing it
+   * here would bake this version's defaults into storage.
+   */
+  getMemoryPolicy(scope: string): Record<string, string | number> {
+    const row = this.db.prepare("SELECT doc FROM memory_policy WHERE scope=?").get(scope) as
+      | { doc?: string }
+      | undefined;
+    if (!row?.doc) return {};
+    try {
+      const parsed = JSON.parse(row.doc);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      // A corrupt row must not make the whole root unreadable; an empty document
+      // resolves to the inherited values, and the write face re-normalizes.
+      return {};
+    }
+  }
+
+  setMemoryPolicy(scope: string, doc: Record<string, string | number>): void {
+    this.db
+      .prepare(
+        `INSERT INTO memory_policy (scope, doc, updated_at) VALUES (?,?,?)
+         ON CONFLICT(scope) DO UPDATE SET doc=excluded.doc, updated_at=excluded.updated_at`,
+      )
+      .run(scope, JSON.stringify(doc), new Date().toISOString());
+  }
+
+  deleteMemoryPolicy(scope: string): boolean {
+    const res = this.db.prepare("DELETE FROM memory_policy WHERE scope=?").run(scope);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  memoryPolicyScopes(): string[] {
+    const rows = this.db.prepare("SELECT scope FROM memory_policy").all() as Array<{ scope: string }>;
+    return rows.map((r) => r.scope);
   }
 
   // -- distill state (add-memory-distiller) -----------------------------------
