@@ -466,3 +466,64 @@ test("a project policy overrides the root it sits under (both directions)", asyn
     "a project may open what its root closed",
   );
 });
+
+// ── the write face is idempotent (task 4.2) ────────────────────────────────
+//
+// Materialization runs on every pod start, so the same declaration reaches this
+// face repeatedly. The acceptance is "two landings, one row, same content" — and
+// the row key is `root`, which is the scope a pack's process axis compiles to
+// (paas: compilePackMemoryPolicy → PUT /policy?scope=root). Everything here goes
+// through HTTP, because the row-count claim is about what the route does, not
+// about what the ORM helper can be trusted to do.
+test("/policy: landing the same declaration twice leaves one row with the same content", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const platform = svc.tokens.mint("platform", "*").token;
+    const put = (body: unknown) =>
+      fetch(`${base}/policy?rootKey=d-legal-crew&scope=root`, {
+        method: "PUT",
+        headers: json(platform),
+        body: JSON.stringify(body),
+      });
+
+    const first = await put({ process: { distill: "off", cold_after_days: 90 } });
+    assert.equal(first.status, 200);
+    assert.equal(((await first.json()) as { target: string }).target, "root");
+
+    const second = await put({ process: { distill: "off", cold_after_days: 90 } });
+    assert.equal(second.status, 200);
+    assert.equal(((await second.json()) as { cleared: boolean }).cleared, false);
+
+    const root = svc.rootForKey("d-legal-crew");
+    const rootRows = root.db.memoryPolicyScopes().filter((s) => s === "root");
+    assert.equal(rootRows.length, 1, "two landings must not create two rows");
+    assert.deepEqual(root.db.getMemoryPolicy("root"), { distill: "off", cold_after_days: 90 });
+
+    // And the read face attributes it to the root, not to a project.
+    const got = await fetch(`${base}/policy?rootKey=d-legal-crew`, { headers: json(platform) });
+    const view = (await got.json()) as {
+      rows: Record<string, { declared: unknown; inherited_from: string | null; effective: unknown }>;
+    };
+    assert.equal(view.rows.distill.declared, "off");
+    assert.equal(view.rows.distill.inherited_from, "root");
+    assert.equal(view.rows.distill.effective, "off");
+
+    // The case below is what makes the idempotency claim meaningful: "same input
+    // ⇒ one row, same content" is ALSO satisfied by a route that never updates at
+    // all (measured — replacing the upsert with DO NOTHING left the first version
+    // of this test green). A CHANGED declaration must replace the row.
+    const changed = await put({ process: { distill: "on" } });
+    assert.equal(changed.status, 200);
+    assert.deepEqual(root.db.getMemoryPolicy("root"), { distill: "on" }, "a new declaration must replace the row");
+    assert.equal(root.db.memoryPolicyScopes().filter((s) => s === "root").length, 1, "still one row");
+
+    // The clear path is the same route: an empty declaration removes the row, so
+    // the (single) row cannot accumulate across a pack's lifetime.
+    const cleared = await put({ process: {} });
+    assert.equal(((await cleared.json()) as { cleared: boolean }).cleared, true);
+    assert.deepEqual(root.db.getMemoryPolicy("root"), {});
+    assert.equal(root.db.memoryPolicyScopes().filter((s) => s === "root").length, 0);
+  } finally {
+    await close();
+  }
+});
