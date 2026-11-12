@@ -5,8 +5,14 @@
 // Two behaviours carry the whole point of the change, and both are tested from
 // both sides because a one-sided green is how "declared but not in force" passed
 // review last time:
-//   ① deployment default OFF + team declares ON  → distillation happens
-//   ② deployment default ON  + project declares OFF → distillation does not
+//   ① deployment default OFF + root declares ON      → distillation happens
+//   ② deployment default ON  + project declares OFF  → distillation does not
+//
+// Careful with the word "team" in ①: the deployment default is switchable ONLY
+// for `u-` roots (deploymentDefaults), so ① can only be exercised on a person
+// root. A team's root is `d-<pack>` and its default is always ON — which is why
+// the team half is tested as "declare off" instead, further down. Reading ① as
+// "a team's default can be off" would be a false premise.
 //
 // Real service, real port (harden-memory-surfaces §1: the shipped bugs lived in
 // the parameter/scope seams, and a mock tests the mock).
@@ -381,4 +387,82 @@ test("policy OFF beats a deployment default ON", async () => {
   );
   const state = root.db.getDistillState("agentA");
   assert.ok(!state || !state.obs_cursor, "no cursor movement for a project that declared off");
+});
+
+// ── the TEAM coordinate ────────────────────────────────────────────────────
+//
+// Everything above uses `u-` roots, where `FD_MEMORY_DISTILL_U=0` can make the
+// deployment default OFF. A team's root is `d-<pack>`, and the operator switch
+// deliberately never applied to it (deploymentDefaults: "fleet roots have always
+// distilled"). So the symmetry this file's header claims is only half real:
+//
+//   u- root:  deployment default is switchable           → both directions testable
+//   d- root:  deployment default is ALWAYS on            → only "declare off" is
+//
+// That is not a gap in the change, it is the reason the change matters for teams:
+// before it, a team that wanted distillation off had no way to say so at all.
+test("deploymentDefaults: the operator switch is u-only, so a team default is always on", () => {
+  const env = { FD_MEMORY_DISTILL_U: "0" };
+  assert.deepEqual(deploymentDefaults("u-alice@test", env), { distill: "off" });
+  assert.deepEqual(deploymentDefaults("d-legal-crew", env), { distill: "on" });
+  // And the switch cannot be used to guess: no env value makes a team default off.
+  assert.deepEqual(deploymentDefaults("d-legal-crew", { FD_MEMORY_DISTILL_U: "1" }), { distill: "on" });
+});
+
+test("a team root that declares distill off really stops, and clearing it resumes", async () => {
+  const fx = schedulerFixture({ ...GATES, FD_MEMORY_DISTILL_U: "1" });
+  const root = fx.openRoot("d-legal-crew");
+  const writeNote = (rel: string, at: string) =>
+    root.writePage("default", "notes", rel, {
+      frontmatter: { type: "note", title: "口径", generated: { by: "test", at } },
+      body: "正文",
+    } as never);
+
+  // Declared off at the ROOT scope, which is what a pack's process axis compiles
+  // to (paas: compilePackMemoryPolicy → PUT /policy?scope=root). Every project
+  // under the root inherits it.
+  root.db.setMemoryPolicy("root", { distill: "off" });
+  writeNote("n1", "2026-11-12T00:00:00.000Z");
+  await new Promise((r) => setTimeout(r, 5));
+  await fx.sched.distillNow("d-legal-crew", "default");
+  assert.equal(
+    fx.calls.filter((u) => u.endsWith("/distill")).length,
+    0,
+    "a team declaring off must not reach the distiller",
+  );
+  const untouched = root.db.getDistillState("default");
+  assert.ok(
+    !untouched || untouched.note_cursor === "" || untouched.note_cursor === null,
+    `the cursor must not advance while off (got ${JSON.stringify(untouched)}）`,
+  );
+
+  // Rollback is one row: no code, no deploy.
+  root.db.deleteMemoryPolicy("root");
+  fx.calls.length = 0;
+  writeNote("n2", "2026-11-12T01:00:00.000Z");
+  await new Promise((r) => setTimeout(r, 5));
+  await fx.sched.distillNow("d-legal-crew", "default");
+  assert.ok(
+    fx.calls.some((u) => u.endsWith("/distill")),
+    "after the row is gone the team distils again on the platform default",
+  );
+  const resumed = root.db.getDistillState("default");
+  assert.ok(resumed && resumed.note_cursor !== "", "the cursor advanced after rollback");
+});
+
+test("a project policy overrides the root it sits under (both directions)", async () => {
+  const fx = schedulerFixture({ ...GATES, FD_MEMORY_DISTILL_U: "1" });
+  const root = fx.openRoot("d-legal-crew");
+  root.db.setMemoryPolicy("root", { distill: "off" });
+  root.db.setMemoryPolicy("matter-42", { distill: "on" });
+  root.writePage("matter-42", "notes", "n1", {
+    frontmatter: { type: "note", title: "口径", generated: { by: "test", at: "2026-11-12T00:00:00.000Z" } },
+    body: "正文",
+  } as never);
+  await new Promise((r) => setTimeout(r, 5));
+  await fx.sched.distillNow("d-legal-crew", "matter-42");
+  assert.ok(
+    fx.calls.some((u) => u.endsWith("/distill")),
+    "a project may open what its root closed",
+  );
 });
