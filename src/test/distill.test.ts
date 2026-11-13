@@ -235,6 +235,55 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
   }
 });
 
+test("d-root: the budget binds BETWEEN calls, not once per run (11-12 production overshoot)", async () => {
+  // Measured on the completed UTC day 2026-11-12: owner d-KkCie7… billed
+  // 1,256,968 against FD_MEMORY_DISTILL_DAILY_TOKENS=1,200,000 with per_run =
+  // 179,567 — 41,968 past the "cap + one call" allowance. Cause: d-roots checked
+  // the ledger once at the top of distillOne, then a truncating batch fired two
+  // more calls (extract + halves), each billing. u-roots have re-read per chunk
+  // since 7.3; this pins the same shape for d-roots.
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      if (String(url).endsWith("/promote")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
+      // Every call bills the whole cap AND reports a ceiling hit, so the old
+      // shape would immediately fire two more calls ("halves") and bill 3x.
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [],
+        cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        tokens: 7500, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_DAILY_TOKENS: "7500" });
+    const root = fx.openRoot("d-pkCap");
+    const at = new Date().toISOString();
+    for (const s of ["查 5xx", "看日志", "定位 G7 DNS 超时"]) {
+      root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: s, tool: null, created_at: at, project: "agentA" });
+    }
+    await fx.sched.distillNow("d-pkCap", "agentA");
+    const distillCalls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    assert.equal(distillCalls.length, 1, `the truncation halves must be refused once the cap is spent (saw ${distillCalls.length})`);
+    const day = new Date().toISOString().slice(0, 10);
+    const billed = fx.tokens.distillBudgetUsed("d-pkCap", day).tokens;
+    assert.equal(billed, 7500, `overshoot is bounded by one call (billed ${billed})`);
+    const st = root.db.getDistillState("agentA")!;
+    assert.equal(st.last_error, "daily_budget_exhausted", "the stop is named, not silent");
+    assert.equal(st.obs_cursor, 0, "cursors are kept: the material comes back after the cap resets");
+    assert.ok((st.gaps ?? 0) >= 1);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("scheduler: gates — no URL or not enabled means notify/drain are inert", async () => {
   const data = tmpData();
   const sidecar = { calls: [] as Array<Record<string, unknown>>, impl: (async () => { throw new Error("must not be called"); }) as unknown as typeof fetch };

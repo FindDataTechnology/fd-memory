@@ -659,7 +659,28 @@ export class DistillScheduler {
       let wrote = 0;
       let billed = 0;
       let engineCalls = 0;
-      const callOnce = async (batch: DistillItem[]): Promise<{ written: number; truncated: boolean }> => {
+      const callOnce = async (batch: DistillItem[]): Promise<{ written: number; truncated: boolean; stopped?: boolean }> => {
+        // Per-call budget re-read on the d-root path (2026-11-13). The check at
+        // the top of distillOne runs ONCE per invocation, and one d-root run is
+        // up to three calls (extract + two truncation halves) — measured on the
+        // completed UTC day 11-12: owner d-KkCie7… billed 1,256,968 against a
+        // 1,200,000 cap with per_run = 179,567, i.e. 41,968 past the "cap + one
+        // call" allowance. u-roots have re-read per chunk since 7.3; d-roots did
+        // not, so that invariant only held on one of the two paths. Same error
+        // name and same log line as the u-root branch, so the ops check's
+        // `daily budget hit mid-run` evidence now covers both families.
+        const spentNow = this.opts.tokens.distillBudgetUsed(rootKey, day).tokens;
+        if (spentNow >= this.dailyLimit()) {
+          root.db.upsertDistillState(project, {
+            last_error: "daily_budget_exhausted",
+            gaps: (state?.gaps ?? 0) + 1,
+            next_attempt_at: tomorrowMs(this.now()),
+          });
+          this.log.warn(`[distill] ${key}: daily budget hit mid-run (${spentNow}/${this.dailyLimit()}) — stopping, cursors kept`);
+          noteDistillStages(stageCalls);
+          noteDistill(true, wrote, billed, undefined, { items: items.length, calls: engineCalls });
+          return { written: 0, truncated: false, stopped: true };
+        }
         const candidates = await this.selectCandidates(root, project, queryFor);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
@@ -707,11 +728,15 @@ export class DistillScheduler {
 
       let unresolved = false;
       const first = await callOnce(items);
+      // Budget ran out between the run-level check and this call (or between
+      // chunks): state and log are already written — just stop, cursors kept.
+      if (first.stopped) return;
       const truncated = first.truncated;
       if (first.truncated) {
         if (retryOnTruncation && items.length > 1) {
           const mid = Math.ceil(items.length / 2);
           const halves = await Promise.all([callOnce(items.slice(0, mid)), callOnce(items.slice(mid))]);
+          if (halves.some((h) => h.stopped)) return;
           unresolved = halves.some((h) => h.truncated);
         } else {
           unresolved = true;
