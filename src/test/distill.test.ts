@@ -235,6 +235,57 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
   }
 });
 
+test("d-root: a budget stop is persisted in the ledger, not only logged (11-13 cross-day check)", async () => {
+  // fd-memory is Recreate + single replica, so every rollout deletes the pod that
+  // held the log line `daily budget hit mid-run`. The cross-day check therefore
+  // could only ever report "not observed" — which cannot be told apart from "the
+  // gate never fired" or "the gate leaked" (measured 11-12: an owner billed
+  // 1,256,968 against a 1,200,000 cap with no evidence left). Counting it in
+  // token.db survives restarts and makes the judgment answerable by one query.
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      if (String(url).endsWith("/promote") || String(url).endsWith("/tag")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
+      // Bills the whole cap AND reports a ceiling hit, so the split would fire —
+      // with the call budget at 1 it must be refused, which is the stop we count.
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [], cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        tokens: 7500, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_DAILY_TOKENS: "7500" });
+    const root = fx.openRoot("d-pkPersist");
+    const at = new Date().toISOString();
+    for (const t of ["积压一", "积压二", "积压三"]) {
+      root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: t, tool: null, created_at: at, project: "agentA" });
+    }
+    await fx.sched.distillNow("d-pkPersist", "agentA");
+    const day = new Date().toISOString().slice(0, 10);
+    const row = fx.tokens.distillBudgetRows("d-pkPersist").find((r) => r.day === day)!;
+    assert.ok(row, "the ledger row exists");
+    assert.ok(row.budget_stops >= 1, `the stop is counted, not just logged (got ${row.budget_stops})`);
+    // A refused call bills nothing, so the ledger stays at one call's worth —
+    // that is the design, and the proof that the refusal happened at the gate
+    // rather than after a second request had already spent money.
+    const calls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).length;
+    assert.equal(calls, 1, `only the first call reached the engine (sent ${calls})`);
+    assert.equal(row.tokens, 7500, `nothing was billed for the refused call (billed ${row.tokens})`);
+    // A different day's row must not inherit it.
+    assert.equal(fx.tokens.distillBudgetRows("d-pkPersist").filter((r) => r.day !== day).length, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("d-root: the sidecar request budget is configurable and the default does not abort early (11-13)", async () => {
   // The caller's budget must exceed the distiller's own deadline, otherwise the
   // caller aborts first and the named `distill_deadline_exceeded` never reaches

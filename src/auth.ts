@@ -117,6 +117,13 @@ export class TokenStore {
         -- truncation): the in-process metrics reset on every roll, which is
         -- exactly when an operator most wants the historical ratio.
         runs INTEGER NOT NULL DEFAULT 0, truncated_runs INTEGER NOT NULL DEFAULT 0,
+        -- Mid-run budget stops, persisted (2026-11-13). This used to be a log line
+        -- only, and fd-memory is Recreate + single replica: every rollout deleted
+        -- the pods that had the evidence, so the cross-day check could only ever
+        -- say "not observed" — which is indistinguishable from "the gate never
+        -- fired" and from "the gate leaked". Counting it in the ledger survives
+        -- restarts and makes that judgment answerable from one query.
+        budget_stops INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (owner_key, day)
       );
       CREATE TABLE IF NOT EXISTS root_owner (
@@ -130,6 +137,7 @@ export class TokenStore {
     );
     if (!budgetCols.has("runs")) this.db.exec("ALTER TABLE distill_budget ADD COLUMN runs INTEGER NOT NULL DEFAULT 0");
     if (!budgetCols.has("truncated_runs")) this.db.exec("ALTER TABLE distill_budget ADD COLUMN truncated_runs INTEGER NOT NULL DEFAULT 0");
+    if (!budgetCols.has("budget_stops")) this.db.exec("ALTER TABLE distill_budget ADD COLUMN budget_stops INTEGER NOT NULL DEFAULT 0");
     this.backfillDefaultGrants();
   }
 
@@ -236,10 +244,10 @@ export class TokenStore {
     return { tokens: Number(row?.tokens ?? 0), llm_calls: Number(row?.llm_calls ?? 0) };
   }
 
-  distillBudgetRows(ownerKey: string, limitDays = 7): Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number }> {
+  distillBudgetRows(ownerKey: string, limitDays = 7): Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number; budget_stops: number }> {
     return this.db
-      .prepare("SELECT owner_key, day, tokens, llm_calls, runs, truncated_runs FROM distill_budget WHERE owner_key=? ORDER BY day DESC LIMIT ?")
-      .all(ownerKey, limitDays) as unknown as Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number }>;
+      .prepare("SELECT owner_key, day, tokens, llm_calls, runs, truncated_runs, budget_stops FROM distill_budget WHERE owner_key=? ORDER BY day DESC LIMIT ?")
+      .all(ownerKey, limitDays) as unknown as Array<{ owner_key: string; day: string; tokens: number; llm_calls: number; runs: number; truncated_runs: number; budget_stops: number }>;
   }
 
   // One row per distill run, with whether its extract hit the completion ceiling.
@@ -252,6 +260,16 @@ export class TokenStore {
          ON CONFLICT(owner_key, day) DO UPDATE SET runs = runs + 1, truncated_runs = truncated_runs + excluded.truncated_runs`,
       )
       .run(ownerKey, day, truncated ? 1 : 0);
+  }
+
+  // A run that stopped because the per-call gate refused the next call (7.3).
+  distillBudgetStopAdd(ownerKey: string, day: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO distill_budget (owner_key, day, budget_stops) VALUES (?,?,1)
+         ON CONFLICT(owner_key, day) DO UPDATE SET budget_stops = budget_stops + 1`,
+      )
+      .run(ownerKey, day);
   }
 
   distillBudgetAdd(ownerKey: string, day: string, tokens: number, llmCalls: number): void {

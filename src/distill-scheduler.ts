@@ -655,6 +655,7 @@ export class DistillScheduler {
             catch (e) {
               if ((e as Error)?.message === "daily_budget_exhausted") {
                 root.db.upsertDistillState(project, { last_error: "daily_budget_exhausted", gaps: (state?.gaps ?? 0) + 1, next_attempt_at: tomorrowMs(this.now()) });
+                this.opts.tokens.distillBudgetStopAdd(rootKey, day);
                 this.log.warn(`[distill] ${key}: daily budget hit mid-run (${this.opts.tokens.distillBudgetUsed(rootKey, day).tokens}/${this.dailyLimit()}) — stopping, cursors kept`);
                 return;
               }
@@ -732,6 +733,7 @@ export class DistillScheduler {
             gaps: (state?.gaps ?? 0) + 1,
             next_attempt_at: tomorrowMs(this.now()),
           });
+          this.opts.tokens.distillBudgetStopAdd(rootKey, day);
           this.log.warn(`[distill] ${key}: daily budget hit mid-run (${spentNow}/${this.dailyLimit()}) — stopping, cursors kept`);
           noteDistillStages(stageCalls);
           noteDistill(true, wrote, billed, undefined, { items: items.length, calls: engineCalls });
