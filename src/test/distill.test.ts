@@ -235,6 +235,66 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
   }
 });
 
+test("d-root: the sidecar request budget is configurable and the default does not abort early (11-13)", async () => {
+  // The caller's budget must exceed the distiller's own deadline, otherwise the
+  // caller aborts first and the named `distill_deadline_exceeded` never reaches
+  // us (the exact shape that used to leave "This operation was aborted" with
+  // zero LLM errors). Measured: one call is 47-97 s with a 474-char prompt and
+  // the tail passes 150 s, so production runs 300 s (distiller) / 330 s (here).
+  const data = tmpData();
+  const slowButOk = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      if (String(url).endsWith("/promote") || String(url).endsWith("/tag")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
+      // Real fetch rejects on abort; a bare `await sleep` would swallow the
+      // signal and make the tight-budget arm silently pass.
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(resolve, 150);
+        init?.signal?.addEventListener("abort", () => {
+          clearTimeout(t);
+          reject(Object.assign(new Error("This operation was aborted"), { name: "AbortError" }));
+        });
+      });
+      return { ok: true, status: 200, json: async () => ({
+        facts: [],
+        experiences: [{ id: "exp_slow", engine: "engine:test/1", task: "慢但成功", search_keys: ["慢"], solution: "等它", sources: ["session:s1"], supersedes: [] }],
+        cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 100, completion_tokens: 50 }],
+        tokens: 200, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const seed = (root: StoreRoot) => {
+      root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: "慢调用", tool: null, created_at: new Date().toISOString(), project: "agentA" });
+    };
+    // 50 ms budget against a 150 ms answer → abort, cursor kept, failure named.
+    const fxTight = schedulerFixture(data, slowButOk, { ...GATES, FD_MEMORY_SIDECAR_TIMEOUT_MS: "50" });
+    const tight = fxTight.openRoot("d-pkSlowA");
+    seed(tight);
+    await fxTight.sched.distillNow("d-pkSlowA", "agentA");
+    const stTight = tight.db.getDistillState("agentA")!;
+    assert.equal(stTight.obs_cursor, 0, "an aborted request keeps the cursor");
+    assert.ok(/abort/i.test(String(stTight.last_error)), `the abort is named (got ${stTight.last_error})`);
+
+    // Default budget → the same 150 ms answer lands.
+    const fxDefault = schedulerFixture(data, slowButOk, { ...GATES });
+    const ok = fxDefault.openRoot("d-pkSlowB");
+    seed(ok);
+    await fxDefault.sched.distillNow("d-pkSlowB", "agentA");
+    const stOk = ok.db.getDistillState("agentA")!;
+    assert.ok(stOk.obs_cursor > 0, "the same slow answer lands under the default budget");
+    assert.equal(stOk.last_error, null);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("d-root: a truncating batch is held for the next round, not split mid-request (11-13 call budget)", async () => {
   // The split costs two more calls; at ~1 min per call on this lane those cannot
   // fit the same 150 s request, and a half-finished split used to die at

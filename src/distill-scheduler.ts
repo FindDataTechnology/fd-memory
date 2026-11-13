@@ -86,7 +86,15 @@ const DEFAULT_MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1
 // makes each call ~30 s and keeps the output under the ceiling; the run simply
 // advances its cursor and the next drain continues. Configurable so production
 // can be tuned without a rebuild.
-const SIDECCAR_TIMEOUT_MS = 180_000;
+// The /distill request budget on THIS side. The distiller answers before its own
+// DISTILL_LLM_DEADLINE_S, which must stay below this — otherwise the caller
+// aborts first and we are back to "the other side cut us off and we recorded
+// nothing". Measured 2026-11-13: one engine call takes 47-97 s with a 474-char
+// extraction prompt and the tail goes past 150 s (a 2-item u-root chunk died at
+// distill_deadline_exceeded), so the pair was raised to 300 s (distiller) /
+// 330 s (here) AFTER the call budget was pinned to one call per request — with
+// several calls per request a longer deadline would just hold the thread longer.
+const DEFAULT_SIDECAR_TIMEOUT_MS = 180_000;
 
 // Root-family gate. This used to be the whole decision: pack roots always
 // distilled, person roots distilled unless FD_MEMORY_DISTILL_U=0 — which made the
@@ -151,6 +159,13 @@ export class DistillScheduler {
     const raw = Number(this.opts.env?.FD_MEMORY_DISTILL_MAX_CALLS_PER_RUN ?? 0);
     if (!Number.isFinite(raw) || raw < 1) return Number.POSITIVE_INFINITY;
     return Math.floor(raw);
+  }
+
+  // Per-request HTTP budget against the sidecar (see DEFAULT_SIDECAR_TIMEOUT_MS).
+  // Garbage or <1 falls back to the default rather than aborting instantly.
+  private sidecarTimeoutMs(): number {
+    const raw = Number(this.opts.env?.FD_MEMORY_SIDECAR_TIMEOUT_MS ?? DEFAULT_SIDECAR_TIMEOUT_MS);
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : DEFAULT_SIDECAR_TIMEOUT_MS;
   }
 
   static key(rootKey: string, project: string): string {
@@ -279,7 +294,7 @@ export class DistillScheduler {
     const corr = root.db.correctionsAfter(project, "", 10).map((c) => `${c.title}: ${c.body}`).slice(0, 6).join("\n");
     const items = pending.map((p, i) => ({ idx: i, title: p.title, summary: p.body, current_tags: JSON.parse(p.tags || "[]"), current_tier: p.tier, corrections: corr }));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
     let res: Response;
     try {
       res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/tag`, {
@@ -351,7 +366,7 @@ export class DistillScheduler {
     if (used.tokens >= this.dailyLimit()) return; // budget exhausted: stop proposing; existing proposals stay acceptable
     const items = pending.map((p, i) => ({ idx: i, title: p.title, summary: p.body, current_tier: p.tier }));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
     let res: Response;
     try {
       res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/promote`, {
@@ -557,7 +572,7 @@ export class DistillScheduler {
           chunksIssued += 1;
           const candidates = await this.selectCandidates(root, project, items.map((i) => i.summary).join(" ").slice(0, 1200));
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+          const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
           let res: Response;
           try {
             res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
@@ -724,7 +739,7 @@ export class DistillScheduler {
         }
         const candidates = await this.selectCandidates(root, project, queryFor);
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), SIDECCAR_TIMEOUT_MS);
+        const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
         let res: Response;
         try {
           res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
