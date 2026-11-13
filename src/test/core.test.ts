@@ -629,6 +629,13 @@ test("federation: /hook person face + platform minting matrix + idempotency", as
     assert.equal(await mint(platform, "d/p/a"), 400);
     assert.equal(await mint(platform, "d/p/a", "u/alice"), 200);
     assert.equal(svc.tokens.rootOwnerOf("d-p"), "alice");
+    // add-pack-memory-declaration (2026-11-13): platform also mints the
+    // ONE-segment pack-root POD token — the credential a pack's declaration
+    // write uses. Without it the write path had no legal credential: platform
+    // tokens reach every root (which that path refuses to use) and a pod token
+    // cannot be obtained for `d/<pack>`. Strictly narrower than the two-segment
+    // mint above, so it adds no reach.
+    assert.equal(await mint(platform, "d/p"), 200);
     assert.equal(await mint(runner, "u/bob"), 403);
     assert.equal(await mint(person, "u/bob"), 403);
 

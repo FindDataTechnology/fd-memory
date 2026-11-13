@@ -1374,11 +1374,28 @@ export class Service {
         // agent platform's member materialization uses — and MUST bind
         // root_owner at that moment (the oversight anchor). Person minting
         // stays as-is.
+        //
+        // Extended again (add-pack-memory-declaration, measured 2026-11-13):
+        // platform also mints a ONE-segment `d/<packId>` **pod** token. That is
+        // the credential a pack's declaration write needs: the root's policy row
+        // belongs to `d-<pack>`, and a pod token can only reach the root it was
+        // minted for (a non-platform token that NAMES a root is refused with
+        // `rootKey_is_platform_seam_only`, so the namespace IS the scope).
+        // This is strictly NARROWER than the two-segment mint platform already
+        // holds for any pack, so it adds no reach; without it, `paas`'s
+        // pack-memory landing could only write with the platform token, i.e.
+        // with a credential that can reach every root — which that path
+        // deliberately refuses to do.
         const segs = ns.slice(2).split("/").filter(Boolean);
         if (ns.startsWith("d/")) {
+          if (segs.length === 1 && segs[0]) {
+            const out = this.tokens.mint("pod", ns, String(body.label ?? "platform-minted"));
+            res.writeHead(200, { "content-type": "application/json" });
+            return void res.end(JSON.stringify(out));
+          }
           if (segs.length !== 2 || !segs[0] || !segs[1]) {
             res.writeHead(400, { "content-type": "application/json" });
-            return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "platform deployment mint: d/<packId>/<agentId> with body.owner = u/<user>" }));
+            return void res.end(JSON.stringify({ error: "invalid_namespace", hint: "platform mint: d/<packId> (pack root, pod) | d/<packId>/<agentId> with body.owner = u/<user>" }));
           }
           const owner = String(body.owner ?? "");
           if (!owner.startsWith("u/") || owner.split("/").length !== 2 || !owner.slice(2)) {
@@ -1392,7 +1409,7 @@ export class Service {
         }
         if (!ns.startsWith("u/")) {
           res.writeHead(403, { "content-type": "application/json" });
-          return void res.end(JSON.stringify({ error: "cross_family_mint", platform_mints: "u/<user> | d/<packId>/<agentId>" }));
+          return void res.end(JSON.stringify({ error: "cross_family_mint", platform_mints: "u/<user> | d/<packId> | d/<packId>/<agentId>" }));
         }
         if (ns.split("/").length !== 2 || !ns.slice(2)) {
           res.writeHead(400, { "content-type": "application/json" });
