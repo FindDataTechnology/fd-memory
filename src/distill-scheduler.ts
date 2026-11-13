@@ -75,7 +75,17 @@ const EXTRACT_RETRY_ON_TRUNCATION = String(process.env.FD_MEMORY_EXTRACT_RETRY_O
 // The escape hatch (2.4): a batch that truncates even when split must not stall
 // its project forever. After this many consecutive runs, step over it — loudly.
 
-const MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
+const DEFAULT_MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1: 220 obs ≈ 74k tokens was too coarse)
+// Batch size is a THROUGHPUT bound, not a taste setting (2026-11-13). Measured
+// on the 詞元 lane: 34 output tokens/s, so a 4,858-in/1,378-out extraction call
+// takes 41 s. With the extractor's 6,000-token completion ceiling a 120-item
+// batch is structurally ~176 s — it cannot finish inside the distiller's own
+// 150 s self-limit, and when it does return it is truncated (measured on the
+// new pod the same hour: one project stepped over after 12 consecutive
+// truncations, one run died at `distill_deadline_exceeded`). Lowering the batch
+// makes each call ~30 s and keeps the output under the ceiling; the run simply
+// advances its cursor and the next drain continues. Configurable so production
+// can be tuned without a rebuild.
 const SIDECCAR_TIMEOUT_MS = 180_000;
 
 // Root-family gate. This used to be the whole decision: pack roots always
@@ -115,6 +125,14 @@ export class DistillScheduler {
 
   private dailyLimit(): number {
     return Number(this.opts.env?.FD_MEMORY_DISTILL_DAILY_TOKENS ?? 400_000);
+  }
+
+  // Per-call batch ceiling (see DEFAULT_MAX_ITEMS). Garbage or <1 falls back to
+  // the default rather than sending a zero-item batch, which would look like
+  // "nothing to do" forever.
+  private maxItems(): number {
+    const raw = Number(this.opts.env?.FD_MEMORY_DISTILL_MAX_ITEMS ?? DEFAULT_MAX_ITEMS);
+    return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DEFAULT_MAX_ITEMS;
   }
 
   static key(rootKey: string, project: string): string {
@@ -443,12 +461,13 @@ export class DistillScheduler {
       const root = this.opts.openRoot(rootKey);
       const state = root.db.getDistillState(project);
       if (state && state.next_attempt_at > this.now()) return;
-      const obs = root.db.observationsAfter(project, state?.obs_cursor ?? 0, MAX_ITEMS) as unknown as (ObservationRow & { rid: number })[];
+      const maxItems = this.maxItems();
+      const obs = root.db.observationsAfter(project, state?.obs_cursor ?? 0, maxItems) as unknown as (ObservationRow & { rid: number })[];
       let handoffs: HandoffRow[] = [];
       try {
         handoffs = root.db
           .db.prepare("SELECT * FROM handoffs WHERE project=? AND created_at>? ORDER BY created_at LIMIT ?")
-          .all(project, state?.handoff_cursor ?? "", MAX_ITEMS) as unknown as HandoffRow[];
+          .all(project, state?.handoff_cursor ?? "", maxItems) as unknown as HandoffRow[];
       } catch { /* handoff cursor best-effort */ }
       // Person-root raw material (add-u-root-distillation D2): note pages are
       // what chat MCP writes actually produce; observations never exist there.
@@ -456,7 +475,7 @@ export class DistillScheduler {
       // of the user asking to remember — so the sidecar contract is untouched.
       let notes: Array<{ path: string; title: string; body: string; updated_at: string }> = [];
       try {
-        notes = root.db.notesAfter(project, state?.note_cursor ?? "", MAX_ITEMS);
+        notes = root.db.notesAfter(project, state?.note_cursor ?? "", maxItems);
       } catch { /* note cursor best-effort (pre-migration dbs) */ }
       if (obs.length === 0 && handoffs.length === 0 && notes.length === 0) return;
 

@@ -235,6 +235,78 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
   }
 });
 
+test("d-root: the batch is bounded per call and the run resumes from the cursor (11-13 lane throughput)", async () => {
+  // The lane answers at ~34 output tokens/s (measured 2026-11-13: a 4,858-in /
+  // 1,378-out extraction call took 41 s), so a 120-item batch with the
+  // extractor's 6,000-token completion ceiling is structurally ~176 s — it
+  // cannot finish inside the distiller's own 150 s limit, and when it returns it
+  // is truncated. Observed on the live pod the same hour: "extract truncated
+  // 12x — stepping over this batch (extract_truncated_skipped)" and one run
+  // killed at distill_deadline_exceeded. Bounding the batch is the fix; the run
+  // must advance its cursor so the NEXT drain continues, not re-send the same
+  // head forever.
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      if (String(url).endsWith("/promote") || String(url).endsWith("/tag")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
+      // Well under the 6,000 ceiling: this test is about size, not truncation.
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [],
+        cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 1200, completion_tokens: 200 }],
+        tokens: 1400, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_MAX_ITEMS: "10" });
+    const root = fx.openRoot("d-pkBatch");
+    const at = new Date().toISOString();
+    for (let i = 0; i < 30; i++) {
+      root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: `第 ${i} 条`, tool: null, created_at: at, project: "agentA" });
+    }
+    const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    const itemsSent = () => (distillCalls().at(-1)!.body as { items: unknown[] }).items.length;
+
+    await fx.sched.distillNow("d-pkBatch", "agentA");
+    assert.equal(distillCalls().length, 1, `one call per run, not one per item (saw ${distillCalls().length})`);
+    assert.equal(itemsSent(), 10, `the batch is capped at FD_MEMORY_DISTILL_MAX_ITEMS (sent ${itemsSent()})`);
+    const firstCursor = root.db.getDistillState("agentA")!.obs_cursor;
+    assert.equal(firstCursor, 10, "the cursor advances by what was sent, so the rest is not stranded");
+
+    await fx.sched.distillNow("d-pkBatch", "agentA");
+    assert.equal(itemsSent(), 10, "the next run takes the next slice");
+    assert.equal(root.db.getDistillState("agentA")!.obs_cursor, 20);
+
+    await fx.sched.distillNow("d-pkBatch", "agentA");
+    assert.equal(root.db.getDistillState("agentA")!.obs_cursor, 30);
+    const callsAfterDrain = distillCalls().length;
+    await fx.sched.distillNow("d-pkBatch", "agentA");
+    assert.equal(distillCalls().length, callsAfterDrain, "nothing left → no call");
+
+    // Garbage or <1 must fall back to the default instead of sending an empty
+    // batch (which would look like "nothing to do" forever).
+    const fx2 = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_MAX_ITEMS: "0" });
+    const root2 = fx2.openRoot("d-pkBatch2");
+    for (let i = 0; i < 30; i++) {
+      root2.db.addObservation({ session_id: "s2", agent: "a", event: "stop", summary: `第 ${i} 条`, tool: null, created_at: at, project: "agentA" });
+    }
+    const before = sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).length;
+    await fx2.sched.distillNow("d-pkBatch2", "agentA");
+    const sent = (sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).at(-1)!.body as { items: unknown[] }).items.length;
+    assert.equal(sidecar.calls.filter((c) => String(c.url).endsWith("/distill")).length, before + 1);
+    assert.equal(sent, 30, `a non-positive value falls back to the default, not to 0 (sent ${sent})`);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("d-root: the budget binds BETWEEN calls, not once per run (11-12 production overshoot)", async () => {
   // Measured on the completed UTC day 2026-11-12: owner d-KkCie7… billed
   // 1,256,968 against FD_MEMORY_DISTILL_DAILY_TOKENS=1,200,000 with per_run =
