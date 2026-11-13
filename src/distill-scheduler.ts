@@ -135,6 +135,24 @@ export class DistillScheduler {
     return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : DEFAULT_MAX_ITEMS;
   }
 
+  // Engine calls per /distill request (2026-11-13). One call takes 47-97 s on the
+  // 詞元 lane even with a 474-character extraction prompt (measured; no
+  // "disable thinking" spelling was honoured), so the distiller's 150 s request
+  // deadline covers ONE call — not a run's worth. A u-root with 42 notes needs 21
+  // sequential chunks (~17 min) and died on every attempt; a d-root could issue 4
+  // calls (observations + handoffs + notes + a truncation split). Bounding calls
+  // per request makes every run finish inside the deadline; cursors keep what
+  // landed and the next drain continues from there.
+  // Unset / garbage means NO cap, i.e. the behaviour every existing caller and
+  // test already had; production sets it explicitly (see the deployment
+  // manifest). A knob that silently changes the default would also silently
+  // change what the older tests mean.
+  private maxCallsPerRun(): number {
+    const raw = Number(this.opts.env?.FD_MEMORY_DISTILL_MAX_CALLS_PER_RUN ?? 0);
+    if (!Number.isFinite(raw) || raw < 1) return Number.POSITIVE_INFINITY;
+    return Math.floor(raw);
+  }
+
   static key(rootKey: string, project: string): string {
     return `${rootKey}::${project}`;
   }
@@ -612,8 +630,12 @@ export class DistillScheduler {
         // that only honours process.env is untestable and silently divergent.
         const retryOnTruncation = String(this.opts.env?.FD_MEMORY_EXTRACT_RETRY_ON_TRUNCATION ?? "1") !== "0";
         const gapsLimit = Math.max(1, Number(this.opts.env?.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
+        const maxCalls = this.maxCallsPerRun();
         const runChunks = async (batches: Array<() => Promise<void>>): Promise<void> => {
           for (const run of batches) {
+            // Out of call budget: everything that landed has its cursor written,
+            // so this is a clean stop, not a failure — the next drain resumes.
+            if (chunksIssued >= maxCalls) return;
             try { await run(); }
             catch (e) {
               if ((e as Error)?.message === "daily_budget_exhausted") {
@@ -752,7 +774,11 @@ export class DistillScheduler {
       if (first.stopped) return;
       const truncated = first.truncated;
       if (first.truncated) {
-        if (retryOnTruncation && items.length > 1) {
+        // The split costs two more calls; with the lane at ~1 min per call that
+        // cannot fit the same request, so the batch is held for the next round
+        // (existing holdCursorForTruncation path) instead of stalling mid-split.
+        const canAffordSplit = 1 + 2 <= this.maxCallsPerRun();
+        if (retryOnTruncation && items.length > 1 && canAffordSplit) {
           const mid = Math.ceil(items.length / 2);
           const halves = await Promise.all([callOnce(items.slice(0, mid)), callOnce(items.slice(mid))]);
           if (halves.some((h) => h.stopped)) return;

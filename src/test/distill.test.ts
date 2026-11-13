@@ -235,6 +235,48 @@ test("scheduler: sidecar failure keeps cursor and backs off; budget exhaustion r
   }
 });
 
+test("d-root: a truncating batch is held for the next round, not split mid-request (11-13 call budget)", async () => {
+  // The split costs two more calls; at ~1 min per call on this lane those cannot
+  // fit the same 150 s request, and a half-finished split used to die at
+  // distill_deadline_exceeded with the cursor unchanged anyway. Holding the batch
+  // is the behaviour that already existed for FD_MEMORY_EXTRACT_RETRY_ON_TRUNCATION=0,
+  // so with a call budget of one we take that path deliberately.
+  const data = tmpData();
+  const sidecar = {
+    calls: [] as Array<Record<string, unknown>>,
+    impl: (async (url: RequestInfo | URL) => {
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      if (String(url).endsWith("/promote") || String(url).endsWith("/tag")) {
+        return { ok: true, status: 200, json: async () => ({ results: [], tokens: 0, llm_calls: [], errors: [] }) };
+      }
+      return { ok: true, status: 200, json: async () => ({
+        facts: [], experiences: [],
+        cursor_next: {},
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        tokens: 7500, errors: [],
+      }) };
+    }) as unknown as typeof fetch,
+  };
+  try {
+    const fx = schedulerFixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_MAX_CALLS_PER_RUN: "1" });
+    const root = fx.openRoot("d-pkSplit");
+    const at = new Date().toISOString();
+    for (const s of ["一条", "两条", "三条"]) {
+      root.db.addObservation({ session_id: "s1", agent: "a", event: "stop", summary: s, tool: null, created_at: at, project: "agentA" });
+    }
+    await fx.sched.distillNow("d-pkSplit", "agentA");
+    const distillCalls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+    assert.equal(distillCalls.length, 1, `no halves when the call budget is one (saw ${distillCalls.length})`);
+    const st = root.db.getDistillState("agentA")!;
+    assert.match(String(st.last_error), /extract_truncated/, `the hold is named (got ${st.last_error})`);
+    assert.equal(st.obs_cursor, 0, "cursor held: the material returns next round");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("d-root: the batch is bounded per call and the run resumes from the cursor (11-13 lane throughput)", async () => {
   // The lane answers at ~34 output tokens/s (measured 2026-11-13: a 4,858-in /
   // 1,378-out extraction call took 41 s), so a 120-item batch with the

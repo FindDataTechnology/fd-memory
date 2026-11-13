@@ -289,6 +289,42 @@ test("patrol-echo dedup: a new L2 with the same 16-char title prefix supersedes 
   }
 });
 
+test("u-root: one engine call per request — a long backlog drains across runs (11-13 lane latency)", async () => {
+  // Measured 2026-11-13 with a realistic extraction prompt: ONE call takes
+  // 47-97 s on the 詞元 lane (474 chars in → 2.3-2.9k output tokens, and none of
+  // the "disable thinking" spellings was honoured). The distiller's 150 s request
+  // deadline therefore covers one call, not a run. A u-root with 42 notes needs
+  // 21 sequential chunks (~17 min) and died at distill_deadline_exceeded every
+  // time — observed in production the hour this landed. One call per request
+  // makes each run finish; the cursor carries the rest to the next drain.
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const fx = fixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_MAX_CALLS_PER_RUN: "1" });
+    const root = fx.openRoot("u-calls@test");
+    for (let i = 1; i <= 6; i++) {
+      root.writePage("default", "notes", `c${i}`, {
+        frontmatter: { type: "note", title: `队列 ${i}`, generated: { by: "test", at: `2026-10-25T0${i}:00:00.000Z` } },
+        body: `第 ${i} 条`,
+      } as never);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
+
+    await fx.sched.distillNow("u-calls@test", "default");
+    assert.equal(distillCalls().length, 1, `one call per request (saw ${distillCalls().length}; 6 notes = 3 chunks of 2)`);
+    const afterFirst = root.db.getDistillState("default")!.note_cursor;
+    assert.ok(afterFirst, "the cursor keeps what landed, so nothing is stranded");
+
+    await fx.sched.distillNow("u-calls@test", "default");
+    assert.equal(distillCalls().length, 2, "the next run takes the next chunk");
+    const afterSecond = root.db.getDistillState("default")!.note_cursor;
+    assert.ok(afterSecond > afterFirst, "and advances again");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("u-root: the daily budget binds DURING the run, not once before it (7.3)", async () => {
   // Measured 2026-11-08: one owner spent 3,734,259 tokens against a 400,000
   // daily limit (9.3x) because the gate was read once per run and the spend
