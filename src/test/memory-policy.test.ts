@@ -35,6 +35,7 @@ import {
   resolvePolicy,
   unexecuted,
 } from "../policy.js";
+import { __resetMetrics, metricsSnapshot } from "../metrics.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -576,4 +577,86 @@ test("/policy: an unvalidated stored row is named, never presented as normal", a
   } finally {
     await close();
   }
+});
+
+// ── the degradation path must leave a trace ────────────────────────────────
+
+test("policy read failure still distils, but is counted and warned (not a silent fallback)", async () => {
+  __resetMetrics();
+  // Deployment default ON, so "it kept distilling" is attributable to the
+  // degradation and not to the declaration chain.
+  const env = { ...GATES, FD_MEMORY_DISTILL_U: "1" };
+  const data = tmpData("fdm-policy-readfail-");
+  const tokens = new TokenStore(join(data, "tokens.db"), "p");
+  const roots = new Map<string, StoreRoot>();
+  const openRoot = (key: string) => {
+    let r = roots.get(key);
+    if (!r) {
+      r = new StoreRoot(data, key);
+      roots.set(key, r);
+    }
+    return r;
+  };
+  const calls: string[] = [];
+  const warns: string[] = [];
+  const sched = new DistillScheduler({
+    roots,
+    openRoot,
+    tokens,
+    env,
+    // The whole point: the declaration cannot be read at all.
+    policyFor: () => {
+      throw new Error("policy store unreadable");
+    },
+    log: { warn: (m: string) => warns.push(m), log: () => {} },
+    fetchImpl: (async (url: RequestInfo | URL) => {
+      calls.push(String(url));
+      if (String(url).endsWith("/embed")) {
+        return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          facts: [],
+          experiences: [],
+          cursor_next: {},
+          llm_calls: [{ stage: "distill_extract", ok: true, prompt_tokens: 10, completion_tokens: 5 }],
+          tokens: 15,
+          errors: [],
+        }),
+      };
+    }) as unknown as typeof fetch,
+    now: () => Date.now(),
+  });
+
+  const root = openRoot("u-erin@test");
+  root.writePage("default", "notes", "n1", {
+    frontmatter: { type: "note", title: "偏好", generated: { by: "test", at: "2026-11-12T00:00:00.000Z" } },
+    body: "正文",
+  } as never);
+  await new Promise((r) => setTimeout(r, 5));
+
+  await sched.distillNow("u-erin@test", "default");
+
+  // ① behaviour unchanged: a policy read must never stop distillation.
+  assert.ok(
+    calls.some((u) => u.endsWith("/distill")),
+    "degradation must keep the pre-change behaviour (distillation proceeds)",
+  );
+  // ② the degradation is observable — otherwise every declared `distill: off`
+  // silently turns into "on" and the read face still claims it is in force.
+  const snap = metricsSnapshot() as { policy?: { read_failures?: number; last_error?: string } };
+  // >= 1, not == 1: the counter counts READS, and one run may consult the chain
+  // more than once (fallback scan + the run itself). Pinning the exact number
+  // would couple this test to call sites that are free to change.
+  assert.ok(
+    (snap.policy?.read_failures ?? 0) >= 1,
+    `the failed policy read is counted (got ${snap.policy?.read_failures})`,
+  );
+  assert.match(String(snap.policy?.last_error), /unreadable/, "the error head is kept, not swallowed");
+  assert.ok(
+    warns.some((m) => m.includes("policy read failed")),
+    "the fallback is logged, not silent",
+  );
 });

@@ -37,6 +37,20 @@ const vectors = {
 };
 const startedAt = new Date().toISOString();
 
+// Declared process policy (add-agent-memory-declaration): the distill scheduler
+// degrades to the deployment default when the policy read fails, because "a
+// policy read must never stop distillation". That degradation is correct — but
+// a silent one means a persistent read failure un-honours every declared
+// `distill: off` while the read face still reports the declaration as in force.
+// Counting it makes "the declaration is decoration right now" one metrics read
+// instead of a grep through logs nobody wrote (2026-11-14).
+const policy = { read_failures: 0, last_error: "" as string };
+export function notePolicyReadFailure(err: unknown): void {
+  policy.read_failures += 1;
+  const head = String((err as { message?: unknown })?.message ?? err ?? "unknown");
+  policy.last_error = head.slice(0, 200);
+}
+
 // Tier promotion lane (add-tier-promotion-candidates): the proposal face dies
 // quietly if nobody can see it flowing — these counters make "is anyone ever
 // accepting?" a single /admin/metrics read.
@@ -285,6 +299,7 @@ export function metricsSnapshot(): Record<string, unknown> {
       },
     },
     promotion: { ...promotion },
+    policy: { ...policy },
     meta_filter_queries: metaFilterQueries,
     vectors: { ...vectors },
     "vectors.scale": vectorsScaleSample,
@@ -302,6 +317,8 @@ export function __resetMetrics(): void {
   promotion.proposed = 0;
   promotion.accepted = 0;
   promotion.ignored = 0;
+  policy.read_failures = 0;
+  policy.last_error = "";
   metaFilterQueries = 0;
   vectorsScaleSample = { roots: 0, total: 0, max_root: 0, over_threshold: false, threshold: vectorScaleThresholds() };
   distills.runs = 0;

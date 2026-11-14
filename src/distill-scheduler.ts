@@ -14,7 +14,7 @@ import { TokenStore } from "./auth.js";
 import { distillCandidates, DistillCandidate } from "./distill.js";
 import { HandoffRow, ObservationRow } from "./db.js";
 import { deploymentDefaults, distillEnabled } from "./policy.js";
-import { noteDistillStages, noteDistillTruncation, extractHitCeiling, noteDistill, notePromotion, noteVectorEvent } from "./metrics.js";
+import { noteDistillStages, noteDistillTruncation, extractHitCeiling, noteDistill, notePromotion, notePolicyReadFailure, noteVectorEvent } from "./metrics.js";
 
 export interface DistillItem {
   kind: "observation" | "handoff";
@@ -202,9 +202,19 @@ export class DistillScheduler {
       { root: {}, projects: {} };
     try {
       docs = this.opts.policyFor?.(rootKey) ?? docs;
-    } catch {
+    } catch (err) {
       // A policy read must never stop distillation: degrade to the deployment
-      // default, which is the pre-change behaviour.
+      // default, which is the pre-change behaviour. The degradation stays — but
+      // it must leave a trace. Silence here means a persistent read failure
+      // un-honours every declared `distill: off` while GET /policy still reports
+      // that declaration as in force: the declaration becomes decoration, which
+      // is the exact failure this change exists to remove (2026-11-14).
+      notePolicyReadFailure(err);
+      this.log.warn(
+        `[distill] policy read failed for ${rootKey}; using the deployment default: ${String(
+          (err as { message?: unknown })?.message ?? err,
+        ).slice(0, 200)}`,
+      );
       docs = { root: {}, projects: {} };
     }
     return distillEnabled(
