@@ -587,3 +587,57 @@ test("/digest: several partitions in one request, one budget, every entry labell
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// 2026-11-15 实测（cell 1da519d4c1c0bf89 投研晨会集群 wiki）：
+// 舰队回合缝每回合写一页 `metadata.kind: turn`、状态翻转再写一页 `health`
+// （paas server.js:1553/1555），这些页**天生最新**，于是把 digest 的 L1 五槽
+// 全占了 —— 首席 13/13 页是回合页、五个槽位逐字都是「回合成功」，行业 19/21
+// (90%)、宏观 13/15 (87%)。该车道的存在意义是「喂回 agent 自己写的东西」
+// （add-digest-note-recall），被平台记账挤掉就是缺陷。
+test("/digest: 平台回合记账不占 L1 车道；agent 写的 note 仍然回来（含回滚杆）", async () => {
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  const prev = process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES;
+  try {
+    const person = svc.tokens.mint("person", "u/bob").token;
+    const root = svc.rootForKey("u-bob");
+    const { newPage } = await import("../okf.js");
+    const P = "m_member1";
+
+    // 两篇 agent 知识页先写（旧），随后四篇平台流水页（新）
+    root.writePage(P, "notes", "know-1", newPage("note", "决策记账契约要点", "record_decision 的 schema_version 必须是字符串 1。"));
+    root.writePage(P, "notes", "know-2", newPage("note", "宏观取数通道图谱", "SHIBOR 走 chinabond，eastmoney 只回 HTML 壳。"));
+    for (let i = 0; i < 4; i++) {
+      root.writePage(P, "notes", `turn-${i}`, newPage("note", "回合成功", `[turn turn_id=t${i} status=ok]`, {
+        metadata: { kind: "turn", memberId: "member1" },
+      }));
+    }
+    // 明确时间序：流水页全部晚于知识页（同一秒写入时 updated_at 会平手）
+    const raw = (root.db as unknown as { db: { prepare(q: string): { run(...a: unknown[]): void } } }).db;
+    raw.prepare("UPDATE pages SET updated_at=? WHERE path LIKE ?").run("2026-11-15T01:00:00.000Z", `${P}/notes/know-%`);
+    raw.prepare("UPDATE pages SET updated_at=? WHERE path LIKE ?").run("2026-11-15T09:00:00.000Z", `${P}/notes/turn-%`);
+
+    server = createServer((req, res) => { void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never); });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const H = { "content-type": "application/json", authorization: `Bearer ${person}` };
+
+    // 默认：五槽由两篇知识页填满，流水页一篇都不进
+    delete process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES;
+    const d1 = (await (await fetch(`${base}/digest?project=${P}&q=`, { headers: H })).json()) as { digest: string };
+    assert.match(d1.digest, /决策记账契约要点/);
+    assert.match(d1.digest, /宏观取数通道图谱/);
+    assert.ok(!d1.digest.includes("回合成功"), `平台流水不该占 L1 车道：\n${d1.digest}`);
+
+    // 回滚杆：打开后回到旧排序（流水页重新出现在最前）
+    process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES = "1";
+    const d2 = (await (await fetch(`${base}/digest?project=${P}&q=`, { headers: H })).json()) as { digest: string };
+    assert.match(d2.digest, /回合成功/, "回滚杆必须能恢复旧行为");
+  } finally {
+    if (prev === undefined) delete process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES;
+    else process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES = prev;
+    if (server) await new Promise<void>((r) => server!.close(() => r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});

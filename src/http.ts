@@ -705,13 +705,42 @@ export class Service {
       // the same capped L1 lane by recency — for roots with none, the merge is
       // the recentNotes order unchanged (byte-identical digests, budget
       // discipline intact: still ≤ NOTES_LIMIT items through the same renderer).
+      //
+      // Working-memory filter (2026-11-15): the fleet turn seam writes one
+      // `metadata.kind: turn` note PER TURN plus a `health` note per state flip
+      // (paas `server.js:1553/1555`, "add-zhiyu-team-memory 刀A"). Those are
+      // bookkeeping, and they are NEWEST by construction, so they owned this
+      // lane outright — measured on cell 1da519d4c1c0bf89 (投研晨会集群 wiki):
+      // 首席 13/13 notes are turn pages and its entire 5-slot lane rendered
+      // 「回合成功」; 行业 19/21 (90%), 宏观 13/15 (87%), 常务 61/102 (60%).
+      // The lane exists to feed back what an AGENT wrote (add-digest-note-recall)
+      // — platform bookkeeping spending it is the bug. Filtered at render time
+      // because `pages` carries no metadata column; the recency read widens so
+      // the five slots still fill, and only examined candidates are read.
+      // Rollback lever: FD_MEMORY_DIGEST_KEEP_TURN_PAGES=1 restores the old
+      // ordering byte-for-byte (no widening, no filtering).
+      const KEEP_TURN_PAGES = String(process.env.FD_MEMORY_DIGEST_KEEP_TURN_PAGES ?? "") === "1";
+      const isWorkingMemoryPage = (rel: string): boolean => {
+        const fm = dRoot.readPageByRel(rel)?.frontmatter as Record<string, unknown> | undefined;
+        const meta = fm?.metadata;
+        if (!meta || typeof meta !== "object" || Array.isArray(meta)) return false;
+        const kind = String((meta as Record<string, unknown>).kind ?? "");
+        return kind === "turn" || kind === "health";
+      };
+      const recencyLimit = KEEP_TURN_PAGES ? NOTES_LIMIT : NOTES_LIMIT * 3;
       const obsPages = readProjects.flatMap((p) => dRoot.db.recentObservationPages(p, NOTES_LIMIT));
-      const recency = [...readProjects.flatMap((p) => dRoot.db.recentNotes(p, NOTES_LIMIT)), ...obsPages]
+      const recency = [...readProjects.flatMap((p) => dRoot.db.recentNotes(p, recencyLimit)), ...obsPages]
         .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
-      const merged = [
+      const noteCandidates = [
         ...matched,
         ...recency.filter((p) => (!matchedPaths.has(p.path)) && (!allowedPaths || allowedPaths.has(p.path))),
-      ].slice(0, NOTES_LIMIT);
+      ];
+      const merged: typeof noteCandidates = [];
+      for (const c of noteCandidates) {
+        if (merged.length >= NOTES_LIMIT) break;
+        if (!KEEP_TURN_PAGES && isWorkingMemoryPage(c.path)) continue;
+        merged.push(c);
+      }
       const noteItems: DigestItem[] = merged.map((p) => {
         const page = dRoot.readPageByRel(p.path);
         // Source badge (D5): pages whose metadata carries `harness` render a
