@@ -50,7 +50,13 @@ function parseMetadata(raw: unknown): Record<string, unknown> | undefined {
   }
 }
 
-const TARGET_SCHEMA = { type: "string", enum: ["own", "shared"], description: 'Relative partition selector: "own" (this member\'s private area) or "shared" (the pack\'s shared area). Reads default to the union; writes default to own (pod tokens default to shared).' };
+const TARGET_SCHEMA = { type: "string", enum: ["own", "shared"], description: 'Relative partition selector: "own" (this member\'s private area) or "shared" (the pack\'s shared area). Reads default to the union; writes default to own (pod tokens default to shared). A member agent that passes "shared" on a WRITE gets shared_is_deployment_pack_only — that area is writable by deployment packs only; omit target or pass "own".' };
+
+// shared 的拒收要自带「那我该写哪」——实测 135 次调用都撞在这上面（cell 1da519d4c1c0bf89，
+// 2026-11-15）：工具描述把 shared 列为合法枚举值、却没说普通成员写它会被拒。
+const SHARED_HINT = {
+  hint: "target='shared' is the deployment pack's area — a member agent cannot write it. Omit target (writes default to your own area) or pass target='own'; reads may still use 'shared'.",
+};
 
 function text(content: unknown): ToolResult {
   return { content: [{ type: "text", text: typeof content === "string" ? content : JSON.stringify(content, null, 1) }] };
@@ -103,7 +109,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
       return { projects: [ownProject] };
     }
     if (t === "shared") {
-      if (!isDeploy) return { projects: [], error: err("shared_is_deployment_pack_only") };
+      if (!isDeploy) return { projects: [], error: err("shared_is_deployment_pack_only", SHARED_HINT) };
       if (!may("shared", "r")) return { projects: [], error: err("forbidden_partition", { partition: "shared" }) };
       return { projects: ["shared"] };
     }
@@ -121,7 +127,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
       return { error: err(ownProject == null ? "no_accessible_partition" : "forbidden_partition", { partition: "own" }) };
     }
     if (t === "shared") {
-      if (!isDeploy) return { error: err("shared_is_deployment_pack_only") };
+      if (!isDeploy) return { error: err("shared_is_deployment_pack_only", SHARED_HINT) };
       if (!may("shared", "rw")) return { error: err("forbidden_partition", { partition: "shared" }) };
       return { project: "shared" };
     }
@@ -491,7 +497,7 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
     },
     {
       name: "memory_write_page",
-      description: "Write a durable note page — default into your own area, target 'shared' into the pack's shared area. Use it whenever the user explicitly asks you to remember something, or you learn a preference/fact worth carrying into later sessions; recent notes are recalled automatically at later session starts.",
+      description: "Write a durable page. `type` is a filing lane with exactly two legal values: 'note' (default) and 'reference' (requires source_ref) — any other value is rejected with unknown_page_type carrying the allowed list; your own category taxonomy belongs in `metadata`, never in `type`. Writes land in your own area; target='shared' is writable by deployment packs only. Use it whenever the user explicitly asks you to remember something, or you learn a preference/fact worth carrying into later sessions; recent notes are recalled automatically at later session starts.",
       inputSchema: {
         type: "object",
         properties: {
@@ -500,7 +506,17 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           // Unified memory & outputs: reference pages point at library/output
           // artifacts. type defaults to "note"; "reference" requires
           // source_ref and caps tags at five; tier is draft|stable|canonical.
-          type: { type: "string" },
+          //
+          // Enum, not a bare string (2026-11-15): the ledger of real calls showed
+          // 20+ invented lanes — fact / experience / decision_log / round-log /
+          // dutylog / patrol-board / shift_log — all rejected, one of them with a
+          // whole sentence stuffed into the field. A free-text `type` invites a
+          // taxonomy per post; the enum states the two lanes before the call.
+          type: {
+            type: "string",
+            enum: ["note", "reference"],
+            description: "Filing lane: 'note' (default; anything you decided or observed) or 'reference' (a pointer at an external artifact; requires source_ref). Categories go in metadata.",
+          },
           tags: { type: "array", items: { type: "string" } },
           tier: { type: "string" },
           source_ref: { type: "string" },
@@ -517,7 +533,10 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (w.error) return w.error;
         const type = String(args.type ?? "note");
         const dir = type === "reference" ? "references" : type === "note" ? "notes" : null;
-        if (!dir) return err(`unknown_page_type: ${type}`);
+        if (!dir) return err(`unknown_page_type: ${type}`, {
+          allowed: ["note", "reference"],
+          hint: "type is a filing lane, not a category. Use 'note' for anything you decided or observed, or 'reference' (with source_ref) for a pointer at an external artifact; put your own taxonomy in metadata.",
+        });
         const meta = normalizeMetadata(args.metadata);
         if (meta === null) return err("invalid_metadata", { reason: "metadata must be an object of scalar/array-of-scalar values" });
         const extra: Record<string, unknown> = {};

@@ -239,7 +239,7 @@ function memberTools(data: string, ns: string, kind: "deployment" | "pod" | "per
     const out = tools.find((t) => t.name === name)!.handler(args) as { content: [{ text: string }]; isError?: boolean };
     return { isError: out.isError === true, body: JSON.parse(out.content[0].text) };
   };
-  return { store, scope, root, call };
+  return { store, scope, root, tools, call };
 }
 
 test("mcp v2: member reads own+shared union with source; write defaults own, shared on demand; handoff to_agent", () => {
@@ -284,6 +284,34 @@ test("mcp v2: member reads own+shared union with source; write defaults own, sha
     const bad = a.call("memory_handoff_begin", { summary: "x", to_agent: "agentB" });
     assert.equal(bad.isError, true);
     assert.equal(bad.body.error, "to_agent_requires_shared");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("memory_write_page: 两条合法 filing lane 写在 schema 里，拒收自带可行值（2026-11-15 实测 20+ 种自造类型）", () => {
+  // 现场：事实档把分类当 type 用 —— fact / experience / decision_log / round-log /
+  // dutylog / patrol-board / shift_log …，56+ 次被拒，其中一次把整句话塞进了该字段
+  // （"fact. Let me check what types are allowed. …"）。另有 135 次 target='shared'
+  // 被拒：工具描述把 shared 列为合法枚举值、却没说普通成员写它会被拒。
+  // 修法不是逐岗补提示词，而是让 schema 自己说出两条 lane、让拒收自带「那我该写哪」。
+  const data = tmpData();
+  try {
+    const person = memberTools(data, "u/alice", "person");
+    const spec = person.tools.find((t) => t.name === "memory_write_page")!;
+    const typeProp = (spec.inputSchema as { properties: Record<string, { enum?: string[]; description?: string }> }).properties.type;
+    assert.deepEqual(typeProp.enum, ["note", "reference"]);
+    assert.match(String(typeProp.description), /metadata/);
+
+    const bad = person.call("memory_write_page", { title: "t", body: "b", type: "fact" });
+    assert.equal(bad.isError, true);
+    assert.equal(bad.body.error, "unknown_page_type: fact"); // 码不变：调用方按码分诊
+    assert.deepEqual(bad.body.allowed, ["note", "reference"]); // 可复制的正确值
+    assert.match(String(bad.body.hint), /metadata/);
+
+    const shared = person.call("memory_write_page", { title: "t", body: "b", target: "shared" });
+    assert.equal(shared.body.error, "shared_is_deployment_pack_only");
+    assert.match(String(shared.body.hint), /own/); // 「写哪儿」必须说清楚
   } finally {
     rmSync(data, { recursive: true, force: true });
   }
