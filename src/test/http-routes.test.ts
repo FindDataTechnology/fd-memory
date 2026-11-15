@@ -173,7 +173,12 @@ test("/pages/write: unsupported page type is a named 400 (fact/experience are di
       body: JSON.stringify({ project: "default", type: "fact", title: "口径", body: "内容" }),
     });
     assert.equal(r.status, 400);
-    assert.equal(((await r.json()) as { error: string }).error, "unknown_page_type");
+    const body = (await r.json()) as { error: string; type?: string; allowed?: string[]; hint?: string };
+    assert.equal(body.error, "unknown_page_type");
+    // 两个面（MCP / HTTP）必须给出同一组可行值——否则按码分诊的人还得再猜一次
+    assert.deepEqual(body.allowed, ["note", "reference"]);
+    assert.equal(body.type, "fact");
+    assert.match(String(body.hint), /metadata/);
   } finally { await close(); }
 });
 

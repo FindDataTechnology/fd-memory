@@ -796,7 +796,17 @@ export class Service {
       const project = String(body.project ?? "default");
       const type = String(body.type ?? "note");
       const dir = type === "reference" ? "references" : type === "note" ? "notes" : null;
-      if (!dir) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "unknown_page_type" })); }
+      // 与 MCP 面同一口径（2026-11-15）：拒收要自带可行值，否则调用方只能猜下一个值。
+      // 码本身不变（`unknown_page_type`）——按码分诊的调用方与既有测试都不受影响。
+      if (!dir) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "unknown_page_type",
+          type,
+          allowed: ["note", "reference"],
+          hint: "type is a filing lane, not a category: use 'note' (default) or 'reference' (with source_ref); put your own taxonomy in metadata.",
+        }));
+      }
       const title = String(body.title ?? "").trim();
       if (!title) { res.writeHead(400, { "content-type": "application/json" }); return void res.end(JSON.stringify({ error: "title_required" })); }
       const extra: Record<string, unknown> = {};
