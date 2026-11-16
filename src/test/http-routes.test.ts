@@ -198,3 +198,35 @@ test("/memory: junk filters answer 200 (no 500), agents are refused", async () =
     assert.equal(a.status, 403);
   } finally { await close(); }
 });
+
+test("/memory/index: 任一 harness 都不能被另一个饿死（跨 harness 配额）", async () => {
+  // 2026-11-16 实测缺陷：平铺「feedback 优先 + mtime 倒序」在真实库上返回
+  // 100/100 zcode、claude-code 0 条（2 727 条可用）。zcode 的 feedback 文件
+  // 又多又常改，两项排序键都赢，其他 harness 全被挤出预算。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-alice");
+    const mk = (harness: string, n: number, mtime: number) => {
+      for (let i = 0; i < n; i++) {
+        root.writePage("default", "index", `${harness}-${i}`,
+          newPage("memory-index", `${harness} ${i}`, `${harness} 结论 ${i}`, {
+            metadata: { harness, memory_type: "feedback", source_path: `/m/${harness}/${i}.md`, source_mtime: mtime + i },
+          }));
+      }
+    };
+    mk("zcode", 40, 1000);        // 多且新
+    mk("claude-code", 10, 1);     // 少且旧
+
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    assert.equal(r.status, 200);
+    const entries = ((await r.json()) as { entries: Array<{ harness: string }> }).entries;
+    const hz = entries.filter((e) => e.harness === "zcode").length;
+    const hc = entries.filter((e) => e.harness === "claude-code").length;
+    assert.ok(hc > 0, `claude-code 必须出现，实际 ${hc}/20（zcode ${hz}）`);
+    // 份额按持有量分配：zcode:claude-code = 40:10 ⇒ 20 条里约 16:4。
+    // 不断言精确值（轮转边界会差 1），只断言两边都在且大的一方多。
+    assert.ok(hz > hc, `zcode 条目多，应占更多槽位（zcode ${hz} / claude ${hc}）`);
+    assert.equal(hz + hc, 20, "配额预算未被浪费");
+  } finally { await close(); }
+});

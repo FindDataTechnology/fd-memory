@@ -1043,7 +1043,56 @@ export class Service {
         })
         .sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
 
-      const items = ranked.slice(0, want).map((r) => ({
+      // Harness quota (2026-11-16, measured defect): the flat "feedback first,
+      // then newest" sort returned 100/100 zcode entries and ZERO from
+      // claude-code — 2 727 entries available, one harness invisible. zcode
+      // writes far more feedback files and rewrites them more often, so it
+      // wins both sort keys and starves every other harness. That makes the
+      // face the opposite of its own name: a cross-harness index that shows
+      // one harness is just that harness's own notes read back to it.
+      //
+      // Each harness gets a share of the budget proportional to how much it
+      // actually holds, floor 1 so a small harness is still represented. Not
+      // equal-per-harness: at 40:10 that would re-show the same 10 claude-code
+      // entries on every single injection while hiding 30 of zcode's — a stale
+      // loop, not variety. Recency still decides WITHIN a harness (each bucket
+      // keeps its own newest-first order); it just no longer decides ACROSS
+      // them, which is what let one harness take the whole budget.
+      const byHarness = new Map<string, typeof ranked>();
+      for (const r of ranked) {
+        const key = String(r.harness ?? "unknown");
+        const bucket = byHarness.get(key);
+        if (bucket) bucket.push(r);
+        else byHarness.set(key, [r]);
+      }
+      const buckets = [...byHarness.entries()]
+        .sort((a, b) => b[1].length - a[1].length)
+        .map(([, list]) => list);
+      const total = ranked.length;
+      const picked: typeof ranked = [];
+      const leftovers: typeof ranked[] = [];
+      for (const list of buckets) {
+        const quota = Math.max(1, Math.round((want * list.length) / total));
+        const take = Math.min(quota, list.length);
+        picked.push(...list.slice(0, take));
+        if (list.length > take) leftovers.push(list.slice(take));
+      }
+      // Proportional rounding can leave the budget under-spent (ceil vs floor).
+      // Settle from the leftovers, largest bucket first, stopping at the
+      // budget. No second trim after this: the final sort is stable by
+      // (priority, mtime), and clipping at the end would let the largest
+      // harness's older entries evict a small harness's guaranteed floor —
+      // which is exactly the starvation this whole block exists to prevent.
+      for (const list of leftovers) {
+        for (const r of list) {
+          if (picked.length >= want) break;
+          picked.push(r);
+        }
+        if (picked.length >= want) break;
+      }
+      picked.sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
+
+      const items = picked.map((r) => ({
         harness: r.harness,
         memory_type: r.memory_type,
         description: r.description,
