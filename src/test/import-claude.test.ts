@@ -264,3 +264,20 @@ test("tool_call titles carry a gist, not just the tool name", () => {
   const bare = mapHookEvent("zcode", "post-tool-use", { tool_name: "TodoWrite", cwd: "/tmp" });
   assert.equal(bare!.title, "tool_call TodoWrite");
 });
+
+test("舰队派发模板不算用户交办的未竟事项", () => {
+  // 2026-11-16 实测：zcode-fleet driver 每轮把同一段收尾纪律打给会话，两个
+  // 变体里都含「下一步」⇒ 被 handoff 规则收成 note。96 条 note 里 56 条是它。
+  const variants = [
+    "你来主导本轮开发，允许做任何你觉得必要的操作，继续。\n收尾纪律（务必遵守）：\n1. 用一句话交代：本轮做了什么、还剩什么。\n2. 若你承载的 openspec change 剩余 ≤5 项，优先推完并归档。\n3. 若 change 已归档、任务全部完成、无下一步可推进，请以「任务已完成」开头作答。",
+    "继续按你自己的计划推进开发，完成当前步骤后自主选择下一步。\n收尾纪律（务必遵守）：\n1. 交代本轮做了什么、还剩什么。\n2. 承载的 openspec change 剩 ≤5 项时，优先推完并归档。",
+  ];
+  for (const text of variants) {
+    const out = applyRules(
+      [{ sourceKey: "k", harness: "zcode", sessionId: "s", sourceFile: "/tmp/x", uuid: "u",
+         role: "user", text, ts: "2026-11-16T00:00:00Z", projectDir: "p" }],
+      BUILTIN_RULES,
+    );
+    assert.equal(out.kept.length, 0, `应被过滤：${text.slice(0, 20)}`);
+  }
+});
