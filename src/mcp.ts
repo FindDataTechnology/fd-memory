@@ -470,6 +470,11 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (!seg || !may(seg, "r")) return err("forbidden_project");
         const page = root.readPageByRel(rel);
         if (!page) return err("not_found");
+        // forgotten_at is the store's one definition of "withdrawn" (forgetPage /
+        // retractHarness frontmark it) — the search and recent faces filter it
+        // via the dropped index row, so this body face must too, or a retracted
+        // import stays readable by path (add-harness-memory-import 4.2).
+        if (page.frontmatter?.forgotten_at) return err("not_found");
         const bodyText = String(page.body ?? "");
         // Byte-bounded paging (optimize-yongyi-read-surfaces 2.2). Measured on
         // production the largest page is 10.7 KB, so this cap never fires today
