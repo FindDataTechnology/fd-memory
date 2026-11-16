@@ -1052,7 +1052,7 @@ export class Service {
                        ELSE 'yongyi' END AS harness,
                   CASE WHEN type = 'memory-index'
                        THEN json_extract(metadata,'$.memory_type')
-                       ELSE 'note' END AS memory_type,
+                       ELSE type END AS memory_type,
                   COALESCE(json_extract(metadata,'$.source_path'), path) AS source_path,
                   CASE WHEN type = 'memory-index'
                        THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
@@ -1098,21 +1098,36 @@ export class Service {
       // loop, not variety. Recency still decides WITHIN a harness (each bucket
       // keeps its own newest-first order); it just no longer decides ACROSS
       // them, which is what let one harness take the whole budget.
-      const byHarness = new Map<string, typeof ranked>();
-      for (const r of ranked) {
-        const key = String(r.harness ?? "unknown");
-        const bucket = byHarness.get(key);
-        if (bucket) bucket.push(r);
-        else byHarness.set(key, [r]);
-      }
-      const buckets = [...byHarness.entries()]
-        .sort((a, b) => b[1].length - a[1].length)
-        .map(([, list]) => list);
       const total = ranked.length;
       const picked: typeof ranked = [];
       const leftovers: typeof ranked[] = [];
+      // 蒸馏产物先取（2026-11-17 实测缺口）：note/fact 来自本服务自己的蒸馏，
+      // 只有 70 条左右，按持有量比例分到 100 条预算里不到 3 条 —— 实测 20 条
+      // fact 一条都没进注入，而它们恰恰是「从这台机器全部流水里提炼过的」
+      // 那层，复用价值最高。所以先按 priority=0 给足，剩下的再按 harness 分。
+      // 蒸馏产物先取，但只给到预算的一半（2026-11-17 调）：
+      // note/fact 是本服务自己蒸馏的，复用价值最高；但实测全给时占 71%，
+      // 把各 harness 亲手写的纪律挤到 29% —— 那些是「这个项目/工具特有的
+      // 怎么做」，同样不该被淹。一半对一半是保守起点。
+      const distilled = ranked.filter((r) => r.priority === 0);
+      const rest = ranked.filter((r) => r.priority !== 0);
+      const distilledCap = Math.max(1, Math.floor(want / 2));
+      picked.push(...distilled.slice(0, Math.min(distilledCap, want)));
+      const buckets = [...new Map<string, typeof ranked>(
+        rest.reduce((m, r) => {
+          const k = String(r.harness ?? "unknown");
+          const list = m.get(k);
+          if (list) list.push(r); else m.set(k, [r]);
+          return m;
+        }, new Map<string, typeof ranked>()),
+      ).entries()]
+        .sort((a, b) => b[1].length - a[1].length)
+        .map(([, list]) => list);
+      const remaining = Math.max(0, want - picked.length);
+      const restTotal = rest.length || 1;
       for (const list of buckets) {
-        const quota = Math.max(1, Math.round((want * list.length) / total));
+        if (picked.length >= want) break;
+        const quota = Math.max(1, Math.round((remaining * list.length) / restTotal));
         const take = Math.min(quota, list.length);
         picked.push(...list.slice(0, take));
         if (list.length > take) leftovers.push(list.slice(take));

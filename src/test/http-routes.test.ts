@@ -286,3 +286,29 @@ test("/memory/index: 蒸馏出来的 note 要进注入，且排在别人写的�
     assert.equal(entries[0].memory_type, "note", "蒸馏结论排在别人写的纪律之前");
   } finally { await close(); }
 });
+
+test("/memory/index: 蒸馏产物（note/fact）不被 harness 配额挤掉", async () => {
+  // 2026-11-17 实测：20 条 fact 一条都没进注入。原因是按 harness 持有量分
+  // 配额 —— yongyi 只有几十条，在 2700+ 条里占比 0.7%，100 条预算分不到 1 条。
+  // 而 note/fact 是「从本机全部流水里提炼过的」那层，复用价值最高，必须保底。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u/erin".replace("/", "-"));
+    // 大量 harness 条目淹没预算
+    for (let i = 0; i < 60; i++) {
+      root.writePage("default", "index", `z${i}`,
+        newPage("memory-index", `z${i}`, `zcode 纪律 ${i}`, {
+          metadata: { harness: "zcode", memory_type: "feedback", source_path: `/m/z${i}.md`, source_mtime: 1e9 + i },
+        }));
+    }
+    // 少量蒸馏产物
+    root.writePage("default", "facts", "f1", newPage("fact", "蒸馏结论一", "正文", { updated_at: "2026-11-16T10:00:00Z" }));
+    root.writePage("default", "facts", "f2", newPage("fact", "蒸馏结论二", "正文", { updated_at: "2026-11-16T11:00:00Z" }));
+
+    const person = svc.tokens.mint("person", "u/erin").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=10`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ memory_type: string }> }).entries;
+    const facts = entries.filter((e) => e.memory_type === "fact").length;
+    assert.equal(facts, 2, `两条 fact 都必须进注入，实际 ${facts}/${entries.length}`);
+  } finally { await close(); }
+});
