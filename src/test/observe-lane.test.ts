@@ -27,11 +27,11 @@ function tmpData(prefix = "fdm-observe-"): string {
   return d;
 }
 
-async function boot() {
+async function boot(env?: NodeJS.ProcessEnv) {
   __resetEmbedGate();
   __resetObserveRateLimiter();
   const data = tmpData();
-  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p", ...(env ? { env } : {}) });
   const server = createServer((req, res) => {
     void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never);
   });
@@ -376,5 +376,33 @@ test("/observe: idempotency stays root-global across projects — same key in an
     assert.equal(root.db.recentObservationPages("room-a", 50).length, 1, "room-a holds exactly the first page");
     assert.equal(root.db.recentObservationPages("room-b", 50).length, 0, "room-b holds nothing — no per-project key fork");
     assert.equal(root.db.recentObservationPages("default", 50).length, 0, "default holds nothing");
+  } finally { await close(); }
+});
+
+test("/observe: 会话边界（stop）要通知蒸馏，其余事件不通知", async () => {
+  // 2026-11-17 实测断链：/observe 落库后从不调 notifyCapture，蒸馏只能靠
+  // fallbackScan 每 10 分钟兜底；预算一紧就彻底停摆（实测停 7 小时）。
+  // hook 把 stop/session-start 都归一成 type=turn_outcome，类型层面分不开，
+  // 但 title 保留了原始事件名（`stop · finddata`），判 title 前缀即可。
+  // 蒸馏要过两门（URL + ENABLED=1）；不设 env 时 notifyCapture 第一行就 return。
+  const { svc, base, close } = await boot({
+    FD_MEMORY_DISTILLER_URL: "http://127.0.0.1:1",
+    FD_MEMORY_DISTILL_ENABLED: "1",
+  });
+  try {
+    const person = svc.tokens.mint("person", "u/dana").token;
+    const before = svc.distill.pendingCount();
+
+    // tool_call 不是会话边界，不该排队
+    await post(base, person, { type: "tool_call", idempotency_key: "t-1", title: "tool_call Bash: ls", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before, "tool_call 不触发蒸馏");
+
+    // session-start 也不是边界
+    await post(base, person, { type: "turn_outcome", idempotency_key: "s-1", title: "session-start · finddata", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before, "session-start 不触发蒸馏");
+
+    // stop 才是边界
+    await post(base, person, { type: "turn_outcome", idempotency_key: "e-1", title: "stop · finddata", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before + 1, "stop 必须排队蒸馏");
   } finally { await close(); }
 });

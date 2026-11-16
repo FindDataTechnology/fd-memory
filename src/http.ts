@@ -353,6 +353,21 @@ export class Service {
       // steered landing project — an idempotency key remains root-global, and
       // the first delivery's page is what every replay gets back.
       const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs }, nsProject);
+      // 蒸馏触发（2026-11-17 修断链）：/observe 是 harness hook 的唯一入口，
+      // 但它此前只落库、从不通知调度器 —— 蒸馏只能靠 fallbackScan 每 10 分钟
+      // 兜底，预算一紧（remaining < FALLBACK_BUDGET_RESERVE）就彻底停摆，
+      // 实测停 7 小时才发现。
+      //
+      // 为什么要从 title 认事件而不是从 type：hook 把 stop/session-start 都归一
+      // 成 type='turn_outcome'（EVENT_TYPES 的映射），类型层面分不开。但 title
+      // 保留了原始事件名（`stop · finddata` / `session-start · finddata`），
+      // 而 notifyCapture 要的正是「会话边界」这个语义。判 title 前缀既准确
+      // 又不用改 hook 协议。
+      //
+      // duplicate 不触发：同一条事件重放不该再排队，否则重试会把队列灌满。
+      if (!out.duplicate && /^(?:stop|session-end) ·/.test(parsed.event.title)) {
+        this.distill.notifyCapture(namespaceParts(scope.namespace).rootKey, landingProject, [{ event: "stop" }]);
+      }
       res.writeHead(202, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out.duplicate
         ? { page: out.page, duplicate: true }
@@ -1020,25 +1035,50 @@ export class Service {
       const iProject = String(projRaw ?? "default").replace(/[/\\]+/g, "-").slice(0, 128) || "default";
       const want = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100) || 100));
 
+      // 两类条目进注入，而过去只有第一类（2026-11-16 修）：
+      //   · memory-index —— 各 harness 自己 memory 文件的 description，是「别人
+      //     已经提炼过的结论」；
+      //   · note / fact —— 本服务 eval 分支**自己蒸馏出来的**结论。它们此前
+      //     永远进不了注入：distill 在跑、页也在写，但 memory-index 只由
+      //     sync.ts 扫描 harness 文件产生，两条链路不互通。结果是「记忆越
+      //     蒸馏越深，会话越看不见」，恰恰反了 —— 蒸馏产物是最该被复用的那层。
+      // note 的 title 本身就是一句话结论（例：「规则按行业过滤只认出银行：
+      // insurance/securities 共 12 条规则永不命中」），body 才是展开，所以
+      // description 取 title。
       const rows = iRoot.db.db
         .prepare(
-          `SELECT json_extract(metadata,'$.harness') AS harness,
-                  json_extract(metadata,'$.memory_type') AS memory_type,
-                  json_extract(metadata,'$.source_path') AS source_path,
-                  COALESCE(json_extract(metadata,'$.source_mtime'), 0) AS mtime,
-                  body AS description
+          `SELECT CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.harness'),'?')
+                       ELSE 'yongyi' END AS harness,
+                  CASE WHEN type = 'memory-index'
+                       THEN json_extract(metadata,'$.memory_type')
+                       ELSE 'note' END AS memory_type,
+                  COALESCE(json_extract(metadata,'$.source_path'), path) AS source_path,
+                  CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
+                       ELSE COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) END AS mtime,
+                  CASE WHEN type = 'memory-index' THEN body ELSE title END AS description
            FROM pages
-           WHERE type = 'memory-index' AND project = ?`,
+           WHERE project = ?
+             AND (type = 'memory-index' OR type IN ('note','fact'))
+             AND json_extract(metadata,'$.forgotten_at') IS NULL`,
         )
         .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string }>;
 
-      // Recency comes from the mtime STORED at sync time, not a live stat.
-      // Measured 2026-11-16: statting 2 683 source files per request cost
-      // 1.4–2.2 s and blew the session-start hook's 2 s budget, so injection
-      // silently returned nothing. The index refreshes these on every sync.
+      // 三级优先（2026-11-16 晚）：
+      //   0 = note / fact —— 本服务自己蒸馏出来的结论。它们是「从本机所有
+      //       harness 的流水里提炼过的」那一层，复用价值最高：一条顶得上
+      //       一堆原始记录。原先它们排在 feedback 之后，实测 100 个槽位里
+      //       只挤进 2 条，等于 hello 世界。
+      //   1 = feedback / user —— 各 harness 亲手写的纪律与偏好。
+      //   2 = 其余（project / reference）。
+      // 顺序不是「谁更新」，而是「谁更浓缩」：注入是拿去立刻用的，不是归档。
       const ranked = rows
         .map((r) => {
-          const priority = r.memory_type === "feedback" || r.memory_type === "user" ? 0 : 1;
+          const priority =
+            r.memory_type === "note" || r.memory_type === "fact" ? 0
+            : r.memory_type === "feedback" || r.memory_type === "user" ? 1
+            : 2;
           return { ...r, priority };
         })
         .sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);

@@ -261,3 +261,28 @@ test("会话启动注入：预算装不下全部时，每个 harness 都要按�
   assert.ok(hc > 0, `预算被截断后 claude-code 仍须出现，实际 ${hc}/30`);
   assert.ok(hz > hc, `zcode 持有更多，应占更多，实际 zcode ${hz} / claude ${hc}`);
 });
+
+test("/memory/index: 蒸馏出来的 note 要进注入，且排在别人写的纪律之前", async () => {
+  // 2026-11-16 实测缺口：distill 在跑、页也在写，但 /memory/index 只取
+  // memory-index（由 sync.ts 扫描 harness 文件产生），note/fact 永远进不了
+  // 注入 —— 「记忆越蒸馏越深，会话越看不见」，恰恰反了。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-carol");
+    root.writePage("default", "index", "z1",
+      newPage("memory-index", "z 纪律", "zcode 的一条纪律", {
+        metadata: { harness: "zcode", memory_type: "feedback", source_path: "/m/z.md", source_mtime: 9e9 },
+      }));
+    root.writePage("default", "notes", "n1",
+      newPage("note", "蒸馏出的一句话结论", "展开正文很长", { updated_at: "2026-11-16T10:00:00Z" }));
+
+    const person = svc.tokens.mint("person", "u/carol").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=10`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ harness: string; memory_type: string; description: string }> }).entries;
+    const n = entries.find((e) => e.memory_type === "note");
+    assert.ok(n, `note 必须进注入，实际只有 ${entries.map((e) => e.memory_type).join(",")}`);
+    assert.equal(n!.harness, "yongyi", "蒸馏产物来源标 yongyi");
+    assert.equal(n!.description, "蒸馏出的一句话结论", "取 title（一句话结论），不是展开的 body");
+    assert.equal(entries[0].memory_type, "note", "蒸馏结论排在别人写的纪律之前");
+  } finally { await close(); }
+});
