@@ -6,8 +6,8 @@
 // and observations carry the project they landed in.
 
 import { DatabaseSync } from "node:sqlite";
-import { readdirSync, statSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readdirSync, statSync, mkdirSync, readFileSync } from "node:fs";
+import { join, dirname, sep } from "node:path";
 import { readPageFile } from "./okf.js";
 
 export interface ObservationRow {
@@ -113,9 +113,22 @@ function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null
 export class RootDb {
   readonly db: DatabaseSync;
 
+  /**
+   * Schema version this build expects. Bump it whenever migrate() adds a step
+   * that must run again; otherwise an already-migrated database skips the whole
+   * write path on open.
+   */
+  static readonly SCHEMA_VERSION = 1;
+
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    // busy_timeout FIRST, before any statement that could need a write lock.
+    // Measured 2026-11-15: with 30 independent processes opening this database
+    // simultaneously, migrate() failed with SQLITE_BUSY and StoreRoot
+    // construction threw — so the session could not even start. The default
+    // (and node:sqlite's) timeout is far too short for multi-process use.
+    this.db.exec("PRAGMA busy_timeout = 15000");
     this.migrate();
   }
 
@@ -124,7 +137,23 @@ export class RootDb {
     return new Set(rows.map((r) => r.name));
   }
 
+  /**
+   * Run the schema migration at most once per database version.
+   *
+   * Why the version gate: migrate() used to run on EVERY construction, issuing
+   * a pile of CREATE TABLE / DELETE statements. That is a write transaction on
+   * open, which is fine for one process and fatal for thirty — every session
+   * start competed for the write lock. The schema only needs building once, so
+   * we record that in a tiny metadata table and skip the rest on subsequent
+   * opens.
+   */
   private migrate(): void {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    const row = this.db
+      .prepare("SELECT value FROM schema_meta WHERE key = 'version'")
+      .get() as { value?: string } | undefined;
+    if (row?.value && Number(row.value) >= RootDb.SCHEMA_VERSION) return;
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pages (
         path TEXT PRIMARY KEY, project TEXT, type TEXT, title TEXT, body TEXT, updated_at TEXT,
@@ -273,6 +302,12 @@ export class RootDb {
     // supersede lists — a one-time catch-up for roots that predate the table.
     const edgeCount = this.db.prepare("SELECT COUNT(*) AS n FROM superseded_edges").get() as { n: number };
     if (Number(edgeCount.n) === 0) this.rebuildSupersedeEdges();
+
+    // Record the version so the next open skips this whole write path. Done
+    // last: a half-finished migration must not be marked complete.
+    this.db
+      .prepare("INSERT INTO schema_meta (key, value) VALUES ('version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(String(RootDb.SCHEMA_VERSION));
   }
 
   // A page id is the file basename without the extension — the vocabulary
@@ -411,7 +446,18 @@ export class RootDb {
         .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
     );
     if (meta) meta.total = pagesTotal + (obs.length ? Number(obs[0]._total ?? obs.length) : 0);
-    return [...rows, ...obs].slice(0, limit);
+
+    // 真结论优先于工具流水（2026-11-16 实测）：观测页是 hook 自动抓的
+    // `tool_call Bash: kubectl …`，它们数量多、正文短、词频高，在纯相关度
+    // 排序下会盖过 note（提炼过的结论）。调用方问「权限」要的是「读权限
+    // MUST NOT 覆盖写与拍板」这类判据，不是某次 kubectl 的输出。
+    //
+    // 排序规则：note 页在前（保持各自内部的相关度次序），observation 在后。
+    // 不做成硬过滤——观测仍是合法证据，只是不该排第一。
+    const isNote = (t: string) => t !== "observation";
+    const pageNotes = rows.filter((r) => isNote(r.type));
+    const pageObs = rows.filter((r) => !isNote(r.type));
+    return [...pageNotes, ...pageObs, ...obs].slice(0, limit);
   }
 
   // Alive predicate (optimize-yongyi-read-surfaces 3.3): one definition of
@@ -951,5 +997,60 @@ export class RootDb {
     walk(wikiDir);
     if (forgotten > 0) console.log(`[fd-memory] reindex: skipped ${forgotten} forgotten page(s)`);
     return count;
+  }
+
+  // replayObservationsFromLog: rebuild the observations index from the
+  // append-only JSONL truth written by StoreRoot.appendObservation.
+  //
+  // This is the other half of "L0 捕获流 MUST 为 append-only 且可重建索引".
+  // reindexFromWiki only rebuilds `pages`; observations live outside the wiki
+  // page tree, so before this existed there was no way to recover them if the
+  // SQLite file was lost or its index got out of sync.
+  //
+  // Idempotent: clears the table first, then replays every log line in
+  // chronological order so the autoincrement `id` matches the original arrival
+  // order. Deduplication is NOT applied here — the log is the truth, including
+  // duplicate captures that the live path happened to write.
+  replayObservationsFromLog(wikiDir: string): { projects: number; rows: number } {
+    this.db.exec("DELETE FROM observations");
+    let projects = 0;
+    let rows = 0;
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) {
+          walk(full);
+        } else if (entry.endsWith(".jsonl") && full.includes(`${sep}observations${sep}_log${sep}`)) {
+          projects++;
+          const lines = readFileSync(full, "utf8").split("\n");
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t) continue;
+            let rec: { session_id?: unknown; agent?: unknown; event?: unknown; tool?: unknown; summary?: unknown; created_at?: unknown; project?: unknown };
+            try {
+              rec = JSON.parse(t) as typeof rec;
+            } catch {
+              console.warn(`[fd-memory] replay: skipped malformed line in ${full}`);
+              continue;
+            }
+            if (typeof rec.session_id !== "string" || typeof rec.event !== "string") continue;
+            this.db
+              .prepare("INSERT INTO observations (session_id, agent, event, tool, summary, created_at, project) VALUES (?,?,?,?,?,?,?)")
+              .run(
+                rec.session_id,
+                String(rec.agent ?? "platform"),
+                rec.event,
+                rec.tool == null ? null : String(rec.tool),
+                String(rec.summary ?? ""),
+                String(rec.created_at ?? new Date().toISOString()),
+                String(rec.project ?? "default"),
+              );
+            rows++;
+          }
+        }
+      }
+    };
+    walk(wikiDir);
+    return { projects, rows };
   }
 }

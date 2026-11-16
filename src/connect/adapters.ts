@@ -158,28 +158,51 @@ function hookPrefix(targets: ConnectTargets, harness: Harness): string {
   return `${targets.binName} hook ${harness} `;
 }
 
-// Merge our hook entry into hooks.<Event> arrays — one entry per event, no
-// duplicates on re-run (spec scenario: 幂等重跑).
+// Merge our hook entry into hooks.events.<Event> arrays — one entry per event,
+// no duplicates on re-run (spec scenario: 幂等重跑).
+//
+// 层级必须是 hooks.events.<Event>（2026-11-16 实测）：写进 hooks.<Event> 会让
+// ZCode 判定整个 hooks 段非法（"Unrecognized keys: SessionStart, Stop,
+// PostToolUse"），于是**所有 hook 静默失效**——包括别的工具装的 build-guard。
+// 症状极隐蔽：connect 报成功、config 是合法 JSON，但 `config.file.invalid`
+// 在日志里刷了 172 次而无人察觉。
+// The two harnesses nest hooks DIFFERENTLY, and getting it wrong is silent:
+//   claude-code : settings.hooks.<Event>            (flat)
+//   zcode       : config.hooks.events.<Event>       (nested; requires
+//                 hooks.enabled and rejects unknown keys at the top level)
+// Writing zcode's hooks into the flat shape made ZCode reject the WHOLE hooks
+// block ("Unrecognized keys"), which silently killed every hook — including
+// build-guard — while `connect` still reported success. So the container is
+// chosen by harness, never shared.
+function hooksContainer(doc: Record<string, unknown>, harness: Harness): Record<string, unknown> {
+  const hooks = doc.hooks as Record<string, unknown>;
+  if (harness !== "zcode") return hooks;
+  if (!hooks.events || typeof hooks.events !== "object" || Array.isArray(hooks.events)) hooks.events = {};
+  return hooks.events as Record<string, unknown>;
+}
+
 function wireHooks(doc: Record<string, unknown>, targets: ConnectTargets, harness: Harness): void {
   if (!doc.hooks || typeof doc.hooks !== "object" || Array.isArray(doc.hooks)) doc.hooks = {};
   const hooks = doc.hooks as Record<string, unknown>;
   if (harness === "zcode" && hooks.enabled === undefined) hooks.enabled = true;
+  const events = hooksContainer(doc, harness);
   const prefix = hookPrefix(targets, harness);
   for (const event of HOOK_EVENTS) {
-    const arr = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
+    const arr = Array.isArray(events[event]) ? (events[event] as unknown[]) : [];
     if (arr.some((e) => isOurHookEntry(e, prefix))) continue;
-    hooks[event] = [...arr, hookEntry(targets, harness, event)];
+    events[event] = [...arr, hookEntry(targets, harness, event)];
   }
 }
 
 function unwireHooks(doc: Record<string, unknown>, targets: ConnectTargets, harness: Harness): void {
   const hooks = doc.hooks;
   if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return;
+  const events = hooksContainer(doc, harness);
   const prefix = hookPrefix(targets, harness);
   for (const event of HOOK_EVENTS) {
-    const arr = (hooks as Record<string, unknown>)[event];
+    const arr = (events as Record<string, unknown>)[event];
     if (!Array.isArray(arr)) continue;
-    (hooks as Record<string, unknown>)[event] = arr.filter((e) => !isOurHookEntry(e, prefix));
+    (events as Record<string, unknown>)[event] = arr.filter((e) => !isOurHookEntry(e, prefix));
   }
 }
 

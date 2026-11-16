@@ -65,12 +65,46 @@ export function extractBody(event: Record<string, unknown>): string {
 // Pure mapper: hook event JSON → /observe body (idempotency key generated per
 // call, per D4). `event` must already be canonical (normalizeHookEvent).
 // Returns null when the event name is not in the mapped set.
+/**
+ * One-line gist of a tool call, for the observation title.
+ *
+ * Why (2026-11-16): the title used to be just `tool_call Bash`, so 275 of 405
+ * captured pages shared an identical title and only 16 distinct titles existed
+ * across the whole layer. A title that cannot distinguish two observations is
+ * not a title — it makes the read faces unusable and forces every lookup to
+ * open the body.
+ *
+ * The gist takes the most identifying field the harness gives us: a shell
+ * command, a file path, a description. Truncated hard — this is a label, not
+ * content.
+ */
+function toolGist(payload: Record<string, unknown> | null): string {
+  const input = payload?.tool_input ?? payload?.input;
+  if (typeof input === "string") return input.trim().replace(/\s+/g, " ");
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const o = input as Record<string, unknown>;
+    for (const k of ["command", "file_path", "path", "description", "pattern", "query", "url"]) {
+      const v = o[k];
+      if (typeof v === "string" && v.trim()) return v.trim().replace(/\s+/g, " ");
+    }
+  }
+  const desc = payload?.description;
+  if (typeof desc === "string" && desc.trim()) return desc.trim().replace(/\s+/g, " ");
+  return "";
+}
+
 export function mapHookEvent(harness: string, event: string, payload: Record<string, unknown> | null): ObserveEvent | null {
   const type = EVENT_TYPES[event.replace(/-/g, "")];
   if (!type) return null;
   const tool = typeof payload?.tool_name === "string" ? (payload.tool_name as string) : "";
   const cwd = typeof payload?.cwd === "string" ? (payload.cwd as string) : "";
-  const titleSrc = type === "tool_call" && tool ? `tool_call ${tool}` : `${event} ${cwd ? "· " + cwd.split("/").filter(Boolean).pop() : ""}`;
+  let titleSrc: string;
+  if (type === "tool_call" && tool) {
+    const gist = toolGist(payload);
+    titleSrc = gist ? `tool_call ${tool}: ${gist}` : `tool_call ${tool}`;
+  } else {
+    titleSrc = `${event} ${cwd ? "· " + cwd.split("/").filter(Boolean).pop() : ""}`;
+  }
   return {
     type,
     idempotency_key: randomUUID(),

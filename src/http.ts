@@ -4,7 +4,7 @@
 // namespace), /healthz, /admin/* (token ops, root-scoped). Auth on every
 // route except /healthz; auth failures are structured JSON.
 
-import { readdirSync, existsSync } from "node:fs";
+import { readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -991,6 +991,66 @@ export class Service {
       }
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ items, offset, limit }));
+    }
+
+    // ── /memory/index (cross-harness memory index, 2026-11-16): a bounded
+    // list of DISTILLED conclusions gathered from every AI harness's own
+    // memory files (ZCode `memories/**/memory/*.md`, Claude Code
+    // `projects/*/memory/*.md`). Each entry is one description — the topic
+    // file's body stays at its source path, never copied here.
+    //
+    // Why this exists: session-start injection must be small and must say
+    // something worth reading. The digest face was pulling in L0 tool chatter
+    // (`tool_call Bash: kubectl …`); these pages come from files an agent
+    // already distilled, so a line IS the lesson.
+    //
+    // Ordering: feedback/user first (discipline and preference — the two
+    // classes worth paying for on every turn), then the rest, newest source
+    // first within each group. `limit` is clamped hard because this rides the
+    // system prompt of every session.
+    if (path === "/memory/index" && req.method === "GET") {
+      let iRoot: StoreRoot;
+      if (scope.kind === "person") {
+        iRoot = this.rootFor(scope);
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const projRaw = url.searchParams.get("project");
+      const iProject = String(projRaw ?? "default").replace(/[/\\]+/g, "-").slice(0, 128) || "default";
+      const want = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100) || 100));
+
+      const rows = iRoot.db.db
+        .prepare(
+          `SELECT json_extract(metadata,'$.harness') AS harness,
+                  json_extract(metadata,'$.memory_type') AS memory_type,
+                  json_extract(metadata,'$.source_path') AS source_path,
+                  COALESCE(json_extract(metadata,'$.source_mtime'), 0) AS mtime,
+                  body AS description
+           FROM pages
+           WHERE type = 'memory-index' AND project = ?`,
+        )
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string }>;
+
+      // Recency comes from the mtime STORED at sync time, not a live stat.
+      // Measured 2026-11-16: statting 2 683 source files per request cost
+      // 1.4–2.2 s and blew the session-start hook's 2 s budget, so injection
+      // silently returned nothing. The index refreshes these on every sync.
+      const ranked = rows
+        .map((r) => {
+          const priority = r.memory_type === "feedback" || r.memory_type === "user" ? 0 : 1;
+          return { ...r, priority };
+        })
+        .sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
+
+      const items = ranked.slice(0, want).map((r) => ({
+        harness: r.harness,
+        memory_type: r.memory_type,
+        description: r.description,
+        source_path: r.source_path,
+      }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ project: iProject, total: ranked.length, entries: items }));
     }
 
     // ── /memory/promotions (add-tier-promotion-candidates D2): the 待确认

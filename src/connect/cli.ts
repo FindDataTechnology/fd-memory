@@ -273,6 +273,81 @@ function dropBinding(harness: Harness, credsPath: string, envPath: string): File
 // unreachable service, 5xx, timeout, missing binding — logs to stderr and
 // exits 0: a capture hook must never block a harness turn. Only usage errors
 // exit non-zero (2).
+
+/**
+ * Build the memory context injected at session start.
+ *
+ * Kept deliberately small: this text rides EVERY session's system prompt, so a
+ * verbose dump would be paid for on every turn. We surface only the distilled
+ * layer (kind=memory pages), newest first, capped hard — a handful of
+ * conclusions the agent can act on, not a transcript.
+ *
+ * Fails silent: if the service is down or slow, the session starts without
+ * memory. Blocking a turn on a memory read would repeat the outage we are
+ * trying to avoid.
+ */
+async function buildSessionContext(binding: Binding): Promise<string> {
+  const base = binding.url.replace(/\/+$/, "");
+  const project = binding.project && binding.project !== "default" ? binding.project : "default";
+  const ctl = new AbortController();
+  // 5s, not 2s: the index query touches a multi-thousand-page table on a disk
+    // shared with an 8.5 GB session database (measured 2026-11-16: 1.4–2.5 s,
+    // while /digest needs 10 s). A session-start hook may take a few seconds —
+    // it must not take forever, and it must not fail silently because the
+    // budget was tighter than the machine is fast.
+    const timer = setTimeout(() => ctl.abort(), 5000);
+  try {
+    // 注入的是**跨 harness 记忆索引**，不是 digest。
+    //
+    // 为什么换掉 digest（2026-11-16）：digest 由 hybridCandidates 生成，会把
+    // L0 工具流水（`tool_call Bash: kubectl …`）混进候选，实测启动注入里
+    // 大部分是这类噪音。而索引页（type=memory-index）是从各 harness 自己的
+    // memory 文件里读出来的**结论**，description 就是钩子本身。
+    //
+    // 预算控制（三层，都必要）：
+    //   1. 只取 feedback + user —— 这两类每轮都该看到；project/reference 按需查
+    //   2. 再按源文件 mtime 取最近的 —— 旧结论价值递减
+    //   3. 最后按字符数硬截断 —— 索引大小不可预测，必须有上限
+    //   实测：feedback+user 共 578 条 = 28K tokens（太多）；
+    //         取最近 100 条 = 5K tokens（可接受）。
+    const res = await fetch(`${base}/memory/index?project=${encodeURIComponent(project)}&limit=100`, {
+      headers: { authorization: "Bearer " + binding.token },
+      signal: ctl.signal,
+    });
+    if (!res.ok) return "";
+    const doc = (await res.json()) as {
+      entries?: Array<{ harness?: string; memory_type?: string; description?: string }>;
+      total?: number;
+    };
+    const entries = Array.isArray(doc.entries) ? doc.entries : [];
+    if (entries.length === 0) return "";
+
+    const lines: string[] = ["【永忆 · 跨 harness 记忆】以下是已沉淀的结论（本地优先，其余为其它 harness 的经验）："];
+    let used = lines[0].length;
+    const MAX_CHARS = 3000;
+    let shown = 0;
+    for (const e of entries) {
+      const d = String(e.description ?? "").replace(/\s+/g, " ").trim();
+      if (!d) continue;
+      const tag = e.memory_type === "feedback" ? "纪律" : e.memory_type === "user" ? "偏好" : "记忆";
+      const line = `- 〔${tag}·${e.harness ?? "?"}〕${d}`;
+      if (used + line.length > MAX_CHARS) break;
+      lines.push(line);
+      used += line.length;
+      shown++;
+    }
+    if (shown === 0) return "";
+    const hidden = (doc.total ?? entries.length) - shown;
+    if (hidden > 0) lines.push(`…另有 ${hidden} 条未列出，用 memory_query 检索全文。`);
+    lines.push("本轮学到新结论时用 memory_write_page 落页；收尾时可写 memory_handoff_begin 交接。");
+    return lines.join("\n");
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export async function runHook(argv: string[], readStdin: () => Promise<string>): Promise<void> {
   const { positionals } = parseArgs(argv, []);
   const harness = positionals[0];
@@ -291,6 +366,22 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
   const payload = readStdinJson(stdin);
   const yongyiDir = process.env.YONGYI_HOME ?? homedir() + "/.yongyi";
   const binding = loadCredentials(credentialPaths(yongyiDir).creds).bindings[harness];
+
+  // SessionStart 不只记录，还要**主动把记忆送进会话**。
+  //
+  // 为什么必须这么做（2026-11-16 实测）：纪律文本已经写进 AGENTS.md，MCP 工具
+  // 也连接成功 151 次，但会话 40 分钟内 0 次调用 memory_*——工具可见不等于会被用。
+  // 会话是任务驱动的，它不会主动想「我该查查记忆」。所以要在它开始干活之前，
+  // 把它以前学到的、与本项目相关的结论直接摆到它眼前。
+  //
+  // 输出协议：stdout 必须是严格 JSON，`{"additionalContext": "..."}` 会被注入上下文。
+  // 纯文本会被判非法丢弃；无内容时输出 `{}`（合法且表示"无话可说"）。
+  if (event === "session-start" && binding) {
+    const ctx = await buildSessionContext(binding).catch(() => "");
+    process.stdout.write(JSON.stringify(ctx ? { additionalContext: ctx } : {}) + "\n");
+    // 注入之后仍然记录这次 session-start（捕获照旧）。
+  }
+
   const mapped = binding ? observeEventFor(harness, event, payload, binding) : mapHookEvent(harness, event, payload);
   if (!mapped) return; // unmapped — nothing to capture, not an error
   if (!binding) {

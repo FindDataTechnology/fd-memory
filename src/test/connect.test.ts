@@ -263,7 +263,12 @@ function seedZcode(home: string): void {
     join(home, ".zcode", "cli", "config.json"),
     JSON.stringify({
       mcp: { servers: { context7: { type: "stdio", command: "npx" } } },
-      hooks: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "node hook.mjs" }] }] },
+      // ZCode's real shape: hooks.enabled + hooks.events.<Event>. A flat
+      // hooks.<Event> would be rejected wholesale (2026-11-16).
+      hooks: {
+        enabled: true,
+        events: { PostToolUse: [{ matcher: "Edit|Write", hooks: [{ type: "command", command: "node hook.mjs" }] }] },
+      },
     }),
   );
 }
@@ -281,14 +286,21 @@ test("zcode: connect wires mcp.servers+hooks+AGENTS.md; rerun idempotent; discon
 
   const cfg = JSON.parse(readFileSync(join(home, ".zcode", "cli", "config.json"), "utf8")) as {
     mcp: { servers: Record<string, { type: string; url?: string; headers?: Record<string, string> }> };
-    hooks: Record<string, unknown> & { enabled?: boolean };
+    hooks: Record<string, unknown> & { enabled?: boolean; events?: Record<string, unknown> };
   };
   assert.ok(cfg.mcp.servers.context7, "user server preserved");
   assert.equal(cfg.mcp.servers["fd-memory"]?.url, mcpUrlFor(url));
   assert.equal(cfg.mcp.servers["fd-memory"]?.headers?.Authorization, "Bearer ${" + envVar + "}");
   assert.equal(cfg.hooks.enabled, true, "hook plane enabled, never disabled");
-  assert.equal((cfg.hooks.PostToolUse as unknown[]).length, 2, "user hook entry + ours");
-  for (const ev of ["SessionStart", "Stop"]) assert.ok(Array.isArray(cfg.hooks[ev]) && (cfg.hooks[ev] as unknown[]).length === 1);
+  // ZCode nests under hooks.events — the flat shape is rejected wholesale
+  // ("Unrecognized keys"), which silently kills every hook (2026-11-16).
+  const ev = cfg.hooks.events as Record<string, unknown[]>;
+  assert.ok(ev, "hooks.events exists");
+  assert.equal((ev.PostToolUse as unknown[]).length, 2, "user hook entry + ours");
+  for (const name of ["SessionStart", "Stop"]) assert.ok(Array.isArray(ev[name]) && (ev[name] as unknown[]).length === 1, `${name} nested`);
+  for (const name of ["SessionStart", "Stop", "PostToolUse"]) {
+    assert.equal((cfg.hooks as Record<string, unknown>)[name], undefined, `${name} must NOT be flat`);
+  }
 
   const agents = readFileSync(join(proj, "AGENTS.md"), "utf8");
   assert.equal(agents.split(BLOCK_BEGIN).length - 1, 1, "AGENTS.md block exactly once");
@@ -304,7 +316,11 @@ test("zcode: connect wires mcp.servers+hooks+AGENTS.md; rerun idempotent; discon
   };
   assert.equal(after.mcp.servers["fd-memory"], undefined);
   assert.ok(after.mcp.servers.context7);
-  assert.equal((after.hooks.PostToolUse as unknown[]).length, 1, "user hook entry stays");
+  // ZCode nests under hooks.events; reading the flat key here would silently
+  // pass against a config ZCode actually rejects (2026-11-16).
+  const afterEvents = after.hooks.events as unknown as Record<string, unknown[]>;
+  assert.equal(afterEvents.PostToolUse.length, 1, "user hook entry stays");
+  assert.equal(after.hooks.PostToolUse, undefined, "no flat leftover");
   assert.equal(after.hooks.enabled, true);
   assert.equal(existsSync(join(proj, "AGENTS.md")), false, "block-only AGENTS.md unlinked");
 });

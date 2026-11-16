@@ -8,11 +8,11 @@
 // d-<packId>. Writes carry an optional audit identity (principal + scope)
 // recorded as companion rows.
 
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
-import { RootDb, HandoffRow } from "./db.js";
+import { RootDb, HandoffRow, ObservationRow } from "./db.js";
 import { namespaceParts } from "./auth.js";
 import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
 import { sanitize } from "./sanitize.js";
@@ -133,6 +133,52 @@ export class StoreRoot {
     mkdirSync(dir, { recursive: true });
     projectManifest(dir, project);
     return dir;
+  }
+
+  // appendObservation: the L0 capture lane's durable write.
+  //
+  // Why this exists (change yongyi-multi-agent-memory-plane, requirement
+  // "L0 捕获流 MUST 为 append-only 且可重建索引"): the observations table used
+  // to be the ONLY copy of hook-captured events — insert into SQLite, done.
+  // That made it simultaneously truth and index, so switching storage backends
+  // (or losing the DB file) lost events outright. Every other lane (pages,
+  // handoffs) had the wiki as truth and could be rebuilt by `reindex`; this one
+  // could not. Now the append-only JSONL under <project>/observations/_log/ is
+  // the truth and the SQLite row is a rebuildable index.
+  //
+  // Order matters: the truth write happens FIRST and is never undone by an
+  // index failure. A turn must not be blocked or lost because the index is
+  // locked — that is exactly the failure mode we hit with SQLite under
+  // concurrent writers (25ms busy_timeout, 1275 "database is locked" in a day).
+  appendObservation(o: ObservationRow): { stored: boolean; indexed: boolean } {
+    const dir = this.ensureProject(o.project ?? "default");
+    const logDir = join(dir, "observations", "_log");
+    mkdirSync(logDir, { recursive: true });
+    const record = {
+      session_id: o.session_id,
+      agent: o.agent,
+      event: o.event,
+      tool: o.tool ?? null,
+      summary: o.summary,
+      created_at: o.created_at,
+      project: o.project ?? "default",
+    };
+    // One JSON object per line: appended, never rewritten. Rotation is by
+    // month so a single file stays bounded without needing a compaction pass.
+    const logPath = join(logDir, `${o.created_at.slice(0, 7)}.jsonl`);
+    appendFileSync(logPath, JSON.stringify(record) + "\n", "utf8");
+
+    let indexed = true;
+    try {
+      this.db.addObservation(o);
+    } catch (err) {
+      // Truth is safe; the index can be rebuilt from the log. Surface it in the
+      // return value so callers can report a degraded capture instead of a
+      // failed one.
+      indexed = false;
+      console.error(`[appendObservation] truth written, index failed: ${(err as Error).message}`);
+    }
+    return { stored: true, indexed };
   }
 
   writePage(project: string, typeDir: string, slug: string, page: ReturnType<typeof newPage>, audit?: AuditIdentity): string {
