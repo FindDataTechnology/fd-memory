@@ -12,7 +12,7 @@ import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { execFileSync } from "node:child_process";
-import { RootDb, HandoffRow, ObservationRow } from "./db.js";
+import { RootDb, HandoffRow, ObservationRow, observationDigest } from "./db.js";
 import { namespaceParts } from "./auth.js";
 import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
 import { sanitize } from "./sanitize.js";
@@ -179,6 +179,48 @@ export class StoreRoot {
       console.error(`[appendObservation] truth written, index failed: ${(err as Error).message}`);
     }
     return { stored: true, indexed };
+  }
+
+  /**
+   * Withdraw every observation an import harness wrote (change
+   * add-harness-memory-import, requirement "导入记忆 MUST 标注来源并可整批撤回").
+   *
+   * Two properties this has to keep:
+   *
+   *  - **The log is never rewritten.** The retract appends a marker line naming
+   *    each withdrawn row by digest (session_id + summary), then drops the index
+   *    rows. `replayObservationsFromLog` collects markers before inserting, so a
+   *    rebuild reproduces "withdrawn" instead of resurrecting rows the user asked
+   *    to remove. Deleting from the log instead would make the truth mutable and
+   *    lose the audit trail.
+   *  - **A later re-import survives.** The marker carries one digest per withdrawn
+   *    row and replay spends those allowances one at a time, so bytes appended
+   *    after the retract (a deliberate re-import) are kept.
+   *
+   * Markers are written per project because the log is per project. The caller
+   * reads back `markers`/`deleted` so "nothing matched" and "matched nothing
+   * because the label is wrong" stay distinguishable.
+   */
+  retractObservations(labels: string[], at = new Date().toISOString()): { markers: number; projects: string[]; deleted: number } {
+    const projects = this.db.projectsForAgentLabels(labels);
+    let markers = 0;
+    let deleted = 0;
+    for (const project of projects) {
+      const rows = this.db.observationsForAgentLabels(labels, project);
+      if (rows.length === 0) continue;
+      const dir = join(this.ensureProject(project), "observations", "_log");
+      mkdirSync(dir, { recursive: true });
+      const logPath = join(dir, `${at.slice(0, 7)}.jsonl`);
+      const retracted = rows.map((r) => observationDigest(r.session_id, r.summary));
+      appendFileSync(
+        logPath,
+        JSON.stringify({ _retract: true, labels, project, at, retracted }) + "\n",
+        "utf8",
+      );
+      markers++;
+      deleted += this.db.deleteObservationsByAgent(labels, project);
+    }
+    return { markers, projects, deleted };
   }
 
   writePage(project: string, typeDir: string, slug: string, page: ReturnType<typeof newPage>, audit?: AuditIdentity): string {

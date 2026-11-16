@@ -8,7 +8,19 @@
 import { DatabaseSync } from "node:sqlite";
 import { readdirSync, statSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { readPageFile } from "./okf.js";
+
+/**
+ * Identity of one observation as it appears in the append-only log.
+ *
+ * Retract markers name rows by this digest instead of by rowid: rowids are
+ * rebuild artifacts, and the whole point of a marker is that it keeps working
+ * after the index has been thrown away and replayed.
+ */
+export function observationDigest(sessionId: string, summary: string): string {
+  return createHash("sha256").update(`${sessionId}\u0000${summary}`).digest("hex").slice(0, 16);
+}
 
 export interface ObservationRow {
   session_id: string;
@@ -388,6 +400,63 @@ export class RootDb {
     // used to retire stays hidden (3.1).
     this.db.prepare("DELETE FROM superseded_edges WHERE by_path=?").run(relPath);
     this.db.prepare("DELETE FROM superseded_edges WHERE superseded_id=?").run(id);
+  }
+
+  /**
+   * Pages written by an importer, keyed by the provenance label the importer
+   * stamped into frontmatter metadata (`import:<harness>`).
+   *
+   * Why the label and not a directory: every import lands in the ordinary
+   * `notes/` tree alongside captured pages, so there is no directory to
+   * enumerate. The label is the only thing that survives into the index.
+   */
+  pagesByMetadataSource(labels: string[]): Array<{ path: string; project: string }> {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return this.db
+      .prepare(`SELECT path, project FROM pages WHERE json_extract(metadata,'$.source') IN (${ph})`)
+      .all(...labels) as unknown as Array<{ path: string; project: string }>;
+  }
+
+  /**
+   * Drop observation rows written by the given agent labels.
+   *
+   * This is the INDEX half of a retract; the append-only log keeps the rows and
+   * that is deliberate — `replayObservationsFromLog` honours the retract marker
+   * written *before* this runs, so a rebuild reproduces the same visible set
+   * instead of resurrecting what the user asked to withdraw.
+   */
+  deleteObservationsByAgent(labels: string[], project?: string): number {
+    if (labels.length === 0) return 0;
+    const ph = labels.map(() => "?").join(",");
+    const r = project
+      ? this.db.prepare(`DELETE FROM observations WHERE agent IN (${ph}) AND project=?`).run(...labels, project)
+      : this.db.prepare(`DELETE FROM observations WHERE agent IN (${ph})`).run(...labels);
+    return Number(r.changes ?? 0);
+  }
+
+  /** Projects that still hold observations from these import labels. */
+  projectsForAgentLabels(labels: string[]): string[] {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return (this.db
+      .prepare(`SELECT DISTINCT project FROM observations WHERE agent IN (${ph})`)
+      .all(...labels) as unknown as Array<{ project: string }>).map((r) => r.project);
+  }
+
+  /**
+   * The rows a retract is about to withdraw, by agent label and project.
+   *
+   * Returns idENTITY (session_id + summary), never rowid: the marker the retract
+   * writes has to keep working after this index is thrown away, and rowids are
+   * rebuild artifacts.
+   */
+  observationsForAgentLabels(labels: string[], project: string): ObservationRow[] {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return this.db
+      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project FROM observations WHERE agent IN (${ph}) AND project=? ORDER BY id`)
+      .all(...labels, project) as unknown as ObservationRow[];
   }
 
   searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null; _total?: number }> {
@@ -1011,46 +1080,83 @@ export class RootDb {
   // chronological order so the autoincrement `id` matches the original arrival
   // order. Deduplication is NOT applied here — the log is the truth, including
   // duplicate captures that the live path happened to write.
-  replayObservationsFromLog(wikiDir: string): { projects: number; rows: number } {
+  replayObservationsFromLog(wikiDir: string): { projects: number; rows: number; retracted: number } {
     this.db.exec("DELETE FROM observations");
     let projects = 0;
     let rows = 0;
-    const walk = (dir: string) => {
+    let retracted = 0;
+
+    // Two passes, both over the same append-only files.
+    //
+    // A retract marker (`_retract: true`, written by StoreRoot.retractObservations)
+    // lists digests of the rows it withdrew. Pass 1 collects how many of each
+    // digest are withdrawn — a COUNT, not a flag, because a deliberate re-import
+    // after the retract appends the same bytes again and must survive the replay.
+    // Each withdrawn row consumes exactly one such allowance.
+    const files: string[] = [];
+    const collect = (dir: string) => {
       for (const entry of readdirSync(dir)) {
         const full = join(dir, entry);
-        if (statSync(full).isDirectory()) {
-          walk(full);
-        } else if (entry.endsWith(".jsonl") && full.includes(`${sep}observations${sep}_log${sep}`)) {
-          projects++;
-          const lines = readFileSync(full, "utf8").split("\n");
-          for (const line of lines) {
-            const t = line.trim();
-            if (!t) continue;
-            let rec: { session_id?: unknown; agent?: unknown; event?: unknown; tool?: unknown; summary?: unknown; created_at?: unknown; project?: unknown };
-            try {
-              rec = JSON.parse(t) as typeof rec;
-            } catch {
-              console.warn(`[fd-memory] replay: skipped malformed line in ${full}`);
-              continue;
-            }
-            if (typeof rec.session_id !== "string" || typeof rec.event !== "string") continue;
-            this.db
-              .prepare("INSERT INTO observations (session_id, agent, event, tool, summary, created_at, project) VALUES (?,?,?,?,?,?,?)")
-              .run(
-                rec.session_id,
-                String(rec.agent ?? "platform"),
-                rec.event,
-                rec.tool == null ? null : String(rec.tool),
-                String(rec.summary ?? ""),
-                String(rec.created_at ?? new Date().toISOString()),
-                String(rec.project ?? "default"),
-              );
-            rows++;
-          }
-        }
+        if (statSync(full).isDirectory()) collect(full);
+        else if (entry.endsWith(".jsonl") && full.includes(`${sep}observations${sep}_log${sep}`)) files.push(full);
       }
     };
-    walk(wikiDir);
-    return { projects, rows };
+    collect(wikiDir);
+
+    const withdrawn = new Map<string, number>();
+    for (const file of files) {
+      for (const line of readFileSync(file, "utf8").split("\n")) {
+        const t = line.trim();
+        if (!t || !t.includes("_retract")) continue;
+        try {
+          const rec = JSON.parse(t) as { _retract?: unknown; retracted?: unknown };
+          if (rec._retract !== true || !Array.isArray(rec.retracted)) continue;
+          for (const d of rec.retracted) {
+            const key = String(d);
+            withdrawn.set(key, (withdrawn.get(key) ?? 0) + 1);
+          }
+        } catch {
+          console.warn(`[fd-memory] replay: skipped malformed retract marker in ${file}`);
+        }
+      }
+    }
+
+    for (const file of files) {
+      projects++;
+      const lines = readFileSync(file, "utf8").split("\n");
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        let rec: { session_id?: unknown; agent?: unknown; event?: unknown; tool?: unknown; summary?: unknown; created_at?: unknown; project?: unknown; _retract?: unknown };
+        try {
+          rec = JSON.parse(t) as typeof rec;
+        } catch {
+          console.warn(`[fd-memory] replay: skipped malformed line in ${file}`);
+          continue;
+        }
+        if (rec._retract === true) continue;
+        if (typeof rec.session_id !== "string" || typeof rec.event !== "string") continue;
+        const digest = observationDigest(rec.session_id, String(rec.summary ?? ""));
+        const allowance = withdrawn.get(digest) ?? 0;
+        if (allowance > 0) {
+          withdrawn.set(digest, allowance - 1);
+          retracted++;
+          continue;
+        }
+        this.db
+          .prepare("INSERT INTO observations (session_id, agent, event, tool, summary, created_at, project) VALUES (?,?,?,?,?,?,?)")
+          .run(
+            rec.session_id,
+            String(rec.agent ?? "platform"),
+            rec.event,
+            rec.tool == null ? null : String(rec.tool),
+            String(rec.summary ?? ""),
+            String(rec.created_at ?? new Date().toISOString()),
+            String(rec.project ?? "default"),
+          );
+        rows++;
+      }
+    }
+    return { projects, rows, retracted };
   }
 }
