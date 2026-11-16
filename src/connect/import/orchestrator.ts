@@ -26,6 +26,26 @@ import { extractSummaryLayer, summaryAsTurns } from "./summary.js";
 import type { ExtractedTurn, HarnessId } from "./types.js";
 import { applyRules, BUILTIN_RULES, type FilterRule } from "./rules.js";
 
+/** Import depth. `light` (default) applies the filter rules; `full` keeps everything. */
+export type ImportProfile = "light" | "full";
+
+/**
+ * Rules for a profile. `full` is the "不过滤" mode the spec scenario refuses to
+ * run silently: every extracted turn is a candidate, so the estimated write
+ * volume equals the whole source and the CLI must gate it behind `--yes`.
+ */
+export function rulesForProfile(profile: ImportProfile): FilterRule[] {
+  if (profile === "full") {
+    return [{ id: "profile-full", description: "全量档：不过滤（需显式 --yes）", test: () => true }];
+  }
+  return BUILTIN_RULES;
+}
+
+/** Does this invocation need the explicit-confirmation gate? Pure predicate. */
+export function fullProfileNeedsConfirmation(profile: ImportProfile, yes: boolean): boolean {
+  return profile === "full" && !yes;
+}
+
 export interface ZcodeImportOptions {
   dbPath: string;
   rules?: FilterRule[];
@@ -34,6 +54,8 @@ export interface ZcodeImportOptions {
   sessionIds?: string[];
   /** Project whose existing memories seed the content-dedupe set. */
   project?: string;
+  /** Stamp the source ledger while planning (default true) — see ImportOptions. */
+  stamp?: boolean;
 }
 
 export interface ImportOptions {
@@ -47,6 +69,12 @@ export interface ImportOptions {
   projectsDir?: string;
   /** Project whose existing memories seed the content-dedupe set. */
   project?: string;
+  /**
+   * Stamp the source ledger while planning (default true). The full-profile
+   * confirmation gate plans WITHOUT stamping: a refusal must leave no state
+   * that would change the outcome of the confirmed rerun.
+   */
+  stamp?: boolean;
 }
 
 export interface ImportPlan {
@@ -207,6 +235,8 @@ export function planFromTurns(
   scanned: ImportPlan["scanned"],
   rules: FilterRule[] = BUILTIN_RULES,
   existingFingerprints?: Set<string>,
+  /** Persist the source ledger (default true). The estimate path plans without stamping. */
+  stamp = true,
 ): ImportPlan {
   const filtered = applyRules(turns, rules);
   const cursor = loadCursor(root, harness);
@@ -229,7 +259,12 @@ export function planFromTurns(
     const prev = ledger[item.turn.sourceFile];
     const cur = hashOf(item.turn.sourceFile);
     if (!cur) continue;
-    if (prev && stampedBefore.has(item.turn.sourceFile) && cur === prev.hash) {
+    // A keys:[] ledger entry is a PLAN-ONLY stamp (a dry-run or a full-profile
+    // estimate touched this file but nothing was written from it). It must not
+    // suppress the file's turns: without the keys guard, "dry-run then real
+    // run" silently imported nothing — the real run saw the plan's stamp,
+    // called the file unchanged, and skipped every turn (measured 2026-11-16).
+    if (prev && prev.keys.length > 0 && stampedBefore.has(item.turn.sourceFile) && cur === prev.hash) {
       unchangedFiles.add(item.turn.sourceFile);
       continue;
     }
@@ -273,7 +308,9 @@ export function planFromTurns(
   // Persist immediately: this function owns the stamps it just computed, and
   // runPlan loads its own copy. Leaving the save to runPlan silently discarded
   // every stamp (measured 2026-11-16: ledger stayed at 9 entries across runs).
-  saveLedger(root, harness, ledger);
+  // The estimate path (stamp=false) leaves the ledger untouched — a refusal or
+  // a dry-run must not leave state that changes the confirmed rerun.
+  if (stamp) saveLedger(root, harness, ledger);
 
   return {
     harness,
@@ -304,6 +341,7 @@ export function planClaudeImport(root: StoreRoot, opts: ImportOptions = {}): Imp
     { files: stats.files, lines: stats.lines, turns: stats.turns },
     opts.rules ?? BUILTIN_RULES,
     existingContentFingerprints(root, opts.project ?? "default"),
+    opts.stamp ?? true,
   );
 }
 
@@ -313,6 +351,8 @@ export interface SummaryImportOptions {
   project?: string;
   projectDir?: string;
   rules?: FilterRule[];
+  /** Stamp the source ledger while planning (default true) — see ImportOptions. */
+  stamp?: boolean;
 }
 
 /**
@@ -334,6 +374,7 @@ export function planSummaryImport(root: StoreRoot, opts: SummaryImportOptions): 
     { files: stats.files, lines: stats.withFrontmatter, turns: memories.length },
     keepAll,
     existingContentFingerprints(root, opts.project ?? "default"),
+    opts.stamp ?? true,
   );
 }
 
@@ -347,6 +388,7 @@ export function planZcodeImport(root: StoreRoot, opts: ZcodeImportOptions): Impo
     { files: 1, lines: stats.messages, turns: stats.turns },
     opts.rules ?? BUILTIN_RULES,
     existingContentFingerprints(root, opts.project ?? "default"),
+    opts.stamp ?? true,
   );
 }
 

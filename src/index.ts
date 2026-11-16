@@ -29,7 +29,8 @@ usage:
   yongyi disconnect <harness>
   yongyi hook <harness> <event>      stdin: hook event JSON (capture, fail-drop)
   yongyi replay --root <rootKey>     rebuild observations index from the append-only log
-  yongyi import claude-code|zcode|summary --root <rootKey> [--project P] [--dry-run] [--batch N]
+  yongyi import claude-code|zcode|summary --root <rootKey> [--project P] [--dry-run] [--batch N] [--profile light|full] [--yes]
+  yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]
   yongyi index --root <rootKey> [--project P]   sync cross-harness memory index
   yongyi deliver --root <rootKey> --project P --file <instructionFile> [--off] [--limit N]
 env:
@@ -115,6 +116,18 @@ if (cmd === "serve") {
   }
   const project = argValue("--project") ?? "default";
   const dryRun = process.argv.includes("--dry-run");
+  // Profile gate (add-harness-memory-import 2.3): `full` is the "不过滤" mode
+  // the spec refuses to run silently — it turns every extracted turn into a
+  // candidate, so on an 84 万-row source it would recreate the lock outage the
+  // whole import design exists to avoid. Unconfirmed, it is refused WITH an
+  // estimate of what it would write; --yes is the explicit confirmation.
+  const profileArg = argValue("--profile") ?? "light";
+  if (profileArg !== "light" && profileArg !== "full") {
+    console.error("--profile must be light (rule-filtered, default) or full (unfiltered, requires --yes)");
+    process.exit(2);
+  }
+  const profile = profileArg as "light" | "full";
+  const yes = process.argv.includes("--yes");
   const batchSize = Number(argValue("--batch") ?? 200);
   const batchPauseMs = Number(argValue("--pause") ?? 200);
   const limitArg = argValue("--limit");
@@ -127,12 +140,47 @@ if (cmd === "serve") {
   const root = new StoreRoot(dataDir(), rootKey);
   import("./connect/import/orchestrator.js")
     .then(async (m) => {
+      const rules = m.rulesForProfile(profile);
+
+      // Full profile without confirmation: refuse with an estimate, computing
+      // it WITHOUT stamping the source ledger (a refusal must leave no state
+      // that changes what the confirmed rerun would do).
+      if (m.fullProfileNeedsConfirmation(profile, yes) && !dryRun) {
+        const est =
+          harness === "summary"
+            ? m.planSummaryImport(root, { memoryRoot, project, stamp: false })
+            : harness === "zcode"
+              ? m.planZcodeImport(root, { dbPath, limit, project, rules, stamp: false })
+              : m.planClaudeImport(root, { projectsDir, project, rules, stamp: false });
+        console.log(
+          JSON.stringify(
+            {
+              refused: "profile full writes every extracted turn — pass --yes to confirm",
+              profile,
+              harness,
+              scanned: est.scanned,
+              filtered: est.filtered,
+              alreadyImported: est.alreadyImported,
+              duplicateContent: est.duplicateContent,
+              estimatedWrites: est.estimatedWrites,
+              hint: "preview with --dry-run, or re-run with --yes to execute",
+            },
+            null,
+            1,
+          ),
+        );
+        console.error(
+          `拒绝：--profile full 不过滤，将全量写入约 ${est.estimatedWrites} 条（扫描 ${est.scanned.turns} 条）。确认执行请显式加 --yes。`,
+        );
+        process.exit(1);
+      }
+
       const plan =
         harness === "summary"
           ? m.planSummaryImport(root, { memoryRoot, project })
           : harness === "zcode"
-            ? m.planZcodeImport(root, { dbPath, limit, project })
-            : m.planClaudeImport(root, { projectsDir, project });
+            ? m.planZcodeImport(root, { dbPath, limit, project, rules })
+            : m.planClaudeImport(root, { projectsDir, project, rules });
 
       if (dryRun) {
         console.log(JSON.stringify(plan, null, 1));
@@ -144,8 +192,8 @@ if (cmd === "serve") {
         harness === "summary"
           ? await m.runSummaryImport(root, project, { memoryRoot, batchSize, batchPauseMs, project })
           : harness === "zcode"
-            ? await m.runZcodeImport(root, project, { dbPath, limit, batchSize, batchPauseMs, project })
-            : await m.runClaudeImport(root, project, { projectsDir, batchSize, batchPauseMs, project });
+            ? await m.runZcodeImport(root, project, { dbPath, limit, batchSize, batchPauseMs, project, rules })
+            : await m.runClaudeImport(root, project, { projectsDir, batchSize, batchPauseMs, project, rules });
       console.log(
         JSON.stringify(
           {
@@ -162,6 +210,33 @@ if (cmd === "serve") {
           1,
         ),
       );
+    })
+    .catch((e: unknown) => fail(e));
+} else if (cmd === "import-retract") {
+  // Take back everything one harness imported, and nothing else.
+  //   yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]
+  //
+  // Why a sibling command instead of `import <harness> --retract`: the import
+  // branch resolves a source, a profile and a plan before it writes anything, and
+  // retract has none of those inputs — bolting it on would make every one of them
+  // optional-in-one-direction and ambiguous. The two acts share a write path
+  // (StoreRoot.retractObservations), which is where the sharing belongs.
+  const rk = argValue("--root");
+  const target = argValue("--harness");
+  if (!rk || !target) {
+    console.error("usage: yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]");
+    console.error("  withdraws every page and observation that harness imported; source files are never touched");
+    process.exit(2);
+  }
+  const retractRoot = new StoreRoot(dataDir(), rk);
+  import("./connect/import/retract.js")
+    .then((m) => {
+      const report = m.retractHarness(retractRoot, {
+        harness: target,
+        dryRun: process.argv.includes("--dry-run"),
+      });
+      console.log(JSON.stringify(report, null, 1));
+      if (report.dryRun) console.error("(dry run — nothing written)");
     })
     .catch((e: unknown) => fail(e));
 } else if (cmd === "index") {
