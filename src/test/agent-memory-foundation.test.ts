@@ -160,9 +160,14 @@ test("filters: /digest meta filter narrows L2+notes; empty intersection is an em
   try {
     const platform = svc.tokens.mint("platform", "*").token;
     const root = svc.rootForKey("d-pk");
-    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[turn][clerk] 报数", metadata: { kind: "turn", memberId: "clerk" } }, body: "报数 body\n" });
+    // NOTE: the fixture kind must NOT be "turn"/"health" — fb07d84's
+    // working-memory filter excludes those from the digest notes lane by
+    // design (platform bookkeeping does not spend the L1 slots), and this
+    // test predates it. The meta-filter mechanism is kind-agnostic;
+    // "briefing" keeps this test about the filter, not about turn pages.
+    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[briefing][clerk] 报数", metadata: { kind: "briefing", memberId: "clerk" } }, body: "报数 body\n" });
     root.writePage("f-team", "notes", "n2", { frontmatter: { type: "note", title: "拍板记录", metadata: { kind: "decision-resolved", memberId: "lead" } }, body: "拍板 body\n" });
-    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:turn`, { headers: json(platform) });
+    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:briefing`, { headers: json(platform) });
     assert.equal(hit.status, 200);
     const hitBody = await hit.json() as { digest: string };
     assert.ok(hitBody.digest.includes("报数"));
