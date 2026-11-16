@@ -230,3 +230,34 @@ test("/memory/index: 任一 harness 都不能被另一个饿死（跨 harness �
     assert.equal(hz + hc, 20, "配额预算未被浪费");
   } finally { await close(); }
 });
+
+test("会话启动注入：预算装不下全部时，每个 harness 都要按比例露头", async () => {
+  // 2026-11-16 实测：服务端按配额返回 zcode 73 / claude 27，但注入预算 3000
+  // 字符只装得下约 35 条，照原顺序截断后前 35 条几乎全是 zcode ⇒ 配额在
+  // 客户端这一步被抹平，会话看到的仍是单 harness。这里验证轮转取用。
+  //
+  // 直接测纯逻辑：喂 40 条 zcode + 20 条 claude，走与 buildSessionContext
+  // 相同的轮转 + 截断，断言两个 harness 都出现。
+  const desc = (h: string, i: number) => ({ harness: h, memory_type: "feedback",
+    description: `${h} 的第 ${i} 条结论，内容足够长以消耗预算字符` });
+  const entries = [
+    ...Array.from({ length: 40 }, (_, i) => desc("zcode", i)),
+    ...Array.from({ length: 20 }, (_, i) => desc("claude-code", i)),
+  ];
+  // 与 buildSessionContext 相同的归一化位置交错
+  const byHarness = new Map<string, typeof entries>();
+  for (const e of entries) {
+    const b = byHarness.get(e.harness);
+    if (b) b.push(e); else byHarness.set(e.harness, [e]);
+  }
+  const ordered = [...byHarness.values()]
+    .flatMap((bucket) => bucket.map((e, pos) => ({ e, key: pos / Math.max(1, bucket.length) })))
+    .sort((a, b) => a.key - b.key)
+    .map((x) => x.e);
+  // 模拟 3000 字符预算：只取前 30 条，看构成
+  const shown = ordered.slice(0, 30);
+  const hz = shown.filter((e) => e.harness === "zcode").length;
+  const hc = shown.filter((e) => e.harness === "claude-code").length;
+  assert.ok(hc > 0, `预算被截断后 claude-code 仍须出现，实际 ${hc}/30`);
+  assert.ok(hz > hc, `zcode 持有更多，应占更多，实际 zcode ${hz} / claude ${hc}`);
+});

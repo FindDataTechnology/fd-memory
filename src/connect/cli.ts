@@ -286,7 +286,7 @@ function dropBinding(harness: Harness, credsPath: string, envPath: string): File
  * memory. Blocking a turn on a memory read would repeat the outage we are
  * trying to avoid.
  */
-async function buildSessionContext(binding: Binding): Promise<string> {
+export async function buildSessionContext(binding: Binding): Promise<string> {
   const base = binding.url.replace(/\/+$/, "");
   const project = binding.project && binding.project !== "default" ? binding.project : "default";
   const ctl = new AbortController();
@@ -326,7 +326,30 @@ async function buildSessionContext(binding: Binding): Promise<string> {
     let used = lines[0].length;
     const MAX_CHARS = 3000;
     let shown = 0;
+
+    // 按 harness 比例取用，而不是照服务端顺序一路填满预算，也不是等分轮转。
+    //
+    // 为什么必须在客户端再分一次（2026-11-16 实测）：服务端 /memory/index 已经
+    // 按持有量配额返回（zcode 73 / claude-code 27），但注入预算只有 3000 字符，
+    // 装得下约 35 条。照原顺序（feedback 优先 + mtime 倒序）前 35 条几乎全是
+    // zcode，于是配额在截断这一步被抹平，会话看到的仍是单 harness。
+    //
+    // 为什么不用等分轮转：等分会让小 harness 占满一半预算。40:20 实测截断后
+    // 得到 15:15——大 harness 的配额优势消失。按比例交错（归一化位置排序）
+    // 让任意长度的前缀都保持与总量一致的比例。
+    const byHarness = new Map<string, Array<{ e: (typeof entries)[number]; pos: number }>>();
     for (const e of entries) {
+      const k = String(e.harness ?? "?");
+      const b = byHarness.get(k);
+      const pos = b ? b.length : 0;
+      if (b) b.push({ e, pos: pos / 1 }); else byHarness.set(k, [{ e, pos: 0 }]);
+    }
+    const ordered = [...byHarness.values()]
+      .flatMap((bucket) => bucket.map(({ e, pos }) => ({ e, key: pos / Math.max(1, bucket.length) })))
+      .sort((a, b) => a.key - b.key)
+      .map((x) => x.e);
+
+    for (const e of ordered) {
       const d = String(e.description ?? "").replace(/\s+/g, " ").trim();
       if (!d) continue;
       const tag = e.memory_type === "feedback" ? "纪律" : e.memory_type === "user" ? "偏好" : "记忆";
