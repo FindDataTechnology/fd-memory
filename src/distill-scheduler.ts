@@ -97,12 +97,13 @@ const DEFAULT_MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1
 // The /distill request budget on THIS side. The distiller answers before its own
 // DISTILL_LLM_DEADLINE_S, which must stay below this — otherwise the caller
 // aborts first and we are back to "the other side cut us off and we recorded
-// nothing". Measured 2026-11-13: one engine call takes 47-97 s with a 474-char
-// extraction prompt and the tail goes past 150 s (a 2-item u-root chunk died at
-// distill_deadline_exceeded), so the pair was raised to 300 s (distiller) /
-// 330 s (here) AFTER the call budget was pinned to one call per request — with
-// several calls per request a longer deadline would just hold the thread longer.
-const DEFAULT_SIDECAR_TIMEOUT_MS = 180_000;
+// nothing".
+//
+// 2026-11-17 修一个真实错配：注释一直写 330s(here)/300s(distiller)，但代码是
+// 180s —— 调用方比被调方先放弃 120 秒。实测 28 个 /distill 里 6 个超时（21%），
+// 而 distiller 侧记的是 TimeoutError：它还没到自己的 300s 就被我们掐了。
+// 现改为 distiller 600s / here 660s，保持注释承诺的 60 秒余量。
+const DEFAULT_SIDECAR_TIMEOUT_MS = 660_000;
 
 // Root-family gate. This used to be the whole decision: pack roots always
 // distilled, person roots distilled unless FD_MEMORY_DISTILL_U=0 — which made the
@@ -513,7 +514,19 @@ export class DistillScheduler {
       const state = root.db.getDistillState(project);
       if (state && state.next_attempt_at > this.now()) return;
       const maxItems = this.maxItems();
-      const obs = root.db.observationsAfter(project, state?.obs_cursor ?? 0, maxItems) as unknown as (ObservationRow & { rid: number })[];
+      // u/ 根不吃 observations（2026-11-17 修空转）：代码注释一直写着「person
+      // root 的原材料是 note，observations 在那儿根本不存在」，但实测这个 root
+      // 有 3,542 条 —— 历史导入（import:zcode / import:summary）留下的，而
+      // obs_cursor 从没推进过（一直是 0）。于是每次 stop 事件触发的蒸馏都从 0
+      // 重取那批流水、调一次 LLM、产出 0 page：五小时内 9 次纯空转，白烧预算
+      // 还占着 sidecar。
+      //
+      // 判据用 root 家族而不是「obs_cursor 是不是 0」：后者会把「真的还没消费
+      // 过 observation 的 d/ 根」也误伤。u/ 根只走 note + handoff。
+      const isPersonRoot = rootKey.startsWith("u-");
+      const obs = isPersonRoot
+        ? []
+        : (root.db.observationsAfter(project, state?.obs_cursor ?? 0, maxItems) as unknown as (ObservationRow & { rid: number })[]);
       let handoffs: HandoffRow[] = [];
       try {
         handoffs = root.db
@@ -572,7 +585,12 @@ export class DistillScheduler {
         // silently DROPS unknown events (probe: "note-write" batches → 0 LLM
         // calls, no error). Handoffs and notes are chunked per-stream so cursors
         // advance cleanly; the daily budget is billed once for the whole run.
-        const CHUNK = 2;
+        // CHUNK 可配置（2026-11-17）：2 是早期「2 条/批、800 字摘要」下测出的
+        // 安全值，但 note 类正文远长于 handoff，实测 28 个 /distill 请求里 6 个
+        // 撞 300s sidecar deadline（21%）——超时那批内容直接丢失，cursor 虽推进
+        // 但有损。降到 1 让每批更快更稳；代价是调用数翻倍（26 批 → 51 批），
+        // 在 500 万日预算下不构成问题。
+        const CHUNK = Math.max(1, Number(process.env.FD_MEMORY_DISTILL_CHUNK ?? 1) || 1);
         const CAP = 800;
         const cap = (s: string) => String(s ?? "").replace(/\s+/g, " ").slice(0, CAP);
         let spentTotal = 0;
