@@ -65,7 +65,15 @@ const FALLBACK_BUDGET_RESERVE = 100_000;
 // The extractor's completion ceiling, mirrored from distiller/engine.py
 // (CodingMemoryExtractor(max_tokens=6000)). Only used to DETECT truncation; the
 // value itself is the engine's, so the two must move together.
-const EXTRACT_MAX_TOKENS = Number(process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 6000) || 6000;
+// Extractor 的 completion 上限。两侧必须一致：distiller/engine.py 用它设
+// CodingMemoryExtractor(max_tokens=…)，这里用它 DETECT 截断。不一致会出现
+// 「明明截断了却判不出」或反过来「没截断却判截断」。
+//
+// 2026-11-17 调高 6000 → 16000：note 类内容比 handoff 长得多，实测 31 条
+// note 分块后仍有多批撞穿 6000，被整批跳过、cursor 不动 —— 表面上「预算
+// 充足却不推进」。天花板是自设护栏，撞上就抬高，不是等它。
+const EXTRACT_MAX_TOKENS =
+  Number(process.env.MEMORY_EXTRACT_MAX_TOKENS ?? process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 16000) || 16000;
 const EXTRACT_TRUNCATED_MAX_GAPS = Math.max(1, Number(process.env.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
 // Step 2 of fix-distill-extract-truncation. Measured 2/2 runs at exactly the
 // 6,000 ceiling with 120 items → 4 pages, so a truncated batch is not a rare
