@@ -153,6 +153,14 @@ export class RootDb {
     // Application Support 下，符合前提。
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
+    // NOT setting cache_size/mmap_size here (2026-11-18, tried and reverted).
+    // Hypothesis was that SQLite's default 2MB page cache explained the
+    // "first healthz after a while takes 24s, then 38ms" shape. Measured it:
+    // running the same FTS query with and without `cache_size=-16000` +
+    // `mmap_size=128MB` gave 0.01–0.03s both ways — no difference outside the
+    // noise. The cold read is the OS evicting pages (30% free memory, the
+    // 2961M compressor was active), not SQLite's buffer pool. Left here as a
+    // recorded negative result so the next person does not try it again.
     this.migrate();
   }
 
