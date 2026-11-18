@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-function sqlite(db, sql) {
+function sqlite(db: string, sql: string) {
   return execFileSync("sqlite3", [db, sql], { encoding: "utf8" }).trim();
 }
 
@@ -35,8 +35,8 @@ function fixture() {
     CREATE TABLE pages (path TEXT PRIMARY KEY, project TEXT, type TEXT, title TEXT, body TEXT, updated_at TEXT);
     CREATE VIRTUAL TABLE pages_fts USING fts5(title, body, path UNINDEXED, tokenize='trigram');
   `);
-  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
-  const row = (i, type, msAgo) =>
+  const iso = (msAgo: number) => new Date(Date.now() - msAgo).toISOString();
+  const row = (i: number, type: string, msAgo: number) =>
     `INSERT INTO pages VALUES ('p${i}.md','default','${type}','t','b','${iso(msAgo)}');`;
   // 3 observation pages: two fresh (<1 day), one old (2 days).
   const stmts = [

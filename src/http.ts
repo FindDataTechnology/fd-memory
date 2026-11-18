@@ -17,6 +17,7 @@ import { handlePortal } from "./portal-server.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
+import { startStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
 import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
@@ -37,6 +38,7 @@ export class Service {
   readonly ingest: CaptureIngest;
   readonly distill: DistillScheduler;
   private keepwarm: { stop: () => void } | null = null;
+  private stallWatchdog: StallWatchdog | null = null;
   private roots = new Map<string, StoreRoot>();
 
   constructor(readonly opts: ServiceOptions) {
@@ -116,6 +118,7 @@ export class Service {
     });
     const host = this.opts.host ?? "127.0.0.1";
     server.listen(this.opts.port, host);
+    this.stallWatchdog = startStallWatchdog();
     this.distill.start();
     this.keepwarm = startEmbedKeepwarm({ env: process.env });
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
@@ -194,7 +197,16 @@ export class Service {
 
     if (path === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ status: "ok", service: "fd-memory" }));
+      // `stalls` is the event-loop watchdog's counter (2026-11-18). A probe
+      // that times out learns nothing on its own — this tells it whether the
+      // process has been blocking its loop, so "my request took 15s" can be
+      // distinguished from "the process stalled 15s" without reading logs.
+      // Omitted entirely when the watchdog is absent, so the response body is
+      // byte-identical to before for any caller that does not expect it.
+      const stalls = this.stallWatchdog?.stalls();
+      return void res.end(JSON.stringify(
+        stalls === undefined ? { status: "ok", service: "fd-memory" } : { status: "ok", service: "fd-memory", stalls },
+      ));
     }
 
     // Portal (add-yongyi-complete-solution): static assets carry zero data, and
