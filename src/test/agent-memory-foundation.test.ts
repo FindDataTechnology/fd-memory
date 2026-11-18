@@ -160,9 +160,15 @@ test("filters: /digest meta filter narrows L2+notes; empty intersection is an em
   try {
     const platform = svc.tokens.mint("platform", "*").token;
     const root = svc.rootForKey("d-pk");
-    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[turn][clerk] 报数", metadata: { kind: "turn", memberId: "clerk" } }, body: "报数 body\n" });
+    // The filter's subject must be a kind the digest actually renders. `turn`
+    // was used here historically, but the digest now suppresses `kind: turn`
+    // and `kind: health` as platform bookkeeping (FD_MEMORY_DIGEST_KEEP_TURN_PAGES,
+    // 2026-11-18) — so a filter on `turn` matches a page the renderer then
+    // throws away, and this test read that as "the filter broke". What the test
+    // is about is narrowing, not suppression, so use an ordinary note kind.
+    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[clerk-note][clerk] 报数", metadata: { kind: "clerk-note", memberId: "clerk" } }, body: "报数 body\n" });
     root.writePage("f-team", "notes", "n2", { frontmatter: { type: "note", title: "拍板记录", metadata: { kind: "decision-resolved", memberId: "lead" } }, body: "拍板 body\n" });
-    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:turn`, { headers: json(platform) });
+    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:clerk-note`, { headers: json(platform) });
     assert.equal(hit.status, 200);
     const hitBody = await hit.json() as { digest: string };
     assert.ok(hitBody.digest.includes("报数"));

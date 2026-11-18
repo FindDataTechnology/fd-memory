@@ -648,7 +648,15 @@ export class Service {
       if (fp.filter) noteMetaFilter();
       const filterProjects = recallProjects;
       const allowedPaths = fp.filter ? dRoot.db.filteredPagePaths(filterProjects, fp.filter) : null;
-      const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+      // Candidate id → wiki path. The kind→directory map must cover EVERY kind
+      // hybridCandidates can return (digest.ts declares `kind: fact |
+      // experience | note | observation`), not just the two L2 ones: notes live
+      // under `notes/`, and mapping them to `experiences/` made every note miss
+      // the allowed-paths set, so a `meta=` filter silently emptied the digest
+      // of notes that DID match. Found 2026-11-18 via the meta-filter test,
+      // which had been red since the filter landed.
+      const kindDir = (kind: string) => (kind === "fact" ? "facts" : kind === "note" ? "notes" : kind === "observation" ? "observations" : kind === "handoff" ? "handoffs" : kind === "reference" ? "references" : "experiences");
+      const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${kindDir(c.kind)}/${c.id}.md`;
       const filteredCandidates = allowedPaths
         ? candidates.filter((c) => allowedPaths.has(relOf(c, project)) || allowedPaths.has(relOf(c, "shared")))
         : candidates;

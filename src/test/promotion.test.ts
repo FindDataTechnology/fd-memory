@@ -91,7 +91,13 @@ test("promotion lane: lands a proposal, NEVER touches the page tier; human slots
   const tokens = new TokenStore(join(data, "tokens.db"), "p");
   const root = new SR2(join(data, "owners"), "u-tester");
   const roots = new Map([["u-tester", root]]);
+  // Order matters below (`props[0]` must be f1) and the lane ranks candidates by
+  // `ORDER BY updated_at`. Two writes in the same millisecond make that order a
+  // coin flip — this test was flaky at ~40% on the previous build for exactly
+  // that reason, which is a defect in the test, not in the lane: real writes
+  // are milliseconds apart and the lane's tie-break is not contractual.
   root.writePage("default", "facts", "f1", newPage("fact", "毛利率口径", "按扣除退货后口径", { tags: ["财务"] }));
+  await new Promise((r) => setTimeout(r, 5));
   root.writePage("default", "facts", "f2", newPage("fact", "人工草稿", "人已看过", { tier: "draft", tier_origin: "human" }));
   const calls: string[] = [];
   const sched = new DistillScheduler({

@@ -285,9 +285,18 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         // Newest first is the useful order for "is one addressed to me, and how
         // recent is it" — the old query sorted ascending and the caller read the
         // whole list anyway.
-        const all = root.db.openHandoffs(r.projects)
-          .slice()
-          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+        //
+        // `reverse()`, not a comparator, and that matters: `created_at` is
+        // millisecond ISO text, so handoffs opened in one tick (a fleet round, a
+        // batch import, a 30-iteration loop) compare EQUAL. `openHandoffs`
+        // returns `ORDER BY created_at, rowid ASC`, so reversing yields
+        // created_at DESC *and* rowid DESC — "later is newer" holds for ties too.
+        // Sorting by created_at alone is stable, which preserves the ties in
+        // ASCENDING rowid order, i.e. oldest-first among same-millisecond rows:
+        // that is precisely the ~1-in-6 flake seen 2026-11-18 in
+        // `mcp tools: handoff list is capped, newest-first`.
+        // (Ordering by `id` would not help — ids are randomUUID.)
+        const all = root.db.openHandoffs(r.projects).slice().reverse();
         let summariesTruncated = 0;
         const handoffs = all.slice(0, cap).map((row) => {
           const gist = clip(row.summary, HANDOFF_SUMMARY_CHARS);

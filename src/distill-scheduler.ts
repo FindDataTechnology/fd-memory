@@ -72,8 +72,14 @@ const FALLBACK_BUDGET_RESERVE = 100_000;
 // 2026-11-17 调高 6000 → 16000：note 类内容比 handoff 长得多，实测 31 条
 // note 分块后仍有多批撞穿 6000，被整批跳过、cursor 不动 —— 表面上「预算
 // 充足却不推进」。天花板是自设护栏，撞上就抬高，不是等它。
-const EXTRACT_MAX_TOKENS =
+export const EXTRACT_MAX_TOKENS =
   Number(process.env.MEMORY_EXTRACT_MAX_TOKENS ?? process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 16000) || 16000;
+// Notes-per-distill-call. Exported so tests assert against the knob instead of a
+// literal: it was 2, lowered to 1 on 2026-11-17 (a bigger chunk risked the 300s
+// sidecar deadline, and a timed-out batch loses its content), and two tests kept
+// asserting "4 notes distill as 2-item chunks" — green logic, red test, no
+// defect. Anything that pins a tunable's VALUE in a test will rot the same way.
+export const distillChunk = (): number => Math.max(1, Number(process.env.FD_MEMORY_DISTILL_CHUNK ?? 1) || 1);
 const EXTRACT_TRUNCATED_MAX_GAPS = Math.max(1, Number(process.env.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
 // Step 2 of fix-distill-extract-truncation. Measured 2/2 runs at exactly the
 // 6,000 ceiling with 120 items → 4 pages, so a truncated batch is not a rare
@@ -611,7 +617,7 @@ export class DistillScheduler {
         // 撞 300s sidecar deadline（21%）——超时那批内容直接丢失，cursor 虽推进
         // 但有损。降到 1 让每批更快更稳；代价是调用数翻倍（26 批 → 51 批），
         // 在 500 万日预算下不构成问题。
-        const CHUNK = Math.max(1, Number(process.env.FD_MEMORY_DISTILL_CHUNK ?? 1) || 1);
+        const CHUNK = distillChunk();
         const CAP = 800;
         const cap = (s: string) => String(s ?? "").replace(/\s+/g, " ").slice(0, CAP);
         let spentTotal = 0;

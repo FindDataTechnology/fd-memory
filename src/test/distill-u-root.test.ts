@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TokenStore } from "../auth.js";
 import { StoreRoot } from "../store.js";
-import { DistillScheduler } from "../distill-scheduler.js";
+import { DistillScheduler, EXTRACT_MAX_TOKENS, distillChunk } from "../distill-scheduler.js";
 import { buildTools } from "../mcp.js";
 
 function tmpData(): string {
@@ -71,8 +71,11 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
     }
     await fx.sched.distillNow("u-alice@test", "default");
     const distillCalls = () => sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
-    // chunked contract (production-probe tuned): 2 items per engine call
-    assert.equal(distillCalls().length, 2, "4 notes distill as 2-item chunks");
+    // chunked contract (production-probe tuned): `distillChunk()` items per
+    // engine call — read the knob, don't hardcode 2 (it was lowered to 1 on
+    // 2026-11-17 for the 300s sidecar deadline; this assertion said "2" and
+    // went red while the scheduler was behaving exactly as designed).
+    assert.equal(distillCalls().length, Math.ceil(4 / distillChunk()), `4 notes distill as ${distillChunk()}-item chunks`);
     const allNoteItems = distillCalls().flatMap((c) => ((c.body as { items: Array<{ tool?: string; summary: string }> }).items).filter((i) => i.tool === "memory_write_page"));
     assert.equal(allNoteItems.length, 4, "all four notes entered as observation-shaped items");
     assert.ok(allNoteItems[0].summary.startsWith("偏好 1："), "summary = title + body excerpt");
@@ -80,7 +83,7 @@ test("u-root: fallback scan discovers the project, notes ride as observation ite
     // (notesAfter), the same surface the distiller reads, so assert against
     // THAT view; the FTS index samples updated_at separately (1ms drift).
     const l2 = root.db.recentPages(50, ["default"]).filter((p) => p.type === "experience" || p.type === "fact");
-    assert.equal(l2.length, 2, "one engine page per chunk");
+    assert.equal(l2.length, Math.ceil(4 / distillChunk()), "one engine page per chunk");
     const noteRows = root.db.notesAfter("default", "", 120);
     const lastUpdatedAt = noteRows.map((r) => r.updated_at).sort().at(-1)!;
     const st = root.db.getDistillState("default")!;
@@ -409,7 +412,7 @@ test("u-root: a truncated extract now holds the cursor and retries instead of si
         facts: [],
         experiences: [{ id: `exp_${Math.random().toString(36).slice(2, 8)}`, engine: "engine:test/1", task: "触顶批次", search_keys: [], solution: "仍应落库", sources: [], supersedes: [] }],
         cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 24000, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -442,9 +445,19 @@ test("u-root: a truncated extract now holds the cursor and retries instead of si
     const after = root.db.notesAfter("default", "", 120).map((r) => r.path).sort();
     assert.deepEqual(after, before, "every note is still pending");
 
-    // And the split was actually attempted: >1 engine call for one 2-item chunk.
+    // The split is attempted only while a chunk has something to split. With
+    // `distillChunk()` at 1 every chunk is a single item, and a single item has
+    // no halves — `callWithSplit` returns unresolved immediately instead of
+    // firing calls that cannot help. So the invariant is not "more calls than
+    // chunks"; it is: the run stops after the FIRST truncated chunk and never
+    // burns the rest of the material on calls known to truncate too.
+    // (This assertion previously read `>= 3` and encoded "4 notes = 2 chunks of
+    // 2, split the first" — true at CHUNK=2, wrong after it was lowered to 1.)
     const distillCalls = sidecar.calls.filter((c) => String(c.url).endsWith("/distill"));
-    assert.ok(distillCalls.length >= 3, `expected the chunk to be split and retried, saw ${distillCalls.length} call(s)`);
+    const chunks = Math.ceil(4 / distillChunk());
+    const expectedCalls = distillChunk() > 1 ? chunks + 1 : 1; // one split, or none possible
+    assert.equal(distillCalls.length, expectedCalls,
+      `expected ${expectedCalls} engine call(s) for ${chunks} chunk(s) at chunk size ${distillChunk()}, saw ${distillCalls.length}`);
   } finally {
     rmSync(data, { recursive: true, force: true });
   }
@@ -491,7 +504,7 @@ test("u-root: a batch that never stops truncating is stepped over after the gap 
       if (String(url).endsWith("/embed")) return { ok: true, status: 200, json: async () => ({ vectors: [[0.1, 0.2]], model: "m-test", tokens: 3, errors: [] }) };
       return { ok: true, status: 200, json: async () => ({
         facts: [], experiences: [], cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 24000, errors: [],
       }) };
     }) as unknown as typeof fetch,

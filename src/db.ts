@@ -642,7 +642,16 @@ export class RootDb {
   openHandoffs(projects: string[] | null = null): HandoffRow[] {
     const pf = projectFilterSql(projects, "project");
     return this.db
-      .prepare(`SELECT * FROM handoffs WHERE state='open'${pf.clause} ORDER BY created_at`)
+      // Tie-break on `rowid`, NOT on `id`: handoff ids are randomUUID(), so
+      // ordering by id would make the result deterministic without making it
+      // newest-first — it would just always be wrong in the same way. `rowid`
+      // is SQLite's insertion counter, which is exactly "later is newer".
+      // The tie is real: `created_at` is millisecond ISO text, so anyone opening
+      // several handoffs in one tick (a fleet round, a batch import, a 30-iteration
+      // loop in a test) gets rows whose only declared ordering key is equal, and
+      // SQLite may then return them in any order. Observed 2026-11-18 as a
+      // ~1-in-6 flake in `mcp tools: handoff list is capped, newest-first`.
+      .prepare(`SELECT * FROM handoffs WHERE state='open'${pf.clause} ORDER BY created_at, rowid`)
       .all(...pf.args) as unknown as HandoffRow[];
   }
 
