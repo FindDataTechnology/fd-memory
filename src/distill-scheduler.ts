@@ -287,7 +287,7 @@ export class DistillScheduler {
     // Set FD_MEMORY_EMBED=off (or 0/false) when the lane has no serving model.
     // Unset/on keeps the current behaviour — this changes nothing where a real
     // embedding model exists.
-    if (EMBED_DISABLED) {
+    if (embedDisabled(this.opts.env ?? process.env)) {
       if (!this.embedDisabledLogged) {
         this.embedDisabledLogged = true;
         this.log.warn("[vector] embed lane disabled (FD_MEMORY_EMBED=off) — recall runs keyword-only by configuration, not by failure");
@@ -951,7 +951,9 @@ export function embedDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = String(env.FD_MEMORY_EMBED ?? "").trim().toLowerCase();
   return v === "off" || v === "0" || v === "false" || v === "no";
 }
-const EMBED_DISABLED = embedDisabled();
+// (evaluated per call via embedDisabled(); a module-level constant froze the
+// value at import time, which made the switch untestable and — more to the
+// point — invisible to any seam that was added after it.)
 
 // Standalone sidecar /embed call (extracted from the scheduler by
 // add-cluster-digest-injection — the /digest platform-seam face shares the
@@ -1028,6 +1030,15 @@ export async function hybridCandidates(opts: {
     ? [...new Set(opts.projects)]
     : project === "shared" ? [project] : [project, "shared"];
   const keyword = distillCandidates(root, projects, queryFor);
+  // Vector lane kill switch (2026-11-18). `EMBED_DISABLED` was only honoured
+  // inside the scheduler, so every /digest and /memory read still reached for
+  // the embed lane and ate a 404 round-trip before falling back to keywords —
+  // the env var looked set and did nothing on the read path. Measured: the
+  // gateway has no embedding model at all ("Qwen/Qwen3-Embedding-8B … not
+  // supported by any configured account"), so the call can never succeed here.
+  // Gate INSIDE hybridCandidates, not at each call site: it is the one seam
+  // every read path goes through, so a new caller cannot silently re-open it.
+  if (embedDisabled()) return keyword;
   // An empty query has no vector to compute (2026-10-29): the sidecar rejects
   // blank input with 400 texts_required, and the caller turned that into
   // "vector lane unavailable — keyword-only recall" — an input-validation
