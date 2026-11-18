@@ -11,7 +11,7 @@
 import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { RootDb, HandoffRow, ObservationRow, observationDigest } from "./db.js";
 import { namespaceParts } from "./auth.js";
 import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
@@ -77,6 +77,12 @@ export class StoreRoot {
   readonly wikiDir: string;
   readonly db: RootDb;
   private gitTimer: NodeJS.Timeout | null = null;
+  /** Serialises git add/commit pairs — two overlapping runs race on index.lock. */
+  private snapshotInFlight = false;
+  /** When the last snapshot completed; drives the throttle window. */
+  private lastSnapshotAt = 0;
+  /** Most recent label awaiting a snapshot ("" means "already captured"). */
+  private pendingSnapshotLabel: string | null = null;
 
   constructor(dataDir: string, rootKey: string) {
     this.rootDir = join(dataDir, "owners", rootKey);
@@ -108,18 +114,68 @@ export class StoreRoot {
     }
   }
 
+  /**
+   * Wiki snapshot to git — ASYNC and throttled (2026-11-18 root cause).
+   *
+   * The bug this replaces: every `writePage` scheduled a 500ms timer that ran
+   * `execFileSync("git", ["add","-A"])` + `execFileSync("git", ["commit"])` ON
+   * THE EVENT LOOP. Measured: the wiki's `.git` was 504MB with **16,655
+   * commits**, and one `git add -A` took 0.13–0.24s when the machine was idle —
+   * far worse under load. `/observe` runs ~9×/min, so the loop was being
+   * blocked continuously. The stall watchdog caught 2.4 / 2.6 / 4.3 / 4.5 /
+   * 6.7 / 8.8 / 9.0-second stalls, every one labelled `POST /observe`.
+   *
+   * Why it took fifteen rounds to find: every hypothesis pointed at I/O,
+   * slow queries, or connections — and SQLite queries genuinely measured
+   * 0.01–0.03s. The cost was never the disk; it was walking a repo index that
+   * had grown to sixteen thousand commits.
+   *
+   * Two changes, both needed:
+   *  · `execFile` instead of `execFileSync` — the git work moves off the loop.
+   *  · THROTTLE_MS between commits — one commit per page was the actual source
+   *     of the growth. A snapshot is a recovery aid, not a per-write guarantee,
+   *     so batching is the right trade.
+   *
+   * `inFlight` serialises runs: two overlapping `git add`/`commit` pairs race
+   * on `index.lock`, and a failed pair was silently swallowed before.
+   */
+  private static readonly SNAPSHOT_DEBOUNCE_MS = 500;
+  private static readonly SNAPSHOT_THROTTLE_MS = 30_000;
+
   snapshotSoon(label: string): void {
-    if (this.gitTimer) return;
+    this.pendingSnapshotLabel = label;
+    if (this.gitTimer || this.snapshotInFlight) return;
+    // If a snapshot ran recently, wait out the remainder of the throttle rather
+    // than dropping the request: the last write before a quiet period must
+    // still land, otherwise the git history silently stops at the last busy
+    // moment.
+    const since = Date.now() - this.lastSnapshotAt;
+    const wait = Math.max(StoreRoot.SNAPSHOT_DEBOUNCE_MS, StoreRoot.SNAPSHOT_THROTTLE_MS - since);
     this.gitTimer = setTimeout(() => {
       this.gitTimer = null;
-      if (!this.gitAvailable) return;
-      try {
-        execFileSync("git", ["-C", this.wikiDir, "add", "-A"], { stdio: "ignore" });
-        execFileSync("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { stdio: "ignore" });
-      } catch {
-        /* git snapshot is best-effort; wiki writes are already durable */
+      this.runSnapshot();
+    }, wait);
+    this.gitTimer.unref?.();
+  }
+
+  private runSnapshot(): void {
+    if (this.snapshotInFlight || !this.gitAvailable) return;
+    this.snapshotInFlight = true;
+    const label = this.pendingSnapshotLabel ?? "snapshot";
+    const done = () => {
+      this.snapshotInFlight = false;
+      this.lastSnapshotAt = Date.now();
+      // A write may have arrived while this run was in flight; schedule once
+      // more so the final state is captured rather than lost.
+      if (this.pendingSnapshotLabel !== null && this.pendingSnapshotLabel !== label) {
+        this.pendingSnapshotLabel = null;
+        this.snapshotSoon("");
       }
-    }, 500);
+    };
+    execFile("git", ["-C", this.wikiDir, "add", "-A"], { timeout: 120_000 }, (err) => {
+      if (err) return done(); // best-effort: wiki writes are already durable
+      execFile("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { timeout: 120_000 }, () => done());
+    });
   }
 
   // projectDir: the project's wiki subtree (persons may carry p/<name>, d/
