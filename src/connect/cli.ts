@@ -2,7 +2,8 @@
 // (add-yongyi-complete-solution, tasks 3.1–3.7). index.ts dispatches here.
 
 import { homedir } from "node:os";
-import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { rootKeyForRef } from "../auth.js";
 import {
   applyClaudeCode,
@@ -416,6 +417,83 @@ function dropBinding(harness: Harness, credsPath: string, envPath: string): File
  * memory. Blocking a turn on a memory read would repeat the outage we are
  * trying to avoid.
  */
+/**
+ * Last-resort memory injection when the service cannot answer (2026-11-19).
+ *
+ * Why this exists: `buildSessionContext` used to return "" on any failure, so a
+ * down service meant a session started with NO memory — and on this machine the
+ * service is down a lot (31 concurrent sessions, 60MB free RAM, load 24-37).
+ * That turned "memory is unavailable" into "memory is absent", which is the one
+ * thing a memory system must not do.
+ *
+ * The index pages are plain markdown under
+ *   <data>/owners/<root>/wiki/<project>/memory-index/*.md
+ * each carrying frontmatter with `metadata.harness` / `metadata.memory_type`
+ * and a `title`. Reading them directly needs no database, no HTTP, and no
+ * token — so it works exactly when the service does not.
+ *
+ * Deliberately degraded in three ways, and each is honest about itself:
+ *   · no per-harness quota balancing — newest-first only
+ *   · no `total` count, so no "还有 N 条未列出" line
+ *   · bounded by the same 3000-char budget, with a marker saying it is degraded
+ *
+ * The marker matters: silently serving a thinner index would look identical to
+ * a healthy injection, and the reader would never learn the service was down.
+ */
+export function readIndexFromDisk(project: string, binding: Binding, maxChars = 3000): string {
+  try {
+    // The binding carries `namespace` ("u/<user>"), and the on-disk root key is
+    // its sanitized form ("u-<user>"). rootKeyForRef is the single definition of
+    // that mapping, so use it rather than rebuilding the string here.
+    const rootKey = rootKeyForRef(binding.namespace ?? "");
+    if (!rootKey) return "";
+    const dataDir = process.env.FD_MEMORY_DATA;
+    if (!dataDir) return "";
+    const dir = join(dataDir, "owners", rootKey, "wiki", project, "memory-index");
+    if (!existsSync(dir)) return "";
+
+    const files = readdirSync(dir).filter((f) => f.endsWith(".md"));
+    if (files.length === 0) return "";
+
+    // Newest first by mtime — the same ordering the service uses, minus the
+    // per-harness quota.
+    const rows = files
+      .map((f) => {
+        const p = join(dir, f);
+        try { return { p, f, mtime: statSync(p).mtimeMs }; } catch { return null; }
+      })
+      .filter((r): r is { p: string; f: string; mtime: number } => r !== null)
+      .sort((a, b) => b.mtime - a.mtime);
+
+    const lines: string[] = [
+      "【永忆 · 跨 harness 记忆】（服务不可达，以下直接读自本地索引 —— 内容可能比常态少）",
+    ];
+    let used = lines[0].length;
+    let shown = 0;
+    for (const row of rows) {
+      if (used >= maxChars) break;
+      let raw: string;
+      try { raw = readFileSync(row.p, "utf8"); } catch { continue; }
+      const title = /^title:\s*(.+)$/m.exec(raw)?.[1]?.trim();
+      if (!title) continue;
+      const harness = /^\s+harness:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "";
+      const kind = /^\s+memory_type:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "";
+      const line = `- 〔${kind || "记忆"}${harness ? `·${harness}` : ""}〕${title}`;
+      if (used + line.length + 1 > maxChars) break;
+      lines.push(line);
+      used += line.length + 1;
+      shown += 1;
+    }
+    if (shown === 0) return "";
+    lines.push("（服务恢复后本行消失；本轮学到新结论仍可 memory_write_page 落页。）");
+    return lines.join("\n");
+  } catch {
+    // Even the fallback can fail (permissions, corrupt frontmatter). Returning
+    // "" here is correct — a broken fallback must not block the session start.
+    return "";
+  }
+}
+
 export async function buildSessionContext(binding: Binding): Promise<string> {
   const base = binding.url.replace(/\/+$/, "");
   const project = binding.project && binding.project !== "default" ? binding.project : "default";
@@ -444,7 +522,7 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
       headers: { authorization: "Bearer " + binding.token },
       signal: ctl.signal,
     });
-    if (!res.ok) return "";
+    if (!res.ok) return readIndexFromDisk(project, binding);
     const doc = (await res.json()) as {
       entries?: Array<{ harness?: string; memory_type?: string; description?: string }>;
       total?: number;
@@ -495,7 +573,12 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     lines.push("本轮学到新结论时用 memory_write_page 落页；收尾时可写 memory_handoff_begin 交接。");
     return lines.join("\n");
   } catch {
-    return "";
+    // The service is unreachable, timed out, or answered garbage. Falling back
+    // to "" means the session starts with no memory at all — which is what used
+    // to happen, and it is the wrong default: the index pages are plain
+    // markdown on local disk, so a dead service does not actually make them
+    // unreadable (2026-11-19).
+    return readIndexFromDisk(project, binding);
   } finally {
     clearTimeout(timer);
   }
