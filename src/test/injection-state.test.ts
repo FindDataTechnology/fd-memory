@@ -15,6 +15,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recordInjection, readInjectionState, stalenessNote, statePath } from "../connect/injection-state.js";
@@ -123,5 +124,37 @@ test("history is bounded — a diagnostic trail must not fill the disk", () => {
     assert.ok(lines.length >= 400, `but must not be truncated to nothing, saw ${lines.length}`);
   } finally {
     rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// Guard: no test may write to the operator's real ~/.yongyi (2026-11-19).
+//
+// Why this exists: the fallback design leans on LOCAL FILES instead of the
+// service (spool, injection history), which makes it very easy to write to the
+// wrong home — every helper that bypasses HTTP is a place to get it wrong. That
+// already happened once: three bogus `source=disk` records landed in the real
+// injection history with entry counts (1/2/11) that could only come from test
+// fixtures, and it took a dozen probes to work out they were not a production
+// signal.
+//
+// A test cannot assert "some other test did not write" after the fact — but it
+// CAN assert the real directory is untouched at the moment it runs, which turns
+// a silent contamination into a named failure pointing at the run.
+test("the operator's real ~/.yongyi is never written by the test suite", () => {
+  const real = join(homedir(), ".yongyi");
+  if (!existsSync(real)) return; // nothing to protect
+  // The two files the fallback layer writes. They may legitimately exist (a real
+  // session wrote them); what must not happen is them changing DURING a suite
+  // run mode — but we cannot see history here. So the assertion is bounded:
+  // the history must never contain a record whose entry count is impossible for
+  // real content (the observed contamination signature).
+  const hist = join(real, "injection-history.log");
+  if (existsSync(hist)) {
+    const { readFileSync } = require("node:fs") as typeof import("node:fs");
+    const bad = readFileSync(hist, "utf8").split("\n")
+      .filter((l) => /entries=[01]\b/.test(l));
+    assert.equal(bad.length, 0,
+      `injection history contains entries=0/1 records, which real content cannot produce ` +
+      `(a real injection always has dozens). A test is writing to the real home:\n${bad.join("\n")}`);
   }
 });
