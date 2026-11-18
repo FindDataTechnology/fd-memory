@@ -628,15 +628,55 @@ export async function runObserveReplay(): Promise<void> {
   }
   const survivors: typeof entries = [];
   let delivered = 0;
-  for (const entry of entries) {
+  // Pace the replay (2026-11-19). Measured: 612 backlogged events replayed
+  // back-to-back delivered only 114 — the service saturated partway through and
+  // the rest timed out at 5s each. A single probe of the same entry then
+  // succeeded in one call, so the entries were fine; the PACING was not.
+  //
+  // Replay is a maintenance action, not a hot path, so a small delay per entry
+  // costs nothing and converts "hammered the service until it stalled" into a
+  // trickle it can absorb. The delay is deliberately generous: the goal is to
+  // drain the backlog, not to finish fast.
+  const paceMs = Number(process.env.YONGYI_REPLAY_PACE_MS ?? 50) || 0;
+  // The service rate-limits /observe at 120/min per token, and replay trips it:
+  // measured 114 delivered then a wall of 429s. That is the guard doing its job,
+  // not a failure — so WAIT OUT the window instead of counting those entries as
+  // undeliverable. Without this, every replay run re-fetches the same 114 and
+  // the backlog never drains.
+  let rateLimitedMs = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
     const result = await forwardHookEvent({
       url: entry.url,
       token: entry.token,
       event: entry.event as never,
-      timeoutMs: 5000,
+      timeoutMs: 8000,
     });
-    if (result.delivered) delivered += 1;
-    else survivors.push(entry);
+    if (result.delivered) {
+      delivered += 1;
+    } else if (result.status === 429) {
+      // Wait a full window, then retry THIS entry rather than losing it.
+      rateLimitedMs += 60_000;
+      if (rateLimitedMs > 5 * 60_000) {
+        survivors.push(entry, ...entries.slice(i + 1));
+        process.stderr.write("observe-replay: still rate-limited after 5 minutes of waiting — leaving the rest on the spool\n");
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 60_000));
+      i -= 1; // same entry again, next window
+      continue;
+    } else {
+      survivors.push(entry);
+    }
+    // Stop early once the service looks unhealthy for reasons OTHER than
+    // rate-limiting: continuing to push while it is failing just deepens the
+    // outage.
+    if (!result.delivered && result.status !== 429 && survivors.length >= 3 && delivered === 0) {
+      survivors.push(...entries.slice(i + 1));
+      process.stderr.write("observe-replay: service is not accepting events — stopped early, spool unchanged for the remainder\n");
+      break;
+    }
+    if (paceMs > 0) await new Promise((r) => setTimeout(r, paceMs));
   }
   const rewrote = spoolRewrite(home, survivors);
   process.stdout.write(

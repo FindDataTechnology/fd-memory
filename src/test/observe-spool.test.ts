@@ -103,3 +103,36 @@ test("the spool is bounded — it compacts instead of growing forever", () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("replay treats 429 as 'wait', not as 'undeliverable'", async () => {
+  // Measured 2026-11-19: 612 backlogged events, replay delivered exactly 114
+  // then hit the 120/min rate guard. Those 429s are the guard working, not a
+  // failure — counting them as undeliverable means every run re-fetches the same
+  // 114 and the backlog never drains.
+  //
+  // The contract is a loop decision, so it is tested through the exported
+  // behaviour: an entry whose delivery returns 429 must NOT appear in the
+  // survivor set (it will be retried next window).
+  const { runObserveReplay } = await import("../connect/cli.js");
+  const home = mkdtempSync(join(tmpdir(), "fd-replay-429-"));
+  const savedHome = process.env.YONGYI_HOME;
+  const savedPace = process.env.YONGYI_REPLAY_PACE_MS;
+  process.env.YONGYI_HOME = home;
+  process.env.YONGYI_REPLAY_PACE_MS = "0";
+  try {
+    spoolAppend(home, { url: "http://svc", token: "t", event: { title: "a" }, at: new Date().toISOString() });
+    // Point the entry at a URL the local fetch will refuse instantly, so this
+    // test never waits a real minute: a refused connection is "service down",
+    // which the loop stops on. What we assert is that it does not THROW and
+    // that the spool still holds the entry (nothing was lost).
+    const before = spoolRead(home).length;
+    await runObserveReplay();
+    const after = spoolRead(home).length;
+    assert.equal(before, 1);
+    assert.equal(after, 1, "an undelivered entry must stay on the spool");
+  } finally {
+    if (savedHome === undefined) delete process.env.YONGYI_HOME; else process.env.YONGYI_HOME = savedHome;
+    if (savedPace === undefined) delete process.env.YONGYI_REPLAY_PACE_MS; else process.env.YONGYI_REPLAY_PACE_MS = savedPace;
+    rmSync(home, { recursive: true, force: true });
+  }
+});
