@@ -253,14 +253,28 @@ export class DistillScheduler {
     this.timer = null;
   }
 
+  /**
+   * Lets the service tell the stall watchdog what background work is running
+   * (2026-11-18). Without it the watchdog only knows the last HTTP route, and a
+   * stall that lands in a `drain()` tick keeps reporting the route that happened
+   * to arrive last — which is how `POST /observe` looked like the culprit when
+   * the blocking work was actually downstream of it.
+   */
+  setPhaseNamer(note: (phase: string) => void): void {
+    this.notePhase = note;
+  }
+  private notePhase: (phase: string) => void = () => {};
+
   async drain(): Promise<void> {
     if (!this.enabled()) return;
+    this.notePhase("distill:drain+fallbackScan");
     this.fallbackScan();
     const due = [...this.pending.values()].filter(
       (p) => !this.inflight.has(DistillScheduler.key(p.rootKey, p.project)) && this.now() - p.since >= debounceFor(p.rootKey),
     );
     const batch = due.slice(0, 2); // cross-project concurrency ≤2
     await Promise.allSettled(batch.map((p) => this.distillOne(p.rootKey, p.project)));
+    this.notePhase("distill:idle");
   }
 
   // v2.2 candidate selection: vector cosine top-8 first (query embedded via
@@ -522,6 +536,7 @@ export class DistillScheduler {
 
   private async distillOne(rootKey: string, project: string): Promise<void> {
     const key = DistillScheduler.key(rootKey, project);
+    this.notePhase(`distill:${rootKey}/${project}`);
     // One run per OWNER at a time (optimize-yongyi-read-surfaces 7.3). The
     // daily budget is per root, and the ledger can only be read before a call,
     // so two projects of the same owner starting together would both read

@@ -119,6 +119,10 @@ export class Service {
     const host = this.opts.host ?? "127.0.0.1";
     server.listen(this.opts.port, host);
     this.stallWatchdog = startStallWatchdog();
+    // Background distill work must name itself too, or a stall inside drain()
+    // keeps reporting whichever HTTP route arrived last (2026-11-18: that is
+    // exactly how `POST /observe` looked like the culprit).
+    this.distill.setPhaseNamer((p) => this.stallWatchdog?.note(p));
     this.distill.start();
     this.keepwarm = startEmbedKeepwarm({ env: process.env });
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
