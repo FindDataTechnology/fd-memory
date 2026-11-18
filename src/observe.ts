@@ -175,6 +175,103 @@ export function landObserveEvent(root: StoreRoot, project: string, ev: Normalize
   return { page: rel, duplicate: false, truncated };
 }
 
+/**
+ * Deferred landing for the HTTP face (2026-11-18).
+ *
+ * Why: `writePage` measured ~53ms on the live database (34k pages) and grows
+ * with it. Measured on the running service: the stall watchdog recorded 110
+ * event-loop stalls over 62 minutes — **one every 47 seconds** — and every
+ * recorded phase was `POST /observe`. The loop was being blocked by synchronous
+ * page writes, which is why `/healthz` (a pure static response) intermittently
+ * took 15–25s.
+ *
+ * What stays synchronous: `claimObserveEvent`. It is one indexed INSERT, it is
+ * what makes replay idempotent, and doing it inline keeps the `duplicate`
+ * answer truthful — a caller reposting the same key still learns it was a
+ * duplicate.
+ *
+ * What moves off the loop: `writePage` (file write + SQLite index + FTS). It
+ * runs on `setImmediate`, after the response has been flushed.
+ *
+ * The cost, stated plainly: a crash between the claim and the write loses that
+ * one event — the claim row exists but no page does. `/observe` has no JSONL
+ * truth layer to replay from (unlike `appendObservation`). That is an accepted
+ * trade for the platform-seam capture lane: these events are tool-call
+ * narratives, and losing one on a hard crash is cheaper than blocking every
+ * request for 53ms. The claim row also means a retry with the same idempotency
+ * key will be reported as a duplicate and NOT re-landed — so the window must be
+ * kept short, which setImmediate does (it runs before any I/O poll).
+ */
+export function landObserveEventDeferred(
+  root: StoreRoot,
+  project: string,
+  ev: NormalizedObserveEvent,
+  audit?: AuditIdentity,
+  dedupeProject?: string,
+  log: { warn: (m: string) => void } = console,
+): ObserveLanding {
+  const slug = randomUUID().slice(0, 8);
+  const rel = `${project}/observations/${slug}.md`;
+  const claim = root.db.claimObserveEvent(dedupeProject ?? project, ev.idempotencyKey, rel, new Date().toISOString());
+  if (!claim.first && claim.page_rel) {
+    return { page: claim.page_rel, duplicate: true, truncated: false };
+  }
+  const { body, truncated } = truncateObserveBody(ev.body);
+  const metadata: Record<string, unknown> = { ...(ev.metadata ?? {}) };
+  if (ev.harness) metadata.harness = ev.harness;
+  if (ev.subject) metadata.subject = ev.subject;
+  const page = newPage("observation", ev.title, sanitize(body), {
+    ...(Object.keys(metadata).length ? { metadata } : {}),
+    observe: { type: ev.type, idempotency_key: ev.idempotencyKey, ...(ev.ts ? { ts: ev.ts } : {}) },
+    ...(truncated ? { truncated: true } : {}),
+  });
+  // setImmediate, not setTimeout(0): it runs before the next I/O poll, so the
+  // unsaved window is as small as the loop allows.
+  pendingDeferredWrites += 1;
+  setImmediate(() => {
+    try {
+      root.writePage(project, "observations", slug, page, audit);
+    } catch (e) {
+      // The claim row is already written, so this event will be reported as a
+      // duplicate on retry and never re-landed. Say so loudly — a silent catch
+      // here is exactly the "nothing is recorded and nobody knows" failure.
+      log.warn(`[observe] deferred write failed for ${rel} (claim already taken; a retry will be seen as duplicate): ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      pendingDeferredWrites -= 1;
+    }
+  });
+  return { page: rel, duplicate: false, truncated };
+}
+
+/**
+ * How many deferred writes have been claimed but not yet landed (2026-11-18).
+ *
+ * Exists so shutdown can wait for them. Without this, a SIGTERM from launchd
+ * would drop every event claimed in the last few milliseconds — and because the
+ * claim is already in the database, those events would be reported as
+ * duplicates on retry and never recover. This counter is what makes the
+ * deferred design safe to deploy rather than merely faster.
+ */
+let pendingDeferredWrites = 0;
+export const observePendingWrites = (): number => pendingDeferredWrites;
+
+/**
+ * Wait until every claimed-but-unwritten event has landed (or `timeoutMs`
+ * elapses). Returns true when the queue drained. Called on shutdown, where
+ * "we are about to exit" and "these claims can never be re-landed" are both
+ * true, so a bounded wait is strictly better than dropping them.
+ */
+export async function drainObserveWrites(timeoutMs = 3000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  // setImmediate callbacks all run in the same check phase; one full turn of
+  // the loop is enough for the batch queued so far. Loop because callbacks can
+  // queue more (a slow disk can stretch this).
+  while (pendingDeferredWrites > 0 && Date.now() < deadline) {
+    await new Promise((r) => setImmediate(r));
+  }
+  return pendingDeferredWrites === 0;
+}
+
 // -- per-token rate guard -----------------------------------------------------
 // Fixed-window counter per token (design D3: 内存桶计数即可, zero deps). A
 // noisy harness is shed HERE with a retry hint instead of dragging the write

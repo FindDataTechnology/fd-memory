@@ -12,7 +12,7 @@ import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot, normalizeMetadata } from "./store.js";
 import { PageFilter } from "./db.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
-import { parseObserveEvent, landObserveEvent, observeRateGuard } from "./observe.js";
+import { parseObserveEvent, landObserveEventDeferred, observeRateGuard, drainObserveWrites } from "./observe.js";
 import { handlePortal } from "./portal-server.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
@@ -125,6 +125,22 @@ export class Service {
     this.distill.setPhaseNamer((p) => this.stallWatchdog?.note(p));
     this.distill.start();
     this.keepwarm = startEmbedKeepwarm({ env: process.env });
+    // Flush deferred observe writes before exiting (2026-11-18). `/observe`
+    // claims ids synchronously and writes the page on setImmediate; a SIGTERM
+    // in that window would leave a claim with no page, and the claim is what
+    // makes a retry look like a duplicate — so the event would be lost for
+    // good. Bounded wait: a hung disk must not prevent shutdown.
+    let shuttingDown = false;
+    const shutdown = (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void drainObserveWrites(3000).then((drained) => {
+        if (!drained) console.error(`[fd-memory] ${signal}: observe writes did not drain in 3s — some claimed events were not landed`);
+        process.exit(0);
+      });
+    };
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.once("SIGINT", () => shutdown("SIGINT"));
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
   }
 
@@ -372,7 +388,7 @@ export class Service {
       // Dedupe claims ride the token's canonical partition (nsProject), not the
       // steered landing project — an idempotency key remains root-global, and
       // the first delivery's page is what every replay gets back.
-      const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs }, nsProject);
+      const out = landObserveEventDeferred(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs }, nsProject);
       // 蒸馏触发（2026-11-17 修断链）：/observe 是 harness hook 的唯一入口，
       // 但它此前只落库、从不通知调度器 —— 蒸馏只能靠 fallbackScan 每 10 分钟
       // 兜底，预算一紧（remaining < FALLBACK_BUDGET_RESERVE）就彻底停摆，
