@@ -71,3 +71,28 @@ test("stop() is idempotent", () => {
   wd.stop();
   wd.stop(); // must not throw
 });
+
+test("a stall report names the phase the service said it was in", async () => {
+  // Why: on 2026-11-18 three stalls (6.7s / 9.0s / 2.4s) landed while 20
+  // concurrent /digest requests were in flight. That route answers
+  // unauthenticated callers in microseconds, so "concurrent requests" was
+  // co-occurrence, not cause — and the report, which only said "something
+  // blocked the loop", gave no way to tell. The phase label is what turns the
+  // next occurrence into an answer.
+  const { lines, log } = recorder();
+  let fake = 0;
+  const wd = startStallWatchdog({ tickMs: 10, thresholdMs: 100, log, now: () => fake });
+  wd.note("POST /pages/mutate");
+  fake += 10 + 4000;
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /while: POST \/pages\/mutate/, `the report must name the phase:\n${lines[0]}`);
+  // And an un-set phase must still read sensibly rather than print "undefined".
+  const second = recorder();
+  let f2 = 0;
+  const wd2 = startStallWatchdog({ tickMs: 10, thresholdMs: 100, log: second.log, now: () => f2 });
+  f2 += 10 + 3000;
+  await new Promise((r) => setTimeout(r, 25));
+  assert.match(second.lines[0], /while: \(idle\)/, `an idle stall must say idle, not undefined:\n${second.lines[0]}`);
+  wd.stop(); wd2.stop();
+});

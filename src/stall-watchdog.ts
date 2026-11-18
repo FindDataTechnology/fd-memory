@@ -27,6 +27,16 @@ export interface StallWatchdog {
   stop: () => void;
   /** Stalls observed so far — exposed so a health probe can report a count. */
   stalls: () => number;
+  /**
+   * Let the caller name what it was doing, so a stall report says WHERE.
+   * Measured 2026-11-18: three stalls (6.7s / 9.0s / 2.4s) all landed while 20
+   * concurrent /digest requests were in flight, but that route rejects
+   * unauthenticated callers in microseconds — so "concurrent requests caused
+   * it" was co-occurrence, not cause. Without a label the report says only
+   * "something blocked the loop", which is barely better than the raw stack
+   * sample it replaced.
+   */
+  note: (phase: string) => void;
 }
 
 export function startStallWatchdog(opts: {
@@ -43,6 +53,10 @@ export function startStallWatchdog(opts: {
   let last = now();
   let stalls = 0;
   let stopped = false;
+  // Last thing the service said it was doing. Cheap to update, and it is the
+  // whole difference between "the loop stalled" and "the loop stalled while
+  // handling POST /pages/mutate".
+  let phase = "(idle)";
 
   const timer = setInterval(() => {
     if (stopped) return;
@@ -51,12 +65,13 @@ export function startStallWatchdog(opts: {
     last = t;
     if (drift >= thresholdMs) {
       stalls += 1;
-      // Say how long the loop was blocked and when it came back. The recovery
-      // instant is the correlatable half: an external observer knows when its
-      // request timed out, and that timestamp is all they have.
+      // Say how long the loop was blocked, when it came back, and what the
+      // service was last doing. The recovery instant is the correlatable half:
+      // an external observer knows when its request timed out, and that
+      // timestamp is all they have.
       log.warn(
-        `[watchdog] event loop stalled ${(drift / 1000).toFixed(1)}s (recovered at ${new Date(t).toISOString()}) — ` +
-        `a synchronous callback blocked the loop; this is not I/O wait and not a slow query`,
+        `[watchdog] event loop stalled ${(drift / 1000).toFixed(1)}s (recovered at ${new Date(t).toISOString()}) ` +
+        `while: ${phase} — a synchronous callback blocked the loop; this is not I/O wait and not a slow query`,
       );
     }
   }, tickMs);
@@ -69,5 +84,8 @@ export function startStallWatchdog(opts: {
       clearInterval(timer);
     },
     stalls: () => stalls,
+    note: (p: string) => {
+      phase = p;
+    },
   };
 }

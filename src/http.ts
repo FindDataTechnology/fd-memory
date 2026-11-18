@@ -194,6 +194,10 @@ export class Service {
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://local");
     const path = url.pathname;
+    // Tell the stall watchdog what we are about to do (2026-11-18). Updated
+    // before any work, so if a synchronous callback blocks the loop the report
+    // can name the route instead of only saying "something blocked".
+    this.stallWatchdog?.note(`${req.method ?? "?"} ${path}`);
 
     if (path === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
