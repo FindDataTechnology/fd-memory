@@ -114,3 +114,34 @@ test("fails closed on every missing input rather than throwing", () => {
     if (saved === undefined) delete process.env.FD_MEMORY_DATA; else process.env.FD_MEMORY_DATA = saved;
   }
 });
+
+test("a diagnostic call does not record an injection (probes must not mutate)", async () => {
+  // A manual probe used to write the freshness record, which claimed a session
+  // had been injected AND reset the staleness clock — hiding a real gap. The
+  // `record` flag exists so ops code can inspect without lying to the record.
+  const { readInjectionState } = await import("../connect/injection-state.js");
+  const data = mkdtempSync(join(tmpdir(), "fd-fallback-norec-"));
+  const home = mkdtempSync(join(tmpdir(), "fd-home-norec-"));
+  const dir = join(data, "owners", "u-test", "wiki", "default", "memory-index");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "a.md"), page("X", "h", "project"));
+  const savedData = process.env.FD_MEMORY_DATA;
+  const savedHome = process.env.YONGYI_HOME;
+  process.env.FD_MEMORY_DATA = data;
+  process.env.YONGYI_HOME = home;
+  try {
+    const out = readIndexFromDisk("default", binding, 3000, false);
+    assert.ok(out.length > 0, "the probe must still return content");
+    assert.equal(readInjectionState(home), null, "a diagnostic call must not write a freshness record");
+
+    // And the production default still records — otherwise the flag would have
+    // silently disabled the whole feature.
+    readIndexFromDisk("default", binding, 3000);
+    assert.ok(readInjectionState(home), "the production path must still record");
+  } finally {
+    if (savedData === undefined) delete process.env.FD_MEMORY_DATA; else process.env.FD_MEMORY_DATA = savedData;
+    if (savedHome === undefined) delete process.env.YONGYI_HOME; else process.env.YONGYI_HOME = savedHome;
+    rmSync(data, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});

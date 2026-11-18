@@ -442,7 +442,23 @@ function dropBinding(harness: Harness, credsPath: string, envPath: string): File
  * The marker matters: silently serving a thinner index would look identical to
  * a healthy injection, and the reader would never learn the service was down.
  */
-export function readIndexFromDisk(project: string, binding: Binding, maxChars = 3000): string {
+export function readIndexFromDisk(
+  project: string,
+  binding: Binding,
+  maxChars = 3000,
+  // Whether this call counts as "a session was injected" (2026-11-19).
+  //
+  // Why a flag: this function is both the production fallback (called from
+  // buildSessionContext) and a handy diagnostic entry point (ops/debug code
+  // calls it directly). Both used to write the freshness record, so a manual
+  // probe would claim a session had been injected — and, worse, reset the
+  // staleness clock, hiding a real gap. A diagnostic must not mutate what it is
+  // diagnosing.
+  //
+  // Default true so the production path keeps working without every caller
+  // having to know about this; probes pass false explicitly.
+  record = true,
+): string {
   try {
     // The binding carries `namespace` ("u/<user>"), and the on-disk root key is
     // its sanitized form ("u-<user>"). rootKeyForRef is the single definition of
@@ -495,7 +511,8 @@ export function readIndexFromDisk(project: string, binding: Binding, maxChars = 
     lines.push("（服务恢复后本行消失；本轮学到新结论仍可 memory_write_page 落页。）");
     // Record that this session got a DEGRADED injection, so the next session
     // knows the memory it inherits may be thin (2026-11-19).
-    recordInjection(spoolHome(), { at: new Date().toISOString(), source: "disk", entries: shown });
+    // `record` is false for diagnostic callers — see the parameter comment.
+    if (record) recordInjection(spoolHome(), { at: new Date().toISOString(), source: "disk", entries: shown });
     return lines.join("\n");
   } catch {
     // Even the fallback can fail (permissions, corrupt frontmatter). Returning
