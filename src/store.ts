@@ -107,6 +107,12 @@ export class StoreRoot {
         execFileSync("git", ["init", "-q"], { cwd: this.wikiDir, stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@localhost"], { stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "config", "user.name", "fd-memory"], { stdio: "ignore" });
+        // Compact sooner than git's default (2026-11-19). The wiki commits once
+        // per page write, so loose objects accumulate fast: measured 5,729 loose
+        // objects / 426MB after ~17k commits, against a default threshold of
+        // 6,700 — it would have grown for days more before tripping. 500 keeps
+        // the repo small with a cheap check on each snapshot.
+        execFileSync("git", ["-C", this.wikiDir, "config", "gc.auto", "500"], { stdio: "ignore" });
         this.gitAvailable = true;
       } catch {
         this.gitAvailable = false;
@@ -174,7 +180,22 @@ export class StoreRoot {
     };
     execFile("git", ["-C", this.wikiDir, "add", "-A"], { timeout: 120_000 }, (err) => {
       if (err) return done(); // best-effort: wiki writes are already durable
-      execFile("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { timeout: 120_000 }, () => done());
+      execFile("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { timeout: 120_000 }, () => {
+        // Opportunistic compaction (2026-11-19). Measured: the wiki's `.git` had
+        // grown to 510MB — 426MB of it LOOSE objects from 17,355 commits, one
+        // per page write. `git gc` packed it to 71MB in one run (442MB back).
+        //
+        // `--auto` (not a plain `gc`) is the point: it is a no-op unless the
+        // repo is over `gc.auto`, so the steady state costs one cheap
+        // `count-objects` check. We also lower `gc.auto` (see the constructor)
+        // because the default 6,700-object threshold took days to trip in a repo
+        // that commits this often.
+        //
+        // Not awaited and errors ignored: a compaction failure must never block
+        // or fail a page write — the wiki content is already durable, the git
+        // history is a recovery aid.
+        execFile("git", ["-C", this.wikiDir, "gc", "--auto", "--quiet"], { timeout: 600_000 }, () => done());
+      });
     });
   }
 
