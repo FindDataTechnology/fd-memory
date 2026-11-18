@@ -56,7 +56,7 @@ test("reads index pages from disk and renders the documented line format", () =>
   const saved = process.env.FD_MEMORY_DATA;
   process.env.FD_MEMORY_DATA = data;
   try {
-    const out = readIndexFromDisk("default", binding);
+    const out = readIndexFromDisk("default", binding, 3000, false);
     assert.ok(out.length > 0, "fallback must produce something with pages on disk");
     assert.match(out, /- 〔project·claude-code〕结论甲/, `line format wrong:\n${out}`);
     assert.match(out, /- 〔feedback·zcode〕纪律乙/);
@@ -71,7 +71,7 @@ test("says it is degraded, so a thin injection never looks like a healthy one", 
   const saved = process.env.FD_MEMORY_DATA;
   process.env.FD_MEMORY_DATA = data;
   try {
-    const out = readIndexFromDisk("default", binding);
+    const out = readIndexFromDisk("default", binding, 3000, false);
     assert.match(out, /服务不可达/, "must announce the service is unreachable");
     assert.match(out, /服务恢复后本行消失/, "must explain that the marker is temporary");
   } finally {
@@ -88,7 +88,7 @@ test("honours the character budget (this text rides every system prompt)", () =>
   const saved = process.env.FD_MEMORY_DATA;
   process.env.FD_MEMORY_DATA = data;
   try {
-    const out = readIndexFromDisk("default", binding, 800);
+    const out = readIndexFromDisk("default", binding, 800, false);
     assert.ok(out.length <= 800 + 120, `budget overrun: ${out.length} chars for a 800 budget`);
     assert.ok(out.length > 200, `budget so tight nothing came through: ${out.length}`);
   } finally {
