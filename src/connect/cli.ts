@@ -673,6 +673,10 @@ export async function runObserveReplay(): Promise<void> {
     );
     return;
   }
+  // Baseline for the in-flight health re-check below: every 20 deliveries we
+  // compare against this. A pre-flight check alone is not enough — see the
+  // comment at that call site.
+  const baselineStalls: number = s2 ?? s1;
   // The service rate-limits /observe at 120/min per token, and replay trips it:
   // measured 114 delivered then a wall of 429s. That is the guard doing its job,
   // not a failure — so WAIT OUT the window instead of counting those entries as
@@ -712,6 +716,22 @@ export async function runObserveReplay(): Promise<void> {
       break;
     }
     if (paceMs > 0) await new Promise((r) => setTimeout(r, paceMs));
+    // Re-check health DURING the replay, not just before it (2026-11-19).
+    // Measured: the pre-flight gate passed (stalls steady at 22), then the very
+    // act of delivering pushed stalls to 23 and the backlog grew 607 → 615.
+    // A one-shot check cannot see a problem that replaying itself creates — the
+    // gate has to run while the damage would be happening.
+    if ((i + 1) % 20 === 0) {
+      const during = await stallsNow();
+      if (during !== null && during > baselineStalls) {
+        survivors.push(...entries.slice(i + 1));
+        process.stderr.write(
+          `observe-replay: stalls rose to ${during} (from ${baselineStalls}) while replaying — replaying is making it worse. ` +
+          `Stopped after ${delivered} delivered; ${survivors.length} left on the spool.\n`,
+        );
+        break;
+      }
+    }
   }
   const rewrote = spoolRewrite(home, survivors);
   process.stdout.write(
