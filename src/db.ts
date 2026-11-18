@@ -130,7 +130,7 @@ export class RootDb {
    * that must run again; otherwise an already-migrated database skips the whole
    * write path on open.
    */
-  static readonly SCHEMA_VERSION = 1;
+  static readonly SCHEMA_VERSION = 2;
 
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -141,6 +141,18 @@ export class RootDb {
     // construction threw — so the session could not even start. The default
     // (and node:sqlite's) timeout is far too short for multi-process use.
     this.db.exec("PRAGMA busy_timeout = 15000");
+    // WAL + NORMAL（2026-11-18 事故）：默认是 journal_mode=delete +
+    // synchronous=FULL，每次写事务都要建/删 journal 文件并等磁盘物理落盘。
+    // 库涨到 87MB 后，蒸馏写 page 时这个同步提交能把 Node 的事件循环彻底堵死
+    // —— 实测 healthz 连续超时、进程 CPU 0.5%/RSS 16MB 不忙，sample 停在
+    // sqlite3_step→vdbeCommit→pager_end_transaction→pcache1Truncate。
+    //
+    // WAL 把写从主库解耦（读不阻塞写、写不阻塞读），NORMAL 只保证 WAL 落盘
+    // 而不再每次 fsync 主库——对「单机、进程崩溃可能丢最后几个事务但不会损坏
+    // 库」这个场景是正确取舍。WAL 不能用于网络文件系统；本库固定在本机
+    // Application Support 下，符合前提。
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA synchronous = NORMAL");
     this.migrate();
   }
 
@@ -305,6 +317,20 @@ export class RootDb {
       this.db.exec("ALTER TABLE pages ADD COLUMN page_id TEXT");
       this.db.exec("CREATE INDEX IF NOT EXISTS pages_page_id ON pages(page_id)");
     }
+    // Read-face covering index (2026-11-18). Every hot read is
+    // `WHERE project=? AND type=? ORDER BY updated_at DESC LIMIT n`
+    // (recentNotes/queryNotes/referenceFor/notesAfter). Without an index that
+    // is `SCAN pages` + `USE TEMP B-TREE FOR ORDER BY` over ~20k rows whose
+    // body column totals ~8MB — measured cold 0.29s vs 0.01s with the index,
+    // and the scan runs synchronously on the server's event loop, so it is
+    // exactly the `Statement::All → readDbPage → pread` stall that made
+    // /healthz time out for minutes (sample, 2026-11-18). The row counts make
+    // the waste obvious: `note` is 55 rows, `observation` is 17,948 — the old
+    // plan earned its 55 by reading all 20,733.
+    // IF NOT EXISTS unconditionally (not inside a column-added branch): the
+    // database this matters for already has every column, so a migration
+    // gated on "column missing" would never run there.
+    this.db.exec("CREATE INDEX IF NOT EXISTS pages_proj_type_updated ON pages(project, type, updated_at DESC)");
     const nullIds = this.db.prepare("SELECT path FROM pages WHERE page_id IS NULL").all() as Array<{ path: string }>;
     if (nullIds.length > 0) {
       const upd = this.db.prepare("UPDATE pages SET page_id=? WHERE path=?");
