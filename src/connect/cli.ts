@@ -537,7 +537,19 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     // while /digest needs 10 s). A session-start hook may take a few seconds —
     // it must not take forever, and it must not fail silently because the
     // budget was tighter than the machine is fast.
-    const timer = setTimeout(() => ctl.abort(), 5000);
+    //
+    // 5000 → 2500 (2026-11-19). Measured against a server that accepts the
+    // connection and then never answers (the exact shape of a stalled
+    // fd-memory): the whole hook took **8.22s**, against the 10s timeout in
+    // ~/.claude/settings.json. Only 1.8s of headroom, and this machine runs at
+    // load 10–28 — a slower Node start or a busier box would blow the budget and
+    // the session would get NO memory at all, fallback included.
+    //
+    // 2500ms is still 8× the healthy response (measured 286ms for this
+    // endpoint), so it does not start rejecting real answers; it only makes the
+    // stuck case give up sooner and hand over to the disk fallback, which is
+    // the whole point of having one.
+    const timer = setTimeout(() => ctl.abort(), 2500);
   try {
     // 注入的是**跨 harness 记忆索引**，不是 digest。
     //
@@ -552,10 +564,25 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     //   3. 最后按字符数硬截断 —— 索引大小不可预测，必须有上限
     //   实测：feedback+user 共 578 条 = 28K tokens（太多）；
     //         取最近 100 条 = 5K tokens（可接受）。
-    const res = await fetch(`${base}/memory/index?project=${encodeURIComponent(project)}&limit=100`, {
-      headers: { authorization: "Bearer " + binding.token },
-      signal: ctl.signal,
-    });
+    // Promise.race, not AbortSignal alone (2026-11-19). Measured against a
+    // server that accepts and never answers: `setTimeout(abort, 2500)` produced
+    // a 5.7s hook — Node's fetch does not drop a socket read the instant the
+    // signal fires, so the abort cost an extra ~3s. Racing the same promise
+    // against a plain timer bounds the WAIT itself, which is what the hook
+    // budget actually cares about.
+    //
+    // The abort controller stays: it is what stops the underlying request when
+    // the race is lost. The race just decides when we stop *waiting*.
+    const res = await Promise.race([
+      fetch(`${base}/memory/index?project=${encodeURIComponent(project)}&limit=100`, {
+        headers: { authorization: "Bearer " + binding.token },
+        signal: ctl.signal,
+      }),
+      new Promise<never>((_, reject) => {
+        const raceTimer = setTimeout(() => reject(new Error("index fetch timed out")), 2500);
+        raceTimer.unref?.();
+      }),
+    ]);
     if (!res.ok) return readIndexFromDisk(project, binding);
     const doc = (await res.json()) as {
       entries?: Array<{ harness?: string; memory_type?: string; description?: string }>;
@@ -806,6 +833,15 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
     url: binding.url,
     token,
     event: mapped,
+    // 3000 → 1000 (2026-11-19). Measured: with a stalled service, SessionStart
+    // spent 2.5s timing out the index fetch and then ANOTHER ~3s here — a total
+    // of 5.6s against the 10s hook budget, and the second wait bought nothing:
+    // the event ends up on the spool either way, and a healthy service answers
+    // /observe in ~40ms (measured), so 1s is still 25× the real latency.
+    //
+    // The spool makes this safe: a short timeout means "capture it locally"
+    // slightly sooner, never "lose it".
+    timeoutMs: 1000,
   });
   if (!result.delivered) {
     // Spool it instead of dropping it (2026-11-19). Fail-drop was the original
