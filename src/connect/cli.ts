@@ -638,6 +638,41 @@ export async function runObserveReplay(): Promise<void> {
   // trickle it can absorb. The delay is deliberately generous: the goal is to
   // drain the backlog, not to finish fast.
   const paceMs = Number(process.env.YONGYI_REPLAY_PACE_MS ?? 50) || 0;
+
+  // Health gate before replaying (2026-11-19). Measured: a replay against an
+  // already-stalled service pushed `stalls` from 118 to 123 and GREW the backlog
+  // from 397 to 526 — every delivered event writes a page, and the page write is
+  // exactly what blocks the loop. Replaying into a sick service makes it sicker;
+  // the backlog can wait.
+  //
+  // The probe reads /healthz twice a second apart and compares the stall
+  // counter: if it moved, the loop is being blocked right now and no amount of
+  // replaying will land. Using the service's OWN counter avoids inventing a
+  // timing threshold, and avoids the trap of a probe that itself writes a page
+  // (which is what a "deliver one and see" check would do).
+  const healthUrl = entries[0].url.replace(/\/+$/, "") + "/healthz";
+  const stallsNow = async (): Promise<number | null> => {
+    try {
+      const r = await fetch(healthUrl, { signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return null;
+      const d = (await r.json()) as { stalls?: number };
+      return typeof d.stalls === "number" ? d.stalls : null;
+    } catch { return null; }
+  };
+  const s1 = await stallsNow();
+  if (s1 === null) {
+    process.stderr.write(`observe-replay: cannot read ${healthUrl} — leaving ${entries.length} on the spool\n`);
+    return;
+  }
+  await new Promise((r) => setTimeout(r, 1000));
+  const s2 = await stallsNow();
+  if (s2 !== null && s2 > s1) {
+    process.stderr.write(
+      `observe-replay: the service is stalling right now (stalls ${s1}→${s2} in 1s) — replaying would make it worse. ` +
+      `Leaving ${entries.length} on the spool; run again when the machine is quieter.\n`,
+    );
+    return;
+  }
   // The service rate-limits /observe at 120/min per token, and replay trips it:
   // measured 114 delivered then a wall of 429s. That is the guard doing its job,
   // not a failure — so WAIT OUT the window instead of counting those entries as
