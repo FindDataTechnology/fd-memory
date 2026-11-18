@@ -196,6 +196,15 @@ class Handler(BaseHTTPRequestHandler):
             )
             return await engine.embed_texts(lambda: client, texts)
 
+        # Vector-lane kill switch, same contract as the Node side
+        # (unify-harness-delivery 1.3): MEMORY_EMBED=off means "this deployment
+        # has no serving embedding model", so answer without calling upstream
+        # instead of paying a 404 round-trip on every digest. Empty vectors is
+        # the honest answer — the caller already treats it as keyword-only.
+        if str(os.environ.get("MEMORY_EMBED", "")).strip().lower() in ("off", "0", "false", "no"):
+            self._json(200, {"vectors": [], "model": engine.EMBED_MODEL, "tokens": 0, "errors": []})
+            return
+
         try:
             vectors, model, tokens, errors = run_async(run())
             self._json(200, {"vectors": vectors, "model": model, "tokens": tokens, "errors": errors})

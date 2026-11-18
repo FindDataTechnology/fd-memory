@@ -9,7 +9,7 @@ import { runConnect, runDisconnect, runHook } from "./connect/cli.js";
 import { mkdirSync } from "node:fs";
 
 function dataDir(): string {
-  return process.env.FD_MEMORY_DATA ?? process.env.HOME + "/Library/Application Support/fd-memory";
+  return process.env.FD_MEMORY_DATA || process.env.HOME + "/Library/Application Support/fd-memory";
 }
 
 function pepper(): string {

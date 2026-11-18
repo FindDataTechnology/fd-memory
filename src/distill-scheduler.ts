@@ -268,10 +268,31 @@ export class DistillScheduler {
   }
 
   private async embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> {
+    // Vector lane kill switch (unify-harness-delivery 1.3, 2026-11-18).
+    //
+    // The gateway this deployment points at serves 81 models and ZERO of them
+    // are embedding models — `Qwen/Qwen3-Embedding-8B` (the default) answers
+    // 404 model_not_found, as do text-embedding-3-small / bge-m3 / the 0.6B
+    // Qwen. Every digest therefore paid a round-trip to learn "no", then fell
+    // back to keyword recall with a note that reads like an outage. Turning the
+    // lane OFF by configuration makes keyword recall the declared mode instead
+    // of a per-turn failure to explain.
+    //
+    // Set FD_MEMORY_EMBED=off (or 0/false) when the lane has no serving model.
+    // Unset/on keeps the current behaviour — this changes nothing where a real
+    // embedding model exists.
+    if (EMBED_DISABLED) {
+      if (!this.embedDisabledLogged) {
+        this.embedDisabledLogged = true;
+        this.log.warn("[vector] embed lane disabled (FD_MEMORY_EMBED=off) — recall runs keyword-only by configuration, not by failure");
+      }
+      return { vectors: [], model: "", tokens: 0 };
+    }
     const out = await sidecarEmbed(this.opts.env ?? process.env, texts, this.opts.fetchImpl ?? fetch, this.url());
     this.checkModelConsistency(out.model);
     return out;
   }
+  private embedDisabledLogged = false;
 
   // First-embed self-check (2026-10-28): the sidecar's CURRENT model is only
   // knowable from a response. The moment the process learns it, compare it
@@ -917,6 +938,14 @@ export class DistillScheduler {
     }
   }
 }
+
+// Vector lane kill switch (unify-harness-delivery 1.3). Truthy unless the
+// operator explicitly disables it — an unset env must keep today's behaviour.
+export function embedDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = String(env.FD_MEMORY_EMBED ?? "").trim().toLowerCase();
+  return v === "off" || v === "0" || v === "false" || v === "no";
+}
+const EMBED_DISABLED = embedDisabled();
 
 // Standalone sidecar /embed call (extracted from the scheduler by
 // add-cluster-digest-injection — the /digest platform-seam face shares the

@@ -2,15 +2,20 @@
 // (add-yongyi-complete-solution, tasks 3.1–3.7). index.ts dispatches here.
 
 import { homedir } from "node:os";
+import { readFileSync, writeFileSync } from "node:fs";
 import { rootKeyForRef } from "../auth.js";
 import {
   applyClaudeCode,
+  applyGeminiFamily,
+  applyWorkbuddy,
   applyZcode,
   cozeDisconnectNotes,
   cozeRecon,
   difyDisconnectNotes,
   difyRecipe,
   disconnectClaudeCode,
+  disconnectGeminiFamily,
+  disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
   renderCozeRecon,
@@ -24,24 +29,79 @@ import {
   envVarFor,
   loadCredentials,
   planIdentity,
+  PROFILE_BEGIN,
+  PROFILE_END,
+  profileSourceLine,
   saveCredentials,
   writeEnvFile,
   type Binding,
   type CredentialFile,
   type Harness,
 } from "./credentials.js";
+import { removeManagedBlock, upsertManagedBlock } from "./managed-block.js";
 import { forwardHookEvent, mapHookEvent, normalizeHookEvent, readStdinJson } from "./hook-forward.js";
 
 export const CONNECT_USAGE = `usage:
   yongyi connect claude-code --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect zcode --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect workbuddy --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect gemini-cli --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect qwen --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
   yongyi connect dify --url <service-url> --as <user> [--project P]
   yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
-const HOOK_HARNESSES = ["claude-code", "zcode"] as const;
+const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen"] as const;
+
+// ── Recall-injection envelope, per harness (2026-11-18) ─────────────────────
+//
+// Why this is a table and not one literal: the envelope is the host's contract,
+// not ours. Shipping the wrong shape is silently discarded — the hook exits 0,
+// the turn proceeds, and nothing was injected, which is exactly the failure
+// mode this table exists to remove.
+//
+// Evidence (shipped bundles, read 2026-11-18):
+//   claude-code  — binary contains `hookSpecificOutput.additionalContext` (64x)
+//   gemini-cli   — getAdditionalContext() reads ONLY
+//                  hookSpecificOutput["additionalContext"], else returns undefined
+//   qwen-code    — DefaultHookOutput.getRawAdditionalContext() same shape
+//   workbuddy    — same schema as CodeBuddy/Claude Code (its own skill docs say so)
+//   zcode        — neither key appears anywhere in its 464 MB bundle, and its
+//                  hooks are trust-gated; the top-level form we shipped has no
+//                  reader. Left as `none` until a real injection is observed.
+//
+// `none` means: do not emit a guessed envelope. Absence is honest; a wrong shape
+// is a silent no-op that reads as working.
+export type InjectionEnvelope = "hookSpecificOutput" | "top-level" | "none";
+
+export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
+  "claude-code": "hookSpecificOutput",
+  workbuddy: "hookSpecificOutput",
+  codebuddy: "hookSpecificOutput",
+  "gemini-cli": "hookSpecificOutput",
+  qwen: "hookSpecificOutput",
+  zcode: "none",
+};
+
+/**
+ * Wrap recall text in the envelope the target host actually reads.
+ * Returns `{}` (valid JSON, means "nothing to say") when there is no text or
+ * when the target has no verified envelope.
+ */
+export function injectionPayload(harness: string, ctx: string): Record<string, unknown> {
+  if (!ctx) return {};
+  switch (INJECTION_ENVELOPE[harness]) {
+    case "hookSpecificOutput":
+      return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } };
+    case "top-level":
+      return { additionalContext: ctx };
+    default:
+      return {};
+  }
+}
+
 
 // Recipe-shaped harnesses (add-yongyi-connect-dify-coze): the platform is
 // configured through a UI, so connect prints instructions and writes no
@@ -49,7 +109,7 @@ const HOOK_HARNESSES = ["claude-code", "zcode"] as const;
 const RECIPE_HARNESSES = ["dify", "coze"] as const;
 
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "mcp", "dify", "coze"];
+  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -126,7 +186,12 @@ export async function runConnect(argv: string[]): Promise<void> {
   const t = targets(flags);
   const yongyiDir = process.env.YONGYI_HOME ?? t.homeDir + "/.yongyi";
   const paths = credentialPaths(yongyiDir);
-  const dataDir = process.env.FD_MEMORY_DATA ?? t.homeDir + "/Library/Application Support/fd-memory";
+  // Same resolution rule as `serve` (src/index.ts): FD_MEMORY_DATA, else the
+  // HOME-derived default. Using `t.homeDir` here was a real defect — it is a
+  // separate knob (used for harness config paths), so with any override the CLI
+  // minted tokens into a store the daemon never reads and every request 401'd
+  // while `connect` reported success. One rule, one place.
+  const dataDir = process.env.FD_MEMORY_DATA || process.env.HOME + "/Library/Application Support/fd-memory";
   const pepper = process.env.FD_MEMORY_PEPPER ?? "fd-memory-dev-pepper";
   const envVar = envVarFor(harness);
 
@@ -181,6 +246,12 @@ export async function runConnect(argv: string[]): Promise<void> {
     report.files = applyClaudeCode(t, url, envVar);
   } else if (harness === "zcode") {
     report.files = applyZcode(t, url, envVar);
+  } else if (harness === "workbuddy") {
+    report.files = applyWorkbuddy(t, url, envVar);
+  } else if (harness === "gemini-cli") {
+    report.files = applyGeminiFamily(t, ".gemini", "gemini-cli", url, envVar);
+  } else if (harness === "qwen") {
+    report.files = applyGeminiFamily(t, ".qwen", "qwen", url, envVar);
   } else {
     report.snippet = genericMcpSnippet(url, envVar);
   }
@@ -193,7 +264,55 @@ export async function runConnect(argv: string[]): Promise<void> {
     bound_at: new Date().toISOString(),
   };
   saveIdentity(harness, paths.creds, paths.env, creds, binding, url);
+  // The MCP entry references ${YONGYI_TOKEN_*}; this is the half that makes the
+  // reference resolve in a login shell. Without it the entry 401s while hooks
+  // keep working (they read the credential file directly) — the exact asymmetry
+  // this task exists to remove.
+  const profile = wireProfile(paths.env);
+  report.files.push(profile);
   printConnectReport(report, paths, true);
+}
+
+// Upsert/remove our source block in the user's shell profile. Only the marker
+// region is touched; everything else in the file is preserved byte-for-byte.
+const PROFILE_MARKERS = { begin: PROFILE_BEGIN, end: PROFILE_END };
+
+function profilePath(home: string): string {
+  // ~/.zshenv, NOT ~/.zshrc (2026-11-18, found by 6.3 acceptance).
+  //
+  // zsh reads .zshrc only for INTERACTIVE shells. Every harness launched from a
+  // GUI, an IDE, a cron entry or a subprocess runs non-interactive — and a
+  // login non-interactive shell (`zsh -lc`) reads .zprofile/.zlogin, also not
+  // .zshrc. So a source line in .zshrc resolves in a terminal and is absent
+  // exactly where the MCP entry needs it, which reproduces as a 401 with no
+  // local signal. .zshenv is the only file zsh reads in EVERY mode.
+  return process.env.YONGYI_PROFILE ?? home + "/.zshenv";
+}
+
+function readText(p: string): string {
+  try {
+    return readFileSync(p, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function wireProfile(envPath: string): FileWrite {
+  const file = profilePath(homedir());
+  const before = readText(file);
+  const edit = upsertManagedBlock(before, profileSourceLine(envPath), PROFILE_MARKERS);
+  if (!edit.changed) return { path: file, action: "unchanged" };
+  writeFileSync(file, edit.text);
+  return { path: file, action: before === "" ? "created" : "updated" };
+}
+
+function unwireProfile(): FileWrite {
+  const file = profilePath(homedir());
+  const before = readText(file);
+  const edit = removeManagedBlock(before, PROFILE_MARKERS);
+  if (!edit.changed) return { path: file, action: "absent" };
+  writeFileSync(file, edit.text);
+  return { path: file, action: "removed" };
 }
 
 function printConnectReport(report: ConnectReport, paths: { creds: string; env: string }, bound: boolean): void {
@@ -229,6 +348,12 @@ export function runDisconnect(argv: string[]): void {
     files = disconnectClaudeCode(t);
   } else if (harness === "zcode") {
     files = disconnectZcode(t);
+  } else if (harness === "workbuddy") {
+    files = disconnectWorkbuddy(t);
+  } else if (harness === "gemini-cli") {
+    files = disconnectGeminiFamily(t, ".gemini", "gemini-cli");
+  } else if (harness === "qwen") {
+    files = disconnectGeminiFamily(t, ".qwen", "qwen");
   } else if (harness === "dify") {
     const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
     files = dropBinding("dify", paths.creds, paths.env);
@@ -249,6 +374,11 @@ export function runDisconnect(argv: string[]): void {
   }
   console.log(`disconnected ${harness} (memory data untouched)`);
   printFileWrites(files);
+  // Only unwire the profile when no binding remains: another harness may still
+  // rely on the same exported variables.
+  if (Object.keys(loadCredentials(paths.creds).bindings).length === 0) {
+    printFileWrites([unwireProfile()]);
+  }
 }
 
 // Recipe harnesses have no platform-side artifact this CLI wrote, so disconnect
@@ -376,7 +506,7 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
   const harness = positionals[0];
   const rawEvent = positionals[1];
   if (!harness || !rawEvent || !HOOK_HARNESSES.includes(harness as (typeof HOOK_HARNESSES)[number])) {
-    console.error(`usage: yongyi hook <claude-code|zcode> <event>  (stdin: hook event JSON)\n${CONNECT_USAGE}`);
+    console.error(`usage: yongyi hook <claude-code|zcode|workbuddy|gemini-cli|qwen> <event>  (stdin: hook event JSON)\n${CONNECT_USAGE}`);
     process.exit(2);
   }
   const event = normalizeHookEvent(rawEvent);
@@ -397,11 +527,13 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
   // 会话是任务驱动的，它不会主动想「我该查查记忆」。所以要在它开始干活之前，
   // 把它以前学到的、与本项目相关的结论直接摆到它眼前。
   //
-  // 输出协议：stdout 必须是严格 JSON，`{"additionalContext": "..."}` 会被注入上下文。
-  // 纯文本会被判非法丢弃；无内容时输出 `{}`（合法且表示"无话可说"）。
+  // 输出协议：stdout 必须是严格 JSON，形状由目标 harness 决定（见
+  // INJECTION_ENVELOPE）——claude-code/gemini-cli/qwen 只读
+  // `hookSpecificOutput.additionalContext`，发顶层键等于什么都没发；zcode 未核证，
+  // 发 `{}`（合法且表示"无话可说"）。纯文本会被判非法丢弃。
   if (event === "session-start" && binding) {
     const ctx = await buildSessionContext(binding).catch(() => "");
-    process.stdout.write(JSON.stringify(ctx ? { additionalContext: ctx } : {}) + "\n");
+    process.stdout.write(JSON.stringify(injectionPayload(harness, ctx)) + "\n");
     // 注入之后仍然记录这次 session-start（捕获照旧）。
   }
 

@@ -276,6 +276,85 @@ export function disconnectZcode(t: ConnectTargets): FileWrite[] {
   ];
 }
 
+// ── workbuddy (unify-harness-delivery 3.2) ───────────────────────────────────
+//
+// Two facts shape this adapter, both probed on a live install (2026-11-18):
+//
+//  1. MCP config is the client's own file: `~/.workbuddy/mcp.json`, entry shape
+//     { type: "http", url, headers } under `mcpServers` — same entry shape as
+//     Claude Code, different path. The facet CLI already writes this file, so
+//     both products converge on one place rather than two.
+//
+//  2. There is NO user-level `hooks` key in `~/.workbuddy/settings.json` (top
+//     keys: sandbox / claw / enabledPlugins / …). Every hook this client runs
+//     lives inside a PLUGIN and is referenced from its `plugin.json`. So writing
+//     a hooks block here would be a silent no-op — exactly the failure we spent
+//     this change removing. Capture reaches this client through the plugin
+//     channel (a pack that declares `memory` ships hooks/hooks.json); this
+//     adapter does not pretend to wire it.
+//
+// Discipline goes to `CODEBUDDY.md` — the project rules filename this client
+// family actually reads (110 references in its own shipped plugin bundle vs 23
+// for AGENTS.md).
+export function workbuddyMcpPath(t: ConnectTargets): string {
+  return t.homeDir + "/.workbuddy/mcp.json";
+}
+export function workbuddyDisciplinePath(t: ConnectTargets): string {
+  return t.projectDir + "/CODEBUDDY.md";
+}
+
+export function applyWorkbuddy(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  return [
+    applyServerEntry(workbuddyMcpPath(t), ["mcpServers"], mcpServerEntry(baseUrl, envVar)),
+    applyMarkdownBlock(workbuddyDisciplinePath(t)),
+  ];
+}
+
+export function disconnectWorkbuddy(t: ConnectTargets): FileWrite[] {
+  return [
+    removeServerEntry(workbuddyMcpPath(t), ["mcpServers"]),
+    removeMarkdownBlock(workbuddyDisciplinePath(t)),
+  ];
+}
+
+// ── gemini-cli / qwen (unify-harness-delivery 3.4) ───────────────────────────
+//
+// Both are Gemini-CLI-shaped forks: `~/.<name>/settings.json`, servers under
+// `mcpServers` with `{ httpUrl, headers }` (note: `httpUrl`, not `url`), and a
+// flat `hooks.<Event>` array of `{ matcher, hooks }` entries — the same nesting
+// Claude Code uses. Their hook OUTPUT protocol also matches
+// (hookSpecificOutput.additionalContext), which is why both are in
+// INJECTION_ENVELOPE.
+//
+// Before this, both were wired to a DIFFERENT memory product on a dead port
+// (:49374) and a separate near-empty store. Same events, right target.
+function geminiFamilySettingsPath(t: ConnectTargets, dir: string): string {
+  return `${t.homeDir}/${dir}/settings.json`;
+}
+function geminiFamilyServerEntry(baseUrl: string, envVar: string): Record<string, unknown> {
+  return {
+    httpUrl: mcpUrlFor(baseUrl),
+    timeout: 5000,
+    headers: { Authorization: "Bearer ${" + envVar + "}" },
+  };
+}
+
+export function applyGeminiFamily(t: ConnectTargets, dir: string, harness: Harness, baseUrl: string, envVar: string): FileWrite[] {
+  const file = geminiFamilySettingsPath(t, dir);
+  return [
+    applyServerEntry(file, ["mcpServers"], geminiFamilyServerEntry(baseUrl, envVar)),
+    applyJson(file, (doc) => wireHooks(doc, t, harness)),
+  ];
+}
+
+export function disconnectGeminiFamily(t: ConnectTargets, dir: string, harness: Harness): FileWrite[] {
+  const file = geminiFamilySettingsPath(t, dir);
+  return [
+    removeServerEntry(file, ["mcpServers"]),
+    applyJson(file, (doc) => unwireHooks(doc, t, harness), "removed"),
+  ];
+}
+
 // ── generic mcp ──────────────────────────────────────────────────────────────
 // Pure generator for `connect mcp`: a paste-ready snippet for any MCP client.
 // Never touches a tool-specific config file; token stays an env reference.

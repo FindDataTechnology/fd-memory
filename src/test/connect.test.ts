@@ -26,16 +26,17 @@ import {
   disciplineText,
   platformDisciplineText,
 } from "../connect/discipline-text.js";
-import { removeManagedBlock, upsertManagedBlock } from "../connect/managed-block.js";
-import {
+import { removeManagedBlock, upsertManagedBlock } from "../connect/managed-block.js";import {
   COZE_RECON_DATE,
   COZE_RECON_ISSUES,
   DIFY_VERIFY_TOOLS,
   applyClaudeCode,
+  applyWorkbuddy,
   applyZcode,
   cozeRecon,
   difyRecipe,
   disconnectClaudeCode,
+  disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
   mcpUrlFor,
@@ -48,6 +49,9 @@ import {
   envVarFor,
   loadCredentials,
   planIdentity,
+  PROFILE_BEGIN,
+  PROFILE_END,
+  profileSourceLine,
   saveCredentials,
   writeEnvFile,
 } from "../connect/credentials.js";
@@ -57,6 +61,8 @@ import {
   normalizeHookEvent,
   readStdinJson,
 } from "../connect/hook-forward.js";
+import { CONNECT_USAGE, INJECTION_ENVELOPE, connectHarnesses, injectionPayload } from "../connect/cli.js";
+import { embedDisabled } from "../distill-scheduler.js";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -734,4 +740,174 @@ test("discipline: platform text equals the cross-language golden the Python pack
     golden,
     "python golden is stale — run `node scripts/emit-discipline-golden.mjs` after editing discipline-text.ts",
   );
+});
+
+// ── recall-injection envelope (unify-harness-delivery 1.1) ───────────────────
+// The defect this pins: the hook shipped `{"additionalContext": ...}` at the top
+// level, while every target that reads it looks inside
+// `hookSpecificOutput.additionalContext`. The hook exited 0 and nothing was
+// injected — invisible, and green in every test we had. These assertions are
+// about the SHAPE, because a wrong shape is indistinguishable from silence.
+
+test("injection: claude-code/gemini-cli/qwen/workbuddy get hookSpecificOutput.additionalContext", () => {
+  for (const harness of ["claude-code", "gemini-cli", "qwen", "workbuddy", "codebuddy"]) {
+    const payload = injectionPayload(harness, "记忆正文") as {
+      hookSpecificOutput?: { hookEventName?: string; additionalContext?: string };
+      additionalContext?: string;
+    };
+    assert.equal(payload.additionalContext, undefined, `${harness}: top-level additionalContext has no reader`);
+    assert.equal(payload.hookSpecificOutput?.hookEventName, "SessionStart", `${harness}: envelope must name the event`);
+    assert.equal(payload.hookSpecificOutput?.additionalContext, "记忆正文", `${harness}: text must ride the envelope`);
+  }
+});
+
+test("injection: no text and no verified envelope both emit {} ", () => {
+  assert.deepEqual(injectionPayload("claude-code", ""), {}, "empty context must be legal JSON, not a fake envelope");
+  // zcode: neither key exists in its bundle and its hooks are trust-gated, so a
+  // guessed envelope would be a silent no-op. Absence is the honest output.
+  assert.deepEqual(injectionPayload("zcode", "记忆正文"), {}, "unverified harness must not be sent a guessed shape");
+  assert.deepEqual(injectionPayload("some-unknown-harness", "记忆正文"), {});
+});
+
+// ── shell-profile export (unify-harness-delivery 1.2) ────────────────────────
+// The MCP entry references ${YONGYI_TOKEN_*}. Nothing exported it, so the entry
+// 401'd while hooks worked. These assertions cover the block that fixes it: it
+// carries a `source` line (never the token), it is idempotent, and removing it
+// restores the file byte-for-byte — the same invariants the discipline block
+// holds.
+
+test("profile block: carries a source line, never a token literal", () => {
+  const envPath = "/home/u/.yongyi/env";
+  const line = profileSourceLine(envPath);
+  assert.match(line, /\. '.*\/\.yongyi\/env'/, "must source the 0600 env file");
+  assert.doesNotMatch(line, /fdm_|Bearer|token=/i, "must not carry credential material");
+});
+
+test("profile block: idempotent, and removal restores the original bytes", () => {
+  const envPath = "/home/u/.yongyi/env";
+  const markers = { begin: PROFILE_BEGIN, end: PROFILE_END };
+  const original = 'export PATH="$HOME/bin:$PATH"\nalias ll="ls -l"\n';
+
+  const once = upsertManagedBlock(original, profileSourceLine(envPath), markers);
+  assert.equal(once.changed, true);
+  assert.match(once.text, /# >>> yongyi >>>/);
+  assert.ok(once.text.startsWith(original), "user content must be preserved verbatim before the block");
+
+  const twice = upsertManagedBlock(once.text, profileSourceLine(envPath), markers);
+  assert.equal(twice.changed, false, "second run must be a no-op");
+  assert.equal(twice.text, once.text);
+
+  const removed = removeManagedBlock(once.text, markers);
+  assert.equal(removed.text, original, "removal must restore the file byte-for-byte");
+});
+
+test("profile block: a path with spaces and a quote survives quoting", () => {
+  const line = profileSourceLine("/Users/a b/it's here/.yongyi/env");
+  // Rendered form must still be a single shell token per argument.
+  assert.match(line, /\[ -f '/);
+  assert.match(line, /'\\''/, "embedded single quote must be escaped, not dropped");
+});
+
+// ── vector-lane kill switch (unify-harness-delivery 1.3) ─────────────────────
+// The gateway this deployment points at serves no embedding model, so every
+// digest paid a round-trip to learn "404" and then degraded with a note that
+// reads like an outage. An explicit OFF makes keyword-only recall a declared
+// mode. Unset must keep the old behaviour — this gate is opt-in.
+test("embed gate: off/0/false/no disable the lane; unset and any other value keep it on", () => {
+  for (const v of ["off", "OFF", "0", "false", "no", " off "]) {
+    assert.equal(embedDisabled({ FD_MEMORY_EMBED: v } as NodeJS.ProcessEnv), true, `"${v}" must disable`);
+  }
+  for (const v of [undefined, "", "on", "1", "true", "anything"]) {
+    assert.equal(embedDisabled({ FD_MEMORY_EMBED: v } as NodeJS.ProcessEnv), false, `"${v}" must keep the lane on`);
+  }
+});
+
+
+// ── workbuddy adapter (unify-harness-delivery 3.2/3.3) ───────────────────────
+// WorkBuddy keeps MCP at ~/.workbuddy/mcp.json (its own file, not Claude's) and
+// has NO user-level hooks key — hooks only arrive through plugins. So this
+// adapter writes exactly two artifacts and must not pretend to wire capture.
+test("workbuddy: MCP lands in its own file, discipline in CODEBUDDY.md, no hooks key written", () => {
+  const home = tmp("fdm-wb-");
+  const proj = tmp("fdm-wbp-");
+  const t = targetsFor(home, proj);
+
+  const first = applyWorkbuddy(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_WORKBUDDY");
+  const paths = first.map((f) => f.path);
+  assert.ok(paths.includes(join(home, ".workbuddy", "mcp.json")), "MCP must land in the client's own file");
+  assert.ok(paths.includes(join(proj, "CODEBUDDY.md")), "discipline must land in the file this family reads");
+
+  const mcp = JSON.parse(readFileSync(join(home, ".workbuddy", "mcp.json"), "utf8"));
+  assert.equal(mcp.mcpServers["fd-memory"].url, "http://127.0.0.1:49376/mcp");
+  assert.match(mcp.mcpServers["fd-memory"].headers.Authorization, /^Bearer \$\{YONGYI_TOKEN_WORKBUDDY\}$/);
+
+  // Idempotent: a second run changes nothing.
+  const second = applyWorkbuddy(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_WORKBUDDY");
+  assert.equal(second.find((f) => f.path.endsWith("mcp.json"))?.action, "unchanged");
+  assert.equal(second.filter((f) => f.action === "updated").length, 0, "second run must be a no-op");
+});
+
+test("workbuddy: disconnect removes every artifact and leaves no hooks key behind", () => {
+  const home = tmp("fdm-wbd-");
+  const proj = tmp("fdm-wbdp-");
+  const t = targetsFor(home, proj);
+  applyWorkbuddy(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_WORKBUDDY");
+
+  const removed = disconnectWorkbuddy(t);
+  assert.ok(removed.length > 0);
+  const mcp = JSON.parse(readFileSync(join(home, ".workbuddy", "mcp.json"), "utf8"));
+  assert.equal((mcp.mcpServers as Record<string, unknown>)?.["fd-memory"], undefined, "entry must be gone");
+  assert.equal(existsSync(join(proj, "CODEBUDDY.md")), false, "a file that held only our block goes away");
+});
+
+test("workbuddy: usage text and supported set agree", () => {
+  const harnesses = connectHarnesses();
+  assert.ok(harnesses.includes("workbuddy"));
+  for (const h of harnesses) {
+    assert.ok(CONNECT_USAGE.includes(`connect ${h} `), `${h} missing from usage text`);
+  }
+});
+
+// ── connect/serve data-dir agreement (found during unify-harness-delivery 3.4) ─
+// The defect this pins: `connect` derived the store from ConnectTargets.homeDir
+// while `serve` derives it from $HOME. Any override (a --dir run, a test HOME)
+// made connect mint a token into a store the daemon never reads — connect
+// reported success and every subsequent request was 401. Same rule, one place.
+test("connect mints into the same store `serve` reads (FD_MEMORY_DATA, else $HOME)", async () => {
+  const home = tmp("fdm-datadir-");
+  const proj = tmp("fdm-datadirp-");
+  const env = { HOME: home, YONGYI_HOME: join(home, ".yongyi") };
+
+  const r = await runCli(["connect", "claude-code", "--url", "http://127.0.0.1:1", "--as", "u@example.com"], { env, cwd: proj });
+  assert.equal(r.code, 0, r.err);
+
+  // What serve would open with the same env.
+  const serveDir = join(home, "Library/Application Support/fd-memory");
+  const tokPath = join(serveDir, "tokens.db");
+  assert.ok(existsSync(tokPath), `token store must land where serve looks (${tokPath})`);
+
+  // And the token connect wrote must verify against that store with the same pepper.
+  const { TokenStore } = await import("../auth.js");
+  const store = new TokenStore(tokPath, "fd-memory-dev-pepper");
+  const token = loadCredentials(join(home, ".yongyi", "credentials.json")).bindings["claude-code"].token;
+  assert.ok(store.verify(token), "the bound token must authenticate against the store serve would open");
+});
+
+// ── profile target must be read by NON-INTERACTIVE shells (found in 6.3) ─────
+// The defect: the source line went into ~/.zshrc, which zsh reads only for
+// INTERACTIVE shells. Harnesses launched from a GUI/IDE/cron run
+// non-interactive — and `zsh -lc` reads .zprofile/.zlogin, also not .zshrc — so
+// the variable resolved in a terminal and was absent exactly where the MCP
+// entry needed it. That is indistinguishable from a bad token (401, no local
+// signal). `.zshenv` is the only file read in every mode.
+test("connect writes the export block to .zshenv, not .zshrc", async () => {
+  const home = tmp("fdm-prof-");
+  const proj = tmp("fdm-profp-");
+  const env = { HOME: home, YONGYI_HOME: join(home, ".yongyi") };
+  const r = await runCli(["connect", "claude-code", "--url", "http://127.0.0.1:1", "--as", "u@example.com"], { env, cwd: proj });
+  assert.equal(r.code, 0, r.err);
+
+  const zshenv = readFileSync(join(home, ".zshenv"), "utf8");
+  assert.match(zshenv, /# >>> yongyi >>>/, ".zshenv must carry the block — every shell mode reads it");
+  assert.equal(existsSync(join(home, ".zshrc")), false, "must not touch .zshrc (interactive-only, wrong target)");
 });
