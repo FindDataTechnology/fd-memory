@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { rootKeyForRef } from "../auth.js";
 import { spoolAppend, spoolRead, spoolRewrite } from "./observe-spool.js";
+import { readInjectionState, recordInjection, stalenessNote } from "./injection-state.js";
 import {
   applyClaudeCode,
   applyGeminiFamily,
@@ -469,7 +470,12 @@ export function readIndexFromDisk(project: string, binding: Binding, maxChars = 
     const lines: string[] = [
       "【永忆 · 跨 harness 记忆】（服务不可达，以下直接读自本地索引 —— 内容可能比常态少）",
     ];
-    let used = lines[0].length;
+    // Same staleness note as the HTTP path. Computed here rather than passed in
+    // because this function is also the fallback for a caller that never got as
+    // far as buildSessionContext's own read.
+    const prevStale = stalenessNote(readInjectionState(spoolHome()));
+    if (prevStale) lines.push(prevStale);
+    let used = lines.reduce((n, l) => n + l.length + 1, 0);
     let shown = 0;
     for (const row of rows) {
       if (used >= maxChars) break;
@@ -487,6 +493,9 @@ export function readIndexFromDisk(project: string, binding: Binding, maxChars = 
     }
     if (shown === 0) return "";
     lines.push("（服务恢复后本行消失；本轮学到新结论仍可 memory_write_page 落页。）");
+    // Record that this session got a DEGRADED injection, so the next session
+    // knows the memory it inherits may be thin (2026-11-19).
+    recordInjection(spoolHome(), { at: new Date().toISOString(), source: "disk", entries: shown });
     return lines.join("\n");
   } catch {
     // Even the fallback can fail (permissions, corrupt frontmatter). Returning
@@ -498,6 +507,13 @@ export function readIndexFromDisk(project: string, binding: Binding, maxChars = 
 export async function buildSessionContext(binding: Binding): Promise<string> {
   const base = binding.url.replace(/\/+$/, "");
   const project = binding.project && binding.project !== "default" ? binding.project : "default";
+  // How stale is the PREVIOUS injection? Read before writing this one, and
+  // prepend a note when it is old (2026-11-19). This is the last of the three
+  // fallbacks: read falls back to disk, write spools locally, and this one makes
+  // staleness VISIBLE — a thin injection and a stale one look identical from
+  // inside, and silently serving old conclusions as current is the worst thing
+  // a memory system can do.
+  const staleness = stalenessNote(readInjectionState(spoolHome()));
   const ctl = new AbortController();
   // 5s, not 2s: the index query touches a multi-thousand-page table on a disk
     // shared with an 8.5 GB session database (measured 2026-11-16: 1.4–2.5 s,
@@ -532,7 +548,8 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     if (entries.length === 0) return "";
 
     const lines: string[] = ["【永忆 · 跨 harness 记忆】以下是已沉淀的结论（本地优先，其余为其它 harness 的经验）："];
-    let used = lines[0].length;
+    if (staleness) lines.push(staleness);
+    let used = lines.reduce((n, l) => n + l.length + 1, 0);
     const MAX_CHARS = 3000;
     let shown = 0;
 
@@ -572,6 +589,7 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     const hidden = (doc.total ?? entries.length) - shown;
     if (hidden > 0) lines.push(`…另有 ${hidden} 条未列出，用 memory_query 检索全文。`);
     lines.push("本轮学到新结论时用 memory_write_page 落页；收尾时可写 memory_handoff_begin 交接。");
+    recordInjection(spoolHome(), { at: new Date().toISOString(), source: "service", entries: shown });
     return lines.join("\n");
   } catch {
     // The service is unreachable, timed out, or answered garbage. Falling back
