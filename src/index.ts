@@ -5,7 +5,7 @@
 import { Service } from "./http.js";
 import { TokenStore } from "./auth.js";
 import { StoreRoot } from "./store.js";
-import { runConnect, runDisconnect, runHook } from "./connect/cli.js";
+import { runConnect, runDisconnect, runHook, runObserveReplay } from "./connect/cli.js";
 import { mkdirSync } from "node:fs";
 
 function dataDir(): string {
@@ -27,7 +27,8 @@ usage:
   yongyi token revoke --id <id>
   yongyi connect claude-code|zcode|mcp|dify|coze --url U --as user [--project P] [--dir D]
   yongyi disconnect <harness>
-  yongyi hook <harness> <event>      stdin: hook event JSON (capture, fail-drop)
+  yongyi hook <harness> <event>      stdin: hook event JSON (capture; spools locally when the service is down)
+yongyi observe-replay              deliver the local observe spool after an outage
   yongyi replay --root <rootKey>     rebuild observations index from the append-only log
   yongyi import claude-code|zcode|summary --root <rootKey> [--project P] [--dry-run] [--batch N] [--profile light|full] [--yes]
   yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]
@@ -310,6 +311,8 @@ if (cmd === "serve") {
   }
 } else if (cmd === "hook") {
   runHook(process.argv.slice(3), readStdin).catch((e: unknown) => fail(e));
+} else if (cmd === "observe-replay") {
+  runObserveReplay().catch((e: unknown) => fail(e));
 } else {
   console.error(`unknown command: ${cmd} (see --help)`);
   process.exit(2);

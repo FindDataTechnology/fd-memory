@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { rootKeyForRef } from "../auth.js";
+import { spoolAppend, spoolRead, spoolRewrite } from "./observe-spool.js";
 import {
   applyClaudeCode,
   applyGeminiFamily,
@@ -584,6 +585,48 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
   }
 }
 
+/**
+ * Drain the local observe spool (2026-11-19).
+ *
+ * Companion to the hook's spooling: when the service was down, events went to a
+ * local JSONL file instead of being dropped. This delivers them.
+ *
+ * Delivery is decided per entry, and the survivors are written back — so a
+ * replay against a still-broken service is safe to run repeatedly and loses
+ * nothing. Entries are attempted in file order (oldest first) on purpose: if the
+ * service is flapping, the oldest events are the ones with the most to lose by
+ * staying on disk.
+ *
+ * Prints a one-line summary and exits 0 even when nothing could be delivered —
+ * a replay is a maintenance action, not a gate. A caller that wants a verdict
+ * can read the counts.
+ */
+export async function runObserveReplay(): Promise<void> {
+  const home = spoolHome();
+  const entries = spoolRead(home);
+  if (entries.length === 0) {
+    process.stdout.write("observe-replay: spool is empty — nothing to deliver\n");
+    return;
+  }
+  const survivors: typeof entries = [];
+  let delivered = 0;
+  for (const entry of entries) {
+    const result = await forwardHookEvent({
+      url: entry.url,
+      token: entry.token,
+      event: entry.event as never,
+      timeoutMs: 5000,
+    });
+    if (result.delivered) delivered += 1;
+    else survivors.push(entry);
+  }
+  const rewrote = spoolRewrite(home, survivors);
+  process.stdout.write(
+    `observe-replay: ${delivered} delivered, ${survivors.length} still pending` +
+    `${rewrote ? "" : " (WARNING: could not rewrite the spool — pending entries may repeat)"}\n`,
+  );
+}
+
 export async function runHook(argv: string[], readStdin: () => Promise<string>): Promise<void> {
   const { positionals } = parseArgs(argv, []);
   const harness = positionals[0];
@@ -635,8 +678,22 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
     event: mapped,
   });
   if (!result.delivered) {
-    console.error(`yongyi hook: capture dropped (${result.error ?? "unknown"})`);
+    // Spool it instead of dropping it (2026-11-19). Fail-drop was the original
+    // contract and it is wrong now that the service is routinely unreachable on
+    // this machine: every event captured during an outage was lost forever.
+    // `yongyi observe-replay` drains the spool once the service is back.
+    // The hook still exits 0 either way — a capture hook must never block a
+    // harness turn, and losing the spool write is not worth failing a turn for.
+    const spooled = spoolAppend(spoolHome(), { url: binding.url, token, event: mapped, at: new Date().toISOString() });
+    console.error(spooled
+      ? `yongyi hook: service unreachable (${result.error ?? "unknown"}) — event spooled locally; run \`yongyi observe-replay\` when it is back`
+      : `yongyi hook: capture dropped (${result.error ?? "unknown"}) and could not be spooled`);
   }
+}
+
+/** Where the observe spool lives — same dir as credentials, so one flag moves both. */
+function spoolHome(): string {
+  return process.env.YONGYI_HOME ?? homedir() + "/.yongyi";
 }
 
 // Hook event builder: attach the binding's project when it differs from the
