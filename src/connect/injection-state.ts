@@ -17,7 +17,7 @@
 // Bounded and atomic: one small JSON file, written with write-then-rename so a
 // crash cannot leave a half-record that would then be misread as "very old".
 
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 
 export interface InjectionState {
@@ -53,6 +53,21 @@ export function recordInjection(home: string, state: InjectionState): boolean {
     const tmp = `${p}.tmp`;
     writeFileSync(tmp, JSON.stringify(state));
     renameSync(tmp, p);
+    // Append to a history too (2026-11-19). The single state file answers "how
+    // stale is the last injection"; it cannot answer "is the fallback firing
+    // once a day or on every session" — and that difference decides whether a
+    // degraded injection is an incident or the normal operating mode. Observed
+    // 2026-11-19: the state read `source:disk` with no way to tell how often
+    // that had been true.
+    //
+    // Bounded by line count, same reasoning as the spool: a diagnostic trail
+    // must never become the thing that fills the disk.
+    try {
+      const hist = join(home, "injection-history.log");
+      appendFileSync(hist, `${state.at} source=${state.source} entries=${state.entries}\n`);
+      const lines = readFileSync(hist, "utf8").split("\n").filter(Boolean);
+      if (lines.length > 500) writeFileSync(hist, lines.slice(-500).join("\n") + "\n");
+    } catch { /* history is a convenience; the primary record already landed */ }
     return true;
   } catch {
     return false;

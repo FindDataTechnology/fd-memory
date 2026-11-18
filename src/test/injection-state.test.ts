@@ -14,7 +14,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { recordInjection, readInjectionState, stalenessNote, statePath } from "../connect/injection-state.js";
@@ -89,4 +89,39 @@ test("a record with an unparseable timestamp yields no note", () => {
 
 test("recording never throws, even on an unusable path", () => {
   assert.equal(recordInjection("/dev/null/nope", { at: new Date().toISOString(), source: "service", entries: 0 }), false);
+});
+
+test("each record appends to a bounded history (frequency must be answerable)", () => {
+  // The single state file says how stale the LAST injection was. It cannot say
+  // whether the fallback fires once a day or on every session — and that
+  // difference decides whether a degraded injection is an incident or the
+  // normal mode. Observed 2026-11-19: state read `source:disk` with no history
+  // to compare against.
+  const home = mkdtempSync(join(tmpdir(), "fd-inj-hist-"));
+  try {
+    recordInjection(home, { at: isoAgo(3 * HOUR), source: "service", entries: 30 });
+    recordInjection(home, { at: isoAgo(2 * HOUR), source: "disk", entries: 11 });
+    recordInjection(home, { at: isoAgo(1 * HOUR), source: "service", entries: 28 });
+    const raw = readFileSync(join(home, "injection-history.log"), "utf8").split("\n").filter(Boolean);
+    assert.equal(raw.length, 3, `expected 3 history lines, got ${raw.length}`);
+    assert.match(raw[1], /source=disk entries=11/, `the middle line must record the degraded run:\n${raw[1]}`);
+    // The single-record path still works.
+    assert.equal(readInjectionState(home)?.entries, 28);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("history is bounded — a diagnostic trail must not fill the disk", () => {
+  const home = mkdtempSync(join(tmpdir(), "fd-inj-bound-"));
+  try {
+    for (let i = 0; i < 520; i++) {
+      recordInjection(home, { at: new Date(Date.now() - i * 1000).toISOString(), source: "service", entries: 1 });
+    }
+    const lines = readFileSync(join(home, "injection-history.log"), "utf8").split("\n").filter(Boolean);
+    assert.ok(lines.length <= 500, `history must stay bounded, saw ${lines.length}`);
+    assert.ok(lines.length >= 400, `but must not be truncated to nothing, saw ${lines.length}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
