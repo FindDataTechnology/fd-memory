@@ -93,3 +93,29 @@ if (tables.length) {
     console.log(`  ${String(name).padEnd(22)} ${Number(sizeMb).toFixed(1)} MB`);
   }
 }
+
+// Append a one-line history record (2026-11-19).
+//
+// Why: three times in this work I attributed a stall to a code defect, and each
+// time the numbers I was reading came from a MOMENT when the machine was
+// already saturated. I had no series to look at — only isolated readings taken
+// hours apart, each interpreted as if it were the steady state. A one-line
+// series makes "when did this start growing" answerable without re-measuring.
+//
+// Format is deliberately greppable and one line per run, so `tail -20` on the
+// file shows both the trend and the current value.
+try {
+  const { appendFileSync, mkdirSync } = await import("node:fs");
+  const { dirname } = await import("node:path");
+  const histPath = join(a.data, "db-stats-history.log");
+  mkdirSync(dirname(histPath), { recursive: true });
+  const ftsMb = (() => {
+    const row = tables.find((l) => l.startsWith("pages_fts_data|"));
+    return row ? Number(row.split("|")[1]).toFixed(1) : "?";
+  })();
+  appendFileSync(
+    histPath,
+    `${new Date().toISOString()} size_mb=${(size / 1048576).toFixed(1)} pages=${pageCount} ` +
+    `freelist=${freelist} fts_mb=${ftsMb} new_${a.days}d=${allRecent}\n`,
+  );
+} catch { /* history is a convenience; never fail the report for it */ }
