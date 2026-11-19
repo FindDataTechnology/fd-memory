@@ -65,6 +65,42 @@ test("store roots isolate owners physically", () => {
   }
 });
 
+// FTS overwrite semantics (2026-11-19). indexPage used to retire the old FTS
+// row with an unconditional `DELETE ... WHERE path=?`; that predicate is an
+// UNINDEXED fts5 column, so every page write paid a full index scan (22ms) to
+// delete nothing 88% of the time. It is now conditional on a pre-upsert PK
+// lookup. The optimization is only sound if an overwrite STILL replaces the
+// indexed text rather than appending a second row — that is what this pins:
+// a stale term must stop matching, the new term must match, and the row count
+// must not grow.
+test("indexPage overwrite replaces the FTS row instead of duplicating it", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "d-p--a");
+    const countFts = () => (root.db.db.prepare("SELECT COUNT(*) AS n FROM pages_fts").get() as { n: number }).n;
+    const matchCount = (term: string) =>
+      (root.db.db.prepare("SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?").get(`"${term}"`) as { n: number }).n;
+
+    root.writePage("default", "facts", "f1", newPage("fact", "结算口径", "毛利率按含退口径"));
+    const afterFirst = countFts();
+    // Trigram tokenizer: a query needs >= 3 characters to match anything.
+    assert.equal(matchCount("含退口"), 1, "first write indexes the body");
+
+    // Same path, different text: the overwrite must REPLACE.
+    root.writePage("default", "facts", "f1", newPage("fact", "结算口径", "毛利率按扣退口径"));
+    assert.equal(countFts(), afterFirst, "an overwrite must not append a second FTS row");
+    assert.equal(matchCount("含退口"), 0, "the stale term must stop matching after an overwrite");
+    assert.equal(matchCount("扣退口"), 1, "the new term must match after an overwrite");
+
+    // A fresh path still indexes normally.
+    root.writePage("default", "facts", "f2", newPage("fact", "另一口径", "收入按净额确认"));
+    assert.equal(countFts(), afterFirst + 1, "a new path adds exactly one row");
+    assert.equal(matchCount("净额确"), 1);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("reindex rebuilds derived db without touching wiki truth", () => {
   const data = tmpData();
   try {

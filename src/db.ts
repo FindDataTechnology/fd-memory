@@ -408,6 +408,11 @@ export class RootDb {
     const tier = meta?.tier ?? "draft";
     const sourceRef = meta?.source_ref ?? null;
     const metadata = meta?.metadata && Object.keys(meta.metadata).length > 0 ? JSON.stringify(meta.metadata) : null;
+    // Read this BEFORE the upsert below: after it, `pages` always holds the
+    // path and the "was this an overwrite?" question is unanswerable. Drives
+    // whether the FTS row has to be retired first (see the FTS block at the
+    // end of this method).
+    const existedBefore = this.db.prepare("SELECT 1 FROM pages WHERE path=?").get(relPath) !== undefined;
     this.db.prepare(
       `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref, metadata, page_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
@@ -421,7 +426,38 @@ export class RootDb {
     this.db.prepare("DELETE FROM superseded_edges WHERE by_path=?").run(relPath);
     const insEdge = this.db.prepare("INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)");
     for (const id of (meta?.supersedes ?? [])) if (id) insEdge.run(String(id), relPath, project);
-    this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
+    // FTS row replacement (2026-11-19). This used to be an unconditional
+    // `DELETE FROM pages_fts WHERE path=?`. `path` is an fts5 UNINDEXED column,
+    // so that DELETE compiles to `SCAN pages_fts VIRTUAL TABLE INDEX 0:` — a
+    // full scan of every indexed row, on EVERY page write, whether or not the
+    // path was ever there. Measured on the live 48k-row index: 18–22ms median,
+    // p95 over 100ms, versus 0.2ms for the INSERT it guards. Since 88% of write
+    // volume is observations whose slug is `randomUUID().slice(0,8)` (physically
+    // unrepeatable), the scan almost never found anything to delete.
+    //
+    // Fix: read the pre-upsert existence from `pages` (a real PRIMARY KEY
+    // lookup, 0.002ms) and only pay for the DELETE when this path was already
+    // indexed. The probe must happen BEFORE the pages upsert above, because
+    // after it the row always exists.
+    //
+    // Measured on a copy of the live DB: 22.36ms -> 0.06ms median, p95
+    // 108.5ms -> 0.45ms. Deliberately NOT the rowid trick: `pages` and
+    // `pages_fts` are independent rowid sequences — only 2,906 of 48k rows
+    // share both rowid AND path, so deleting by rowid would target the wrong
+    // document.
+    //
+    // Known ceiling: this trades a full scan for a PK lookup, which is only
+    // sound while `pages` is the authority for "is this path indexed?" — an
+    // FTS row with no matching `pages` row would now survive and gain a
+    // sibling instead of being replaced. That state is unreachable by
+    // construction (every writer touches `pages` first, and both
+    // deletePageIndex and reindexFromWiki drop FTS alongside pages) and
+    // measured 0 rows on the live index. If it ever appears, the fix is to
+    // convert pages_fts to an external-content table over `pages` and use
+    // FTS5's 'delete' command with the OLD row values — that is O(log n) and
+    // authoritative. Upgrading to that here would mean a schema migration for
+    // a case that cannot currently occur.
+    if (existedBefore) this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
   }
