@@ -681,7 +681,18 @@ export async function runObserveReplay(): Promise<void> {
   // costs nothing and converts "hammered the service until it stalled" into a
   // trickle it can absorb. The delay is deliberately generous: the goal is to
   // drain the backlog, not to finish fast.
-  const paceMs = Number(process.env.YONGYI_REPLAY_PACE_MS ?? 50) || 0;
+  // 5000ms, not 1000 (2026-11-19). Measured: a 1s pre-flight window passed while
+  // the service was mid-stall — the run then hung for 180s and grew the backlog
+  // by 47. `stalls` moves in bursts, so a one-second sample misses the moment;
+  // five seconds is long enough to see a stall onset, and replay is a
+  // maintenance action that can afford the wait.
+  const PREFLIGHT_WINDOW_MS = 5000;
+  // 200ms, not 50 (same run). At 50ms the loop could outrun a struggling
+  // service: each delivery writes a page, and the writes queue faster than the
+  // service retires them. 200ms is still ~700 entries/minute, well above the
+  // ~16/min the backlog grows at, so it drains — just gently enough that the
+  // service keeps up.
+  const paceMs = Number(process.env.YONGYI_REPLAY_PACE_MS ?? 200) || 0;
 
   // Health gate before replaying (2026-11-19). Measured: a replay against an
   // already-stalled service pushed `stalls` from 118 to 123 and GREW the backlog
@@ -708,12 +719,12 @@ export async function runObserveReplay(): Promise<void> {
     process.stderr.write(`observe-replay: cannot read ${healthUrl} — leaving ${entries.length} on the spool\n`);
     return;
   }
-  await new Promise((r) => setTimeout(r, 1000));
+  await new Promise((r) => setTimeout(r, PREFLIGHT_WINDOW_MS));
   const s2 = await stallsNow();
   if (s2 !== null && s2 > s1) {
     process.stderr.write(
-      `observe-replay: the service is stalling right now (stalls ${s1}→${s2} in 1s) — replaying would make it worse. ` +
-      `Leaving ${entries.length} on the spool; run again when the machine is quieter.\n`,
+      `observe-replay: the service is stalling right now (stalls ${s1}→${s2} in ${PREFLIGHT_WINDOW_MS / 1000}s) — ` +
+      `replaying would make it worse. Leaving ${entries.length} on the spool; run again when the machine is quieter.\n`,
     );
     return;
   }
