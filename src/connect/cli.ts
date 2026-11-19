@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from "node:fs";
 import { rootKeyForRef } from "../auth.js";
-import { spoolAppend, spoolRead, spoolRewrite } from "./observe-spool.js";
+import { spoolAppend, spoolRead, spoolRewrite, spoolCapacity } from "./observe-spool.js";
 import { readInjectionState, recordInjection, stalenessNote } from "./injection-state.js";
 import {
   applyClaudeCode,
@@ -778,9 +778,15 @@ export async function runObserveReplay(): Promise<void> {
     }
   }
   const rewrote = spoolRewrite(home, survivors);
+  // Report how full the spool is (2026-11-19). "628 still pending" alone does not
+  // tell the reader whether that is fine or whether eviction starts in an hour —
+  // the capacity line does, and it is the only number that answers "how long do
+  // I have before events start being lost".
+  const cap = spoolCapacity(home);
   process.stdout.write(
     `observe-replay: ${delivered} delivered, ${survivors.length} still pending` +
-    `${rewrote ? "" : " (WARNING: could not rewrite the spool — pending entries may repeat)"}\n`,
+    `${rewrote ? "" : " (WARNING: could not rewrite the spool — pending entries may repeat)"}\n` +
+    `observe-replay: ${cap.summary}\n`,
   );
 }
 

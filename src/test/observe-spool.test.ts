@@ -20,7 +20,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spoolAppend, spoolRead, spoolRewrite, spoolPath } from "../connect/observe-spool.js";
+import { spoolAppend, spoolRead, spoolRewrite, spoolPath, spoolCapacity } from "../connect/observe-spool.js";
 
 function entry(n: number) {
   return { url: "http://svc", token: "t", event: { title: `e${n}` }, at: new Date().toISOString() };
@@ -161,6 +161,29 @@ test("compaction keeps turn_outcome and evicts tool_call first", () => {
     assert.equal(signals.length, 1, `the session boundary must survive compaction, saw ${signals.length}`);
     assert.ok(kept.length <= 5000, `must stay bounded, saw ${kept.length}`);
     assert.equal((signals[0].event as { title: string }).title, "stop · session");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("spoolCapacity reports the budget that will trip first", () => {
+  // "628 still pending" does not tell a reader whether that is fine or whether
+  // eviction starts in an hour. The ratio is what answers "how long do I have".
+  const home = mkdtempSync(join(tmpdir(), "fd-spool-cap-"));
+  try {
+    const empty = spoolCapacity(home);
+    assert.equal(empty.lines, 0);
+    assert.equal(empty.pct, 0);
+    assert.match(empty.summary, /empty/, `an empty spool must read as empty:\n${empty.summary}`);
+
+    for (let i = 0; i < 100; i++) {
+      spoolAppend(home, { url: "http://svc", token: "t", at: new Date().toISOString(),
+        event: { type: "tool_call", title: `e${i}`, body: "x".repeat(100) } } as never);
+    }
+    const some = spoolCapacity(home);
+    assert.equal(some.lines, 100);
+    assert.ok(some.pct > 0 && some.pct < 100, `partial fill must read as partial, saw ${some.pct}`);
+    assert.match(some.summary, /100 entries/, `summary must name the count:\n${some.summary}`);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

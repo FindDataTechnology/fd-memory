@@ -174,3 +174,37 @@ function compact(file: string, opts: { force?: boolean } = {}): void {
     renameSync(tmp, file);
   } catch { /* best-effort */ }
 }
+
+/**
+ * How close the spool is to dropping events (2026-11-19).
+ *
+ * Why this exists: the spool is bounded (5000 lines / 5MB) precisely so a long
+ * outage cannot fill the disk — but "bounded" also means that at some point it
+ * starts evicting. Observed 2026-11-19: the backlog climbed 332 → 585 → 628
+ * while the service stayed unreachable, and there was no way to answer "how
+ * long until we start losing events" except by re-deriving it from the limits.
+ *
+ * Callers get a plain ratio plus a one-line human summary, so a hook or a
+ * diagnostic can say "spool is 12% full, ~5h of headroom at the current rate"
+ * instead of "spooled locally" and nothing else.
+ */
+export function spoolCapacity(home: string): { lines: number; bytes: number; pct: number; summary: string } {
+  const file = spoolPath(home);
+  let lines = 0;
+  let bytes = 0;
+  try {
+    const raw = readFileSync(file, "utf8");
+    bytes = Buffer.byteLength(raw, "utf8");
+    for (let i = 0; i < raw.length; i++) if (raw.charCodeAt(i) === 10) lines++;
+  } catch { /* missing file ⇒ empty, which is the healthy state */ }
+  // Whichever budget is closer to its limit decides the percentage — that is the
+  // one that will actually start evicting first.
+  const pct = Math.max(
+    MAX_LINES > 0 ? (lines / MAX_LINES) * 100 : 0,
+    MAX_BYTES > 0 ? (bytes / MAX_BYTES) * 100 : 0,
+  );
+  const summary = lines === 0
+    ? "spool empty"
+    : `spool ${lines} entries / ${(bytes / 1024).toFixed(0)}KB (${pct.toFixed(0)}% of capacity)`;
+  return { lines, bytes, pct, summary };
+}
