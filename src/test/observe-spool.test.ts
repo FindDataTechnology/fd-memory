@@ -20,7 +20,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { spoolAppend, spoolRead, spoolRewrite, spoolPath, spoolCapacity } from "../connect/observe-spool.js";
+import { spoolAppend, spoolRead, spoolRewrite, spoolPath, spoolCapacity, shouldSpool } from "../connect/observe-spool.js";
 
 function entry(n: number) {
   return { url: "http://svc", token: "t", event: { title: `e${n}` }, at: new Date().toISOString() };
@@ -184,6 +184,31 @@ test("spoolCapacity reports the budget that will trip first", () => {
     assert.equal(some.lines, 100);
     assert.ok(some.pct > 0 && some.pct < 100, `partial fill must read as partial, saw ${some.pct}`);
     assert.match(some.summary, /100 entries/, `summary must name the count:\n${some.summary}`);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("bash tool_calls are not spooled; everything else is", () => {
+  // Measured 2026-11-19: 2,716 of 3,084 backlogged events were `tool_call Bash`
+  // (88%) while `turn_outcome` — the session boundaries that drive distillation —
+  // numbered 92. The outage buffer was spending its capacity on shell-command
+  // residue and then had to evict by priority to protect the signal.
+  const mk = (type: string, title: string) => ({ url: "http://svc", token: "t", at: new Date().toISOString(), event: { type, title } });
+  assert.equal(shouldSpool(mk("tool_call", "tool_call Bash: ls -la") as never), false, "bash tool_calls must not consume spool capacity");
+  assert.equal(shouldSpool(mk("tool_call", "tool_call Edit: x.js") as never), true, "other tool_calls are rare enough to keep");
+  assert.equal(shouldSpool(mk("tool_call", "tool_call Read: a.md") as never), true);
+  assert.equal(shouldSpool(mk("turn_outcome", "stop · finddata") as never), true, "session boundaries are the signal — always kept");
+  assert.equal(shouldSpool(mk("health_flip", "health") as never), true);
+  // A malformed event must not be silently dropped on a guess.
+  assert.equal(shouldSpool({ url: "x", token: "t", at: "", event: null } as never), true);
+  // And the write path honours it.
+  const home = mkdtempSync(join(tmpdir(), "fd-spool-skip-"));
+  try {
+    assert.equal(spoolAppend(home, mk("tool_call", "tool_call Bash: pwd") as never), false);
+    assert.equal(spoolRead(home).length, 0, "a filtered event must not land on disk");
+    assert.equal(spoolAppend(home, mk("turn_outcome", "stop · x") as never), true);
+    assert.equal(spoolRead(home).length, 1);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

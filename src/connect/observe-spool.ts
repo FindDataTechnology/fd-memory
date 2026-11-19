@@ -42,8 +42,37 @@ export function spoolPath(home: string): string {
  * exactly as bad as one that never had a spool, so the caller must not have to
  * care.
  */
+/**
+ * Should this event be spooled at all?
+ *
+ * Measured 2026-11-19: of 3,084 backlogged events, **2,716 were
+ * `tool_call Bash`** (88%) — one per shell command. They are execution
+ * residue, not knowledge: `turn_outcome` (session boundaries, which drive
+ * distillation) numbered only 92. The spool was spending 61% of its capacity
+ * storing the least valuable class of event, and its eviction policy (fixed to
+ * prefer turn_outcome) had to fight that.
+ *
+ * Bash commands in particular are reproducible from the transcript and carry no
+ * conclusion. Read/Edit/Write are also low-value but far rarer (53/119/85 in the
+ * same sample), so they stay — the cost of keeping them is noise-level and they
+ * sometimes matter for "what did I actually change".
+ *
+ * Deliberately NOT filtering at the hook: the live path must still deliver
+ * everything, so `tool_call Bash` events that arrive while the service is HEALTHY
+ * are still recorded. Only the OUTAGE buffer is selective, because that is the
+ * one with a hard capacity limit.
+ */
+export function shouldSpool(entry: SpoolEntry): boolean {
+  const ev = entry.event as { type?: string; title?: string } | undefined;
+  if (!ev || typeof ev !== "object") return true;
+  if (ev.type !== "tool_call") return true;
+  return !/^tool_call Bash\b/.test(String(ev.title ?? ""));
+}
+
 export function spoolAppend(home: string, entry: SpoolEntry): boolean {
   try {
+    // Drop low-value events rather than letting them evict the valuable ones.
+    if (!shouldSpool(entry)) return false;
     const file = spoolPath(home);
     mkdirSync(home, { recursive: true });
     appendFileSync(file, JSON.stringify(entry) + "\n", { flag: "a" });
