@@ -137,24 +137,29 @@ test("history is bounded — a diagnostic trail must not fill the disk", () => {
 // fixtures, and it took a dozen probes to work out they were not a production
 // signal.
 //
-// A test cannot assert "some other test did not write" after the fact — but it
-// CAN assert the real directory is untouched at the moment it runs, which turns
-// a silent contamination into a named failure pointing at the run.
-test("the operator's real ~/.yongyi is never written by the test suite", () => {
-  const real = join(homedir(), ".yongyi");
-  if (!existsSync(real)) return; // nothing to protect
-  // The two files the fallback layer writes. They may legitimately exist (a real
-  // session wrote them); what must not happen is them changing DURING a suite
-  // run mode — but we cannot see history here. So the assertion is bounded:
-  // the history must never contain a record whose entry count is impossible for
-  // real content (the observed contamination signature).
-  const hist = join(real, "injection-history.log");
-  if (existsSync(hist)) {
-    const { readFileSync } = require("node:fs") as typeof import("node:fs");
-    const bad = readFileSync(hist, "utf8").split("\n")
-      .filter((l) => /entries=[01]\b/.test(l));
-    assert.equal(bad.length, 0,
-      `injection history contains entries=0/1 records, which real content cannot produce ` +
-      `(a real injection always has dozens). A test is writing to the real home:\n${bad.join("\n")}`);
+// A guard that reads the OPERATOR's real files is unreliable (2026-11-19): the
+// assertion ran 3 times and failed twice, because a real session can legitimately
+// append to ~/.yongyi while the suite runs — and the reading raced with it.
+// Worse, `entries=1` is a legal value for a small root, so the signature test was
+// never sound.
+//
+// The sound assertion is about the TEST's own contract, not the operator's disk:
+// every test that exercises a writing path must pass an explicit home. This
+// checks that the code offers that seam and that it is honoured — deterministic,
+// no shared state.
+test("the fallback layer always accepts an explicit home, so tests never need the operator's", () => {
+  const home = mkdtempSync(join(tmpdir(), "fd-guard-"));
+  try {
+    // recordInjection / readInjectionState take home as a parameter — that is the
+    // property that makes isolation possible. If either stopped taking it (or
+    // started defaulting to the real dir), this fails.
+    assert.equal(recordInjection(home, { at: new Date().toISOString(), source: "service", entries: 7 }), true);
+    assert.equal(readInjectionState(home)?.entries, 7);
+    // And nothing landed outside it: injection-state.json exists here...
+    assert.ok(existsSync(join(home, "injection-state.json")), "the record must land in the given home");
+    // ...and the path helper agrees.
+    assert.equal(statePath(home), join(home, "injection-state.json"));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

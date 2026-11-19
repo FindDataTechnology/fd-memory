@@ -687,6 +687,11 @@ export async function runObserveReplay(): Promise<void> {
   // five seconds is long enough to see a stall onset, and replay is a
   // maintenance action that can afford the wait.
   const PREFLIGHT_WINDOW_MS = 5000;
+  // How many new stalls over the run mean "the replay is doing this". Measured
+  // 2026-11-19: a healthy service accumulated ~47 stalls in 20 minutes on its
+  // own (≈2.4/min), so a +5 threshold over one 20-delivery batch is well above
+  // background noise while still catching a real collapse.
+  const INFLIGHT_STALL_LIMIT = 5;
   // 200ms, not 50 (same run). At 50ms the loop could outrun a struggling
   // service: each delivery writes a page, and the writes queue faster than the
   // service retires them. 200ms is still ~700 entries/minute, well above the
@@ -776,13 +781,22 @@ export async function runObserveReplay(): Promise<void> {
     // act of delivering pushed stalls to 23 and the backlog grew 607 → 615.
     // A one-shot check cannot see a problem that replaying itself creates — the
     // gate has to run while the damage would be happening.
+    //
+    // Threshold, not "any rise" (2026-11-19, second pass): the first version
+    // stopped on a single increment, and `stalls` is a CUMULATIVE counter — it
+    // ticks over occasionally even on a healthy service (observed climbing 418 →
+    // 465 over 20 minutes with healthz answering in 0.6ms). That made the gate
+    // fire at exactly 20 deliveries every run, which looked like "replay makes it
+    // worse" but was really "one incidental tick". Now it stops only when the
+    // rise is large enough to be the replay's doing, and it reports the rate so
+    // the judgement is visible rather than implied.
     if ((i + 1) % 20 === 0) {
       const during = await stallsNow();
-      if (during !== null && during > baselineStalls) {
+      if (during !== null && during - baselineStalls >= INFLIGHT_STALL_LIMIT) {
         survivors.push(...entries.slice(i + 1));
         process.stderr.write(
-          `observe-replay: stalls rose to ${during} (from ${baselineStalls}) while replaying — replaying is making it worse. ` +
-          `Stopped after ${delivered} delivered; ${survivors.length} left on the spool.\n`,
+          `observe-replay: stalls climbed ${baselineStalls}→${during} over ${delivered} deliveries ` +
+          `(limit +${INFLIGHT_STALL_LIMIT}) — replaying is making it worse. Stopped; ${survivors.length} left on the spool.\n`,
         );
         break;
       }
