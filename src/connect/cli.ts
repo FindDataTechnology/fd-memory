@@ -713,15 +713,29 @@ export async function runObserveReplay(): Promise<void> {
   const healthUrl = entries[0].url.replace(/\/+$/, "") + "/healthz";
   const stallsNow = async (): Promise<number | null> => {
     try {
-      const r = await fetch(healthUrl, { signal: AbortSignal.timeout(8000) });
+      // 20s, not 8s (2026-11-19): the service answers /healthz in ~1ms when healthy
+      // but has periodic multi-second stalls. An 8s probe missed often enough that
+      // replay refused to start while a plain 20s-timeout delivery of the same
+      // events succeeded 5/5. The probe must outlast a stall, not race it.
+      const r = await fetch(healthUrl, { signal: AbortSignal.timeout(20000) });
       if (!r.ok) return null;
       const d = (await r.json()) as { stalls?: number };
       return typeof d.stalls === "number" ? d.stalls : null;
     } catch { return null; }
   };
-  const s1 = await stallsNow();
+  // Retry the probe before giving up (2026-11-19). A single 8s read can land in
+  // one of the service's periodic stalls while the service is otherwise fine:
+  // measured a run that reported "cannot read /healthz" and left 451 events on
+  // the spool, when a plain sequential delivery of five of those same events
+  // succeeded 5/5. Refusing to start because ONE probe missed is worse than
+  // starting and letting the in-flight checks stop us.
+  let s1: number | null = null;
+  for (let attempt = 0; attempt < 3 && s1 === null; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 2000));
+    s1 = await stallsNow();
+  }
   if (s1 === null) {
-    process.stderr.write(`observe-replay: cannot read ${healthUrl} — leaving ${entries.length} on the spool\n`);
+    process.stderr.write(`observe-replay: cannot read ${healthUrl} after 3 attempts — leaving ${entries.length} on the spool\n`);
     return;
   }
   await new Promise((r) => setTimeout(r, PREFLIGHT_WINDOW_MS));
