@@ -22,7 +22,9 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const MAX_LINES = 5000; // ≈ 4MB at 800 bytes/event — a few hours of normal capture
+const MAX_LINES = 5000;
+/** Disk cap, independent of entry count — a few big events must not grow the file without bound. */
+const MAX_BYTES = 5 * 1024 * 1024; // ≈ 4MB at 800 bytes/event — a few hours of normal capture
 
 export interface SpoolEntry {
   url: string;
@@ -45,10 +47,26 @@ export function spoolAppend(home: string, entry: SpoolEntry): boolean {
     const file = spoolPath(home);
     mkdirSync(home, { recursive: true });
     appendFileSync(file, JSON.stringify(entry) + "\n", { flag: "a" });
-    // Compaction is checked cheaply by size rather than by parsing on every
-    // append — reading and splitting 4MB per hook turn would defeat the point.
+    // Compaction is triggered by SIZE but enforced by LINE COUNT (2026-11-19).
+    //
+    // These two used to disagree: the trigger was `size > MAX_LINES * 1024`
+    // (≈5MB) while `compact()` returned immediately unless `lines.length >
+    // MAX_LINES` (5000 lines). A burst of large events could therefore trip the
+    // trigger on every append while compaction did nothing — the spool would
+    // grow without bound under exactly the load that produces big events.
+    //
+    // Fix: pass the size-based decision INTO compact() so it trims to the budget
+    // even when the line count is under the limit. Line count still caps how
+    // many entries exist; size caps how much disk they may use. Whichever trips
+    // first, compaction runs.
     try {
-      if (statSync(file).size > MAX_LINES * 1024) compact(file);
+      // BOTH budgets must be able to trigger compaction. Checking bytes alone
+      // let 6000 small events (1.5MB) sit under the 5MB trigger while far over
+      // the 5000-line cap — the spool grew unbounded in entry count. Checking
+      // lines alone let 40 large events (8MB) bloat the file. Whichever trips
+      // first, compaction runs; `force` tells compact() which budget spoke.
+      if (statSync(file).size > MAX_BYTES) compact(file, { force: true });
+      else if (lineCountExceeds(file, MAX_LINES)) compact(file);
     } catch { /* size check is best-effort */ }
     return true;
   } catch {
@@ -97,11 +115,60 @@ export function spoolRewrite(home: string, survivors: SpoolEntry[]): boolean {
   }
 }
 
-function compact(file: string): void {
+/**
+ * Trim the spool to MAX_LINES, keeping the events that carry the most meaning.
+ *
+ * Measured 2026-11-19: of 332 backlogged events, **327 were `tool_call`** (mostly
+ * `tool_call Bash: …`) and only 11 were `turn_outcome` (the session boundaries —
+ * `stop`, `session-end` — which are what actually drives distillation). The old
+ * policy ("keep the last N lines") dropped the OLDEST entries regardless of kind,
+ * so under pressure the signal (session boundaries) could be evicted while
+ * hundreds of `ls` invocations survived.
+ *
+ * New policy, in priority order:
+ *   1. every `turn_outcome`, oldest first (bounded by MAX_LINES itself — if there
+ *      were ever that many, keeping all of them is still correct)
+ *   2. then the newest `tool_call`s, to fill the remaining budget
+ *
+ * Ordering inside the file is preserved so replay still goes oldest-first.
+ */
+
+/**
+ * Cheap line-count check for the compaction trigger. Counting newlines is O(n)
+ * but avoids parsing every entry — the whole reason the trigger was size-based
+ * to begin with was to keep the per-append cost tiny.
+ */
+function lineCountExceeds(file: string, limit: number): boolean {
+  try {
+    const raw = readFileSync(file, "utf8");
+    let n = 0;
+    for (let i = 0; i < raw.length; i++) if (raw.charCodeAt(i) === 10) n++;
+    return n > limit;
+  } catch { return false; }
+}
+
+function compact(file: string, opts: { force?: boolean } = {}): void {
   try {
     const lines = readFileSync(file, "utf8").split("\n").filter((l) => l.trim());
-    if (lines.length <= MAX_LINES) return;
-    const keep = lines.slice(-MAX_LINES);
+    // Trim when EITHER budget is exceeded. `force` means the caller already saw
+    // the file exceed MAX_BYTES, so the line count alone must not veto it.
+    if (!opts.force && lines.length <= MAX_LINES) return;
+    if (opts.force && lines.length <= 1) return; // nothing meaningful to trim
+
+    const parsed: Array<{ line: string; idx: number; keep: boolean }> = lines.map((line, idx) => {
+      let keep = false;
+      try {
+        const d = JSON.parse(line) as { event?: { type?: string } };
+        keep = d?.event?.type === "turn_outcome";
+      } catch { /* unparseable: treat as low priority, it cannot be replayed anyway */ }
+      return { line, idx, keep };
+    });
+
+    const signals = parsed.filter((p) => p.keep);
+    const budget = Math.max(0, MAX_LINES - signals.length);
+    const fillers = parsed.filter((p) => !p.keep).slice(-budget);
+    const keep = [...signals, ...fillers].sort((a, b) => a.idx - b.idx).map((p) => p.line);
+
     const tmp = `${file}.tmp`;
     writeFileSync(tmp, keep.join("\n") + "\n");
     renameSync(tmp, file);

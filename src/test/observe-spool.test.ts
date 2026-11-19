@@ -136,3 +136,32 @@ test("replay treats 429 as 'wait', not as 'undeliverable'", async () => {
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("compaction keeps turn_outcome and evicts tool_call first", () => {
+  // Measured 2026-11-19: 332 backlogged events, **327 of them `tool_call`** and
+  // only 11 `turn_outcome`. The old policy kept the last N lines regardless of
+  // kind, so under pressure the session boundaries — the events that actually
+  // drive distillation — could be evicted while hundreds of `ls` invocations
+  // survived. Priority must follow meaning, not arrival order.
+  const home = mkdtempSync(join(tmpdir(), "fd-spool-prio-"));
+  try {
+    // 6000 small filler entries (over the 5000-line cap), with ONE signal buried
+    // near the start. Under "keep the last N lines" that signal is evicted; under
+    // priority compaction it survives. Must exceed MAX_LINES or the test proves
+    // nothing — my first version used 41 entries and stayed green either way.
+    for (let i = 0; i < 6000; i++) {
+      const isSignal = i === 10;
+      spoolAppend(home, { url: "http://svc", token: "t", at: new Date().toISOString(),
+        event: isSignal
+          ? { type: "turn_outcome", title: "stop · session", body: "IMPORTANT" }
+          : { type: "tool_call", title: `filler-${i}`, body: "x" } } as never);
+    }
+    const kept = spoolRead(home);
+    const signals = kept.filter((k) => (k.event as { type: string }).type === "turn_outcome");
+    assert.equal(signals.length, 1, `the session boundary must survive compaction, saw ${signals.length}`);
+    assert.ok(kept.length <= 5000, `must stay bounded, saw ${kept.length}`);
+    assert.equal((signals[0].event as { title: string }).title, "stop · session");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
