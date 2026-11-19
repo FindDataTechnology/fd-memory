@@ -117,6 +117,19 @@ export class Service {
       });
     });
     const host = this.opts.host ?? "127.0.0.1";
+    // Explicit server timeouts (2026-11-19). Node's defaults are
+    // requestTimeout=300s and headersTimeout=60s, which is far too patient for a
+    // service that has periodic multi-second stalls: a client that gave up after
+    // 25s left its request queued on the server for up to five minutes, and the
+    // pile of those is part of why later requests got slower still.
+    //
+    // 30s request / 15s headers is generous for the real latency profile
+    // (healthz 1ms, /observe ~40ms healthy, worst observed landing 1.7s) while
+    // cutting the tail a stuck client can create. keepAliveTimeout stays at the
+    // Node default (5s) — it is already conservative.
+    server.requestTimeout = Number(process.env.FD_MEMORY_REQUEST_TIMEOUT_MS ?? 30_000) || 30_000;
+    server.headersTimeout = Number(process.env.FD_MEMORY_HEADERS_TIMEOUT_MS ?? 15_000) || 15_000;
+    server.keepAliveTimeout = 5_000;
     server.listen(this.opts.port, host);
     this.stallWatchdog = startStallWatchdog();
     // Background distill work must name itself too, or a stall inside drain()
