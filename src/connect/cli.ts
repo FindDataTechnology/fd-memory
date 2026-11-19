@@ -882,8 +882,16 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
     // The hook still exits 0 either way — a capture hook must never block a
     // harness turn, and losing the spool write is not worth failing a turn for.
     const spooled = spoolAppend(spoolHome(), { url: binding.url, token, event: mapped, at: new Date().toISOString() });
+    // Say how full the spool is, and shout when it is close to evicting
+    // (2026-11-19). "spooled locally" alone told nobody anything: the backlog sat
+    // at 40-50% for hours across dozens of runs and the only way to know it was
+    // climbing was to run `db-stats` by hand. A capture hook is a noisy place,
+    // but this is the one line per failure that an operator will actually see.
+    const cap = spooled ? spoolCapacity(spoolHome()) : null;
+    const warn = cap && cap.pct >= 70 ? ` ⚠ spool ${cap.pct.toFixed(0)}% full — events will start being evicted soon` : "";
     console.error(spooled
-      ? `yongyi hook: service unreachable (${result.error ?? "unknown"}) — event spooled locally; run \`yongyi observe-replay\` when it is back`
+      ? `yongyi hook: service unreachable (${result.error ?? "unknown"}) — event spooled locally` +
+        `${cap ? `; ${cap.summary}` : ""}${warn}; run \`yongyi observe-replay\` when it is back`
       : `yongyi hook: capture dropped (${result.error ?? "unknown"}) and could not be spooled`);
   }
 }
