@@ -541,7 +541,11 @@ test("memory_by_domain: 领域键、时间窗口与类型三个条件必须交�
     await call("memory_write_page", { title: "600519 纪律", body: "b", metadata: { instrument: "600519", memory_type: "feedback" } });
     // 先写 #3，再把它的 updated_at 改旧
     const old3 = await call("memory_write_page", { title: "600519 笔记旧", body: "c", metadata: { instrument: "600519" } });
-    const root = svc.rootForKey("u/lia");
+    // rootKey uses a dash, not the namespace slash: rootKeyForRef("u/lia") is
+    // "u-lia". Using "u/lia" here created a SECOND StoreRoot (empty database),
+    // so the UPDATE matched zero rows and the failure looked like a broken
+    // filter. Assert on the hit count so this cannot hide again.
+    const root = svc.rootForKey("u-lia");
     // Compute the stamp from a FIXED instant, not from Date.now() at this line:
     // this runs ~23ms AFTER the writes above, so `Date.now() - 30d` was still
     // later than the freshly-written rows and matched nothing — the old page
