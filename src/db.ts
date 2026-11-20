@@ -199,6 +199,40 @@ export class RootDb {
    * Returns null when no domain key is present at all: an ordinary note has no
    * domain and must not be nagged about one.
    */
+  /**
+   * Which domain keys actually carry this value? (add-domain-memory-schema)
+   *
+   * Why a reverse lookup and not "remember the key name": the whole point of a
+   * domain vocabulary is that a reader asks "what do we have on this thing", not
+   * "what is the metadata key for instruments". Forcing the caller to know that
+   * it is spelled `instrument` (and not `ticker`/`symbol`/`code`) rebuilds the
+   * free-text taxonomy problem one level down.
+   *
+   * Returns one entry per vocabulary key that has at least one row with this
+   * exact value, so a value that happens to be both a party and a case number
+   * reports both instead of silently picking one.
+   *
+   * Counts come from the same expression indexes the recall uses, so this is a
+   * cheap probe, not a scan.
+   */
+  domainKeysForValue(value: string, projects: string[] | null): Array<{ key: string; domain: string; count: number }> {
+    const out: Array<{ key: string; domain: string; count: number }> = [];
+    // projectFilterSql returns a clause that BEGINS with " AND " (it is built to
+    // be appended to "WHERE 1=1"), and an empty string when unscoped. Anchoring
+    // on `WHERE 1=1` keeps both cases valid — appending it to a bare `WHERE`
+    // produced `WHERE  AND ...`, which is a syntax error, not an empty result.
+    const proj = projectFilterSql(projects, "project");
+    for (const { key, domain } of RootDb.DOMAIN_KEYS) {
+      const path = `'$."${key.replace(/"/g, '""')}"'`;
+      const row = this.db
+        .prepare(`SELECT COUNT(*) AS n FROM pages WHERE 1=1${proj.clause} AND json_extract(metadata, ${path}) = ?`)
+        .get(...(proj.args as never[]), bindable(value)) as { n: number } | undefined;
+      const n = Number(row?.n ?? 0);
+      if (n > 0) out.push({ key, domain, count: n });
+    }
+    return out;
+  }
+
   domainHintFor(meta: Record<string, unknown> | null | undefined): { domain: string; present: string[]; missing: string[] } | null {
     if (!meta) return null;
     const present: string[] = [];

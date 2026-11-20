@@ -166,6 +166,10 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
   // overview's name.
   const OVERVIEW_PARTITIONS = 25;
   const OVERVIEW_TITLES = 3;
+  // Domain lookups are "what do we have on this thing" — a compass, not an
+  // export. Capped like the overview so a broad value (a party shared by many
+  // matters) cannot turn one call into a bulk dump.
+  const DOMAIN_LOOKUP_LIMIT = 50;
 
   const clampListLimit = (raw: unknown): number => {
     const n = Math.floor(Number(raw));
@@ -614,6 +618,68 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           });
         }
         return text({ path: rel, source: sourceOf(w.project!) });
+      },
+    },
+    {
+      name: "memory_by_domain",
+      description:
+        "Recall everything filed under a domain value — the instrument, party, case number, supplier or SKU — WITHOUT knowing which metadata key the writer used. " +
+        "Answers 'what do we have on this thing' directly: pass the value you already have (a ticker, a party name) and it finds which domain key carries it, then returns those pages. " +
+        "If the value matches more than one domain key, all of them are reported rather than one being guessed. Read-only.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: { type: "string", description: "The domain value to look up, e.g. a ticker '600519' or a party name." },
+          limit: { type: "number", description: `Max pages to return (default ${DOMAIN_LOOKUP_LIMIT}).` },
+          ...targetProps,
+        },
+        required: ["value"],
+      },
+      handler: (args) => {
+        const r = readProjects(args.target);
+        if (r.error) return r.error;
+        const value = String(args.value ?? "").trim();
+        if (!value) return err("missing_domain_value", { hint: "pass the value you want to look up, e.g. a ticker or a party name" });
+        const cap = Math.min(clampListLimit(args.limit), DOMAIN_LOOKUP_LIMIT);
+        const matches = root.db.domainKeysForValue(value, r.projects);
+        if (matches.length === 0) {
+          return text({
+            value, matches: [], pages: [],
+            note: "没有任何领域键带这个值。可能是没人按领域记过，或值拼写不同（例如带交易所前缀）。",
+          });
+        }
+        // Query each matching key separately and merge, so a value that is both
+        // a party and a case number returns both sets instead of whichever key
+        // happened to be checked first.
+        const seen = new Set<string>();
+        const pages: Array<Record<string, unknown>> = [];
+        // `projects: null` means "no partition restriction" (a person token owns
+        // its whole root) — it is not an empty list. Passing JSON.stringify(null)
+        // into json_each yields the single value "null", which matches no row,
+        // so the lookup silently returned nothing for exactly the callers who
+        // have the broadest access.
+        const projectClause = r.projects ? "AND project IN (SELECT value FROM json_each(?))" : "";
+        for (const m of matches) {
+          const args: unknown[] = [];
+          if (r.projects) args.push(JSON.stringify(r.projects));
+          args.push(`$."${m.key}"`, value, cap);
+          const rows = root.db.db
+            .prepare(`SELECT path, project, type, title, updated_at FROM pages WHERE 1=1 ${projectClause} AND json_extract(metadata, ?) = ? ORDER BY updated_at DESC LIMIT ?`)
+            .all(...(args as never[])) as Array<{ path: string; project: string; type: string; title: string; updated_at: string }>;
+          for (const row of rows) {
+            if (seen.has(row.path)) continue;
+            seen.add(row.path);
+            pages.push({ ...row, domain: m.domain, domain_key: m.key, source: sourceOf(row.project) });
+          }
+        }
+        pages.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+        return text({
+          value,
+          matches,
+          total: pages.length,
+          truncated: pages.length > cap,
+          pages: pages.slice(0, cap),
+        });
       },
     },
     {

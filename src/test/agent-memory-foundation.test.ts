@@ -472,3 +472,57 @@ test("memory_write_page: a missing domain companion key is reported, never fatal
     assert.equal(plain.domain_hint, undefined, "无领域键的普通记忆不该被提示");
   } finally { await close(); }
 });
+
+test("memory_by_domain: recall by value without knowing the key name", async () => {
+  // add-domain-memory-schema tasks 3.x. The point of a domain vocabulary is that
+  // a reader asks "what do we have on this thing", not "what is the metadata key
+  // called". Forcing callers to remember `instrument` (and not ticker/symbol/
+  // code) rebuilds the free-text taxonomy problem one level down.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/jon").token;
+    const call = await mcpSession(base, tok);
+
+    await call("memory_write_page", { title: "600519 复盘一", body: "a", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "600519 复盘二", body: "b", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "别的标的", body: "c", metadata: { instrument: "000001" } });
+    await call("memory_write_page", { title: "某案", body: "d", metadata: { party: "P-9" } });
+
+    const hit = await call("memory_by_domain", { value: "600519" });
+    assert.equal(hit.matches.length, 1, `应只匹配 instrument 一个键: ${JSON.stringify(hit.matches)}`);
+    assert.equal(hit.matches[0].key, "instrument");
+    assert.equal(hit.matches[0].domain, "invest");
+    assert.equal(hit.matches[0].count, 2, "两条同标的记忆都应计入");
+    assert.equal(hit.pages.length, 2);
+    assert.ok(hit.pages.every((p: { domain_key: string }) => p.domain_key === "instrument"));
+
+    // A value nobody filed under any domain key is an empty answer with a
+    // readable note, not an error.
+    const miss = await call("memory_by_domain", { value: "NOPE" });
+    assert.equal(miss.matches.length, 0);
+    assert.equal(miss.pages.length, 0);
+    assert.ok(miss.note, "未命中必须给出可读说明");
+
+    // The value matched by a DIFFERENT domain key is found just the same.
+    const party = await call("memory_by_domain", { value: "P-9" });
+    assert.equal(party.matches[0].key, "party");
+    assert.equal(party.pages.length, 1);
+  } finally { await close(); }
+});
+
+test("memory_by_domain: a value matching two domain keys reports both", async () => {
+  // "600519" filed as both an instrument and a party is unusual but legal.
+  // Picking whichever key is checked first would hide half the answer.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/kai").token;
+    const call = await mcpSession(base, tok);
+    await call("memory_write_page", { title: "作标的", body: "a", metadata: { instrument: "X-1" } });
+    await call("memory_write_page", { title: "作当事人", body: "b", metadata: { party: "X-1" } });
+
+    const r = await call("memory_by_domain", { value: "X-1" });
+    const keys = r.matches.map((m: { key: string }) => m.key).sort();
+    assert.deepEqual(keys, ["instrument", "party"], `两个键都必须报告: ${JSON.stringify(keys)}`);
+    assert.equal(r.pages.length, 2, "两个来源的页都要返回");
+  } finally { await close(); }
+});
