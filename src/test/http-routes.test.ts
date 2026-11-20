@@ -478,7 +478,12 @@ test("/memory/index: 同一领域值的多条记忆折叠为一条并标注条�
     const entries = ((await r.json()) as { entries: Array<{ domain_value?: string; domain_count?: number; domain_note?: string; description: string }> }).entries;
 
     const grouped = entries.filter((e) => e.domain_value === "600519");
-    assert.equal(grouped.length, 1, `同标的应折叠为一条，实际 ${grouped.length}；全部条目=${JSON.stringify(entries.map((e) => ({ d: e.description, dv: e.domain_value, dc: e.domain_count })))}`);
+    // assert.ok, not assert.equal: node:test puts expected/actual into structured
+    // fields and drops the message, so a failing equal() reports "0 !== 1" and
+    // nothing about WHAT the entries actually were — which is exactly the
+    // information needed when CI and the laptop disagree.
+    assert.ok(grouped.length === 1,
+      `同标的应折叠为一条，实际 ${grouped.length}；全部条目=${JSON.stringify(entries.map((e) => ({ d: e.description, dv: e.domain_value, dc: e.domain_count })))}`);
     assert.equal(grouped[0].domain_count, 3, "展开前必须知道有几条");
     assert.ok(grouped[0].domain_note, "必须说明还有多少条未逐条展开");
 
