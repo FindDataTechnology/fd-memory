@@ -1374,11 +1374,19 @@ export class Service {
         outItems = [];
         picked.forEach((r, idx) => {
           const v = (r as { domain_value?: string | null }).domain_value;
-          if (!v || !grouped.has(v)) { outItems.push(items[idx] as Record<string, unknown>); return; }
+          if (!v) { outItems.push(items[idx] as Record<string, unknown>); return; }
+          if (!grouped.has(v)) {
+            // A domain value with only ONE page is not folded, but it still
+            // carries the value — that is what lets a reader (and the lookup
+            // path) tell "filed under 000001" from "no domain at all".
+            // Dropping it here was a real defect: the ungrouped branch pushed
+            // `items[idx]`, which never had the field.
+            outItems.push({ ...(items[idx] as Record<string, unknown>), domain_value: v });
+            return;
+          }
           if (emitted.has(v)) return; // already folded into the group entry
           emitted.add(v);
           const members = domainOf.get(v)!;
-          const newest = members[0].r; // picked is sorted newest-first within priority
           outItems.push({
             ...(items[members[0].idx] as Record<string, unknown>),
             domain_value: v,
@@ -1387,7 +1395,6 @@ export class Service {
             // is the only memory on the subject.
             domain_note: `该领域下另有 ${members.length - 1} 条记忆，未逐条展开`,
           });
-          void newest;
         });
       }
       res.writeHead(200, { "content-type": "application/json" });
