@@ -655,9 +655,31 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
         .map((x) => x.e);
     };
     const isDiscipline = (t?: string) => t === "feedback" || t === "user";
+    // Proportions, not a full pass then another full pass.
+    //
+    // Putting every discipline entry ahead of every other entry fixed "0
+    // discipline" but overshot: measured after the first attempt, 50 feedback
+    // entries consumed the entire budget and note/fact dropped to 0 (38
+    // feedback, 0 notes). One starvation replaced another.
+    //
+    // So reserve a SHARE for each group and interleave within it — the same
+    // shape the server already uses for harness quotas, applied across
+    // categories. The share is proportional to what the server offered, floored
+    // at 1 so a category that exists always shows at least one line.
+    const groupShare = (list: typeof entries, budget: number) =>
+      Math.max(1, Math.round((list.length / Math.max(1, entries.length)) * budget));
+    const discList = interleave(ranked.filter((e) => isDiscipline(e.memory_type)));
+    const restList = interleave(ranked.filter((e) => !isDiscipline(e.memory_type)));
+    // ~38 lines fit in 3000 chars at the observed ~78 chars/line.
+    const SLOT_ESTIMATE = Math.max(1, Math.floor(MAX_CHARS / 78));
+    const discCap = Math.min(discList.length, groupShare(discList, SLOT_ESTIMATE));
+    const restCap = Math.max(0, SLOT_ESTIMATE - discCap);
     const ordered = [
-      ...interleave(ranked.filter((e) => isDiscipline(e.memory_type))),
-      ...interleave(ranked.filter((e) => !isDiscipline(e.memory_type))),
+      ...discList.slice(0, discCap),
+      ...restList.slice(0, restCap),
+      // Anything the caps left behind still gets a chance if there is room.
+      ...restList.slice(restCap),
+      ...discList.slice(discCap),
     ];
 
     for (const e of ordered) {
