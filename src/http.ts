@@ -10,7 +10,7 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot, normalizeMetadata } from "./store.js";
-import { PageFilter } from "./db.js";
+import { PageFilter, RootDb } from "./db.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { parseObserveEvent, landObserveEvent, observeRateGuard } from "./observe.js";
 import { handlePortal } from "./portal-server.js";
@@ -1130,7 +1130,16 @@ export class Service {
                   -- The page identifier supersede edges speak in (db.idOfPath:
                   -- basename minus .md). Needed so the read face can ask "has
                   -- anyone superseded me?".
-                  COALESCE(page_id, path) AS pid
+                  COALESCE(page_id, path) AS pid,
+                  -- Domain grouping key for the injection face
+                  -- (add-domain-memory-schema). COALESCE over the vocabulary in
+                  -- declaration order, so a page carrying two keys groups under
+                  -- the first one — the same rule the write-side hint uses, so
+                  -- "which domain is this" has ONE answer across both faces.
+                  -- NULL when the page carries no domain key, which is the
+                  -- overwhelming majority today; those pages keep the existing
+                  -- ordering untouched.
+                  COALESCE(${RootDb.DOMAIN_KEYS.map(({ key }) => `json_extract(metadata, '$."${key}"')`).join(", ")}) AS domain_value
            FROM pages
            WHERE project = ?
              AND (type = 'memory-index' OR type IN ('note','fact'))
@@ -1147,7 +1156,7 @@ export class Service {
                   AND e.project = pages.project
              )`,
         )
-        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string }>;
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string; domain_value: string | null }>;
 
       // Cross-harness dedup by semantic identity (2026-11-20).
       //
@@ -1333,6 +1342,54 @@ export class Service {
         const hs = (r as { harnesses?: string[] }).harnesses;
         return hs && hs.length > 1 ? { ...base, harnesses: hs } : base;
       });
+
+      // Domain grouping (add-domain-memory-schema task 5.x).
+      //
+      // Ten reviews of the same instrument and ten reviews of ten different
+      // instruments cost the same number of injection lines, but only the first
+      // case cannot be read as "what do we have on this thing" — the copies are
+      // scattered and each one alone says little.
+      //
+      // Deliberately ADDITIVE: this runs only over picks that actually carry a
+      // domain value, and when none do the array is returned untouched (same
+      // order, same objects). Today that is every page, so the output stays
+      // byte-identical until the vocabulary starts being used — which is what
+      // task 5.3 pins.
+      //
+      // A group is reported as ONE item that names the count and shows the
+      // newest member's text, so no information is lost, only deduplicated from
+      // the budget's point of view.
+      const domainOf = new Map<string, Array<{ idx: number; r: (typeof picked)[number] }>>();
+      picked.forEach((r, idx) => {
+        const v = (r as { domain_value?: string | null }).domain_value;
+        if (!v) return;
+        const list = domainOf.get(v);
+        if (list) list.push({ idx, r }); else domainOf.set(v, [{ idx, r }]);
+      });
+      const grouped = new Set<string>();
+      for (const [v, list] of domainOf) if (list.length > 1) grouped.add(v);
+      let outItems: Array<Record<string, unknown>> = items;
+      if (grouped.size > 0) {
+        const emitted = new Set<string>();
+        outItems = [];
+        picked.forEach((r, idx) => {
+          const v = (r as { domain_value?: string | null }).domain_value;
+          if (!v || !grouped.has(v)) { outItems.push(items[idx] as Record<string, unknown>); return; }
+          if (emitted.has(v)) return; // already folded into the group entry
+          emitted.add(v);
+          const members = domainOf.get(v)!;
+          const newest = members[0].r; // picked is sorted newest-first within priority
+          outItems.push({
+            ...(items[members[0].idx] as Record<string, unknown>),
+            domain_value: v,
+            domain_count: members.length,
+            // Named so a reader knows the rest exist rather than believing this
+            // is the only memory on the subject.
+            domain_note: `该领域下另有 ${members.length - 1} 条记忆，未逐条展开`,
+          });
+          void newest;
+        });
+      }
       res.writeHead(200, { "content-type": "application/json" });
       // Cache the SERIALISED body, keyed on the write version (2026-11-20).
       // `MAX(rowid)` is O(1) and moves on every insert, which is exactly the
@@ -1340,7 +1397,7 @@ export class Service {
       // a supersede edge all write through `pages`). Using the rowid rather
       // than a TTL is deliberate: the spec requires a freshly written memory to
       // be visible to the very next session, and a TTL cannot promise that.
-      const bodyOut = JSON.stringify({ project: iProject, total: ranked.length, entries: items });
+      const bodyOut = JSON.stringify({ project: iProject, total: ranked.length, entries: outItems });
       const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
       this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
       return void res.end(bodyOut);

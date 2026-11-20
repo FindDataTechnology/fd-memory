@@ -452,3 +452,59 @@ test("/memory/index: 蒸馏产物（note/fact）不被 harness 配额挤掉", as
     assert.equal(facts, 2, `两条 fact 都必须进注入，实际 ${facts}/${entries.length}`);
   } finally { await close(); }
 });
+
+test("/memory/index: 同一领域值的多条记忆折叠为一条并标注条数", async () => {
+  // add-domain-memory-schema 5.1: ten reviews of one instrument and ten reviews
+  // of ten instruments cost the same number of lines, but only the first cannot
+  // be read as "what do we have on this thing".
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-lex");
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `same-${i}`,
+        newPage("note", `600519 复盘 ${i}`, `第 ${i} 条`, {
+          metadata: { instrument: "600519", memory_type: "feedback" },
+        }));
+    }
+    root.writePage("default", "notes", "other",
+      newPage("note", "别的标的", "另一条", { metadata: { instrument: "000001", memory_type: "feedback" } }));
+
+    const person = svc.tokens.mint("person", "u/lex").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ domain_value?: string; domain_count?: number; domain_note?: string; description: string }> }).entries;
+
+    const grouped = entries.filter((e) => e.domain_value === "600519");
+    assert.equal(grouped.length, 1, `同标的应折叠为一条，实际 ${grouped.length}`);
+    assert.equal(grouped[0].domain_count, 3, "展开前必须知道有几条");
+    assert.ok(grouped[0].domain_note, "必须说明还有多少条未逐条展开");
+
+    // A value with a single page is NOT collapsed — collapsing a group of one
+    // would just add noise.
+    const single = entries.filter((e) => e.domain_value === "000001");
+    assert.equal(single.length, 1);
+    assert.equal(single[0].domain_count, undefined, "单条不标注条数");
+  } finally { await close(); }
+});
+
+test("/memory/index: 无领域键时输出与折叠功能加入前一致", async () => {
+  // add-domain-memory-schema 5.3 red-proof anchor. Every page in the live
+  // database today has no domain key, so the grouping path must be a no-op —
+  // not "produces equivalent results", but literally the same objects.
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-nodom");
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `plain-${i}`,
+        newPage("note", `普通 ${i}`, `正文 ${i}`, { metadata: { memory_type: "feedback" } }));
+    }
+    const person = svc.tokens.mint("person", "u/nodom").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<Record<string, unknown>> }).entries;
+    assert.equal(entries.length, 3);
+    for (const e of entries) {
+      assert.equal(e.domain_value, undefined, "无领域键的条目不得带领域字段");
+      assert.equal(e.domain_count, undefined);
+      assert.equal(e.domain_note, undefined);
+    }
+  } finally { await close(); }
+});
