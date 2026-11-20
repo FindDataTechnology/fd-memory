@@ -262,6 +262,39 @@ test("会话启动注入：预算装不下全部时，每个 harness 都要按�
   assert.ok(hz > hc, `zcode 持有更多，应占更多，实际 zcode ${hz} / claude ${hc}`);
 });
 
+test("/memory/index: 缓存不能让刚写入的记忆看不到", async () => {
+  // 2026-11-20：注入面每次会话启动都全量扫 ~6,500 行并排序（实测端到端
+  // 148–757ms，全在事件循环上同步跑）。加了进程内缓存，以 MAX(rowid) 为
+  // 失效键。这条测试钉住缓存最危险的失败模式：写完看不到。
+  // 用 TTL 就一定会中这个坑，用写版本号则不会。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-gina");
+    root.writePage("default", "index", "seed",
+      newPage("memory-index", "第一条", "初始内容", {
+        metadata: { harness: "zcode", memory_type: "feedback", source_path: "/m/a.md", source_mtime: 100 },
+      }));
+    const person = svc.tokens.mint("person", "u/gina").token;
+    const get = async () => {
+      const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+      return ((await r.json()) as { entries: Array<{ description: string }> }).entries.map((e) => e.description.trim());
+    };
+
+    const first = await get();
+    assert.ok(first.includes("初始内容"), "第一次请求能看到已有的页");
+    // 再请求一次：命中缓存，结果不变。
+    assert.deepEqual(await get(), first, "内容未变时缓存返回同样的结果");
+
+    // 写一条新的 —— 下一个请求必须看到它，这是缓存失效的关键断言。
+    root.writePage("default", "index", "fresh",
+      newPage("memory-index", "第二条", "刚写入的内容", {
+        metadata: { harness: "zcode", memory_type: "feedback", source_path: "/m/b.md", source_mtime: 200 },
+      }));
+    const after = await get();
+    assert.ok(after.includes("刚写入的内容"), `写入后必须立刻可见，实际 ${JSON.stringify(after)}`);
+  } finally { await close(); }
+});
+
 test("/memory/index: 同一结论被两个 harness 各写一份时，注入只出现一次", async () => {
   // 2026-11-20 实测：2,846 条 memory-index 里 523 组是同一个 memory_name 被
   // 两个 harness 各存一份（claude-code 的 paas/memory/x.md 与 zcode 的

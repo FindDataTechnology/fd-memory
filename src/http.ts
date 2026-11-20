@@ -40,6 +40,14 @@ export class Service {
   private keepwarm: { stop: () => void } | null = null;
   private stallWatchdog: StallWatchdog | null = null;
   private roots = new Map<string, StoreRoot>();
+  // Injection-face cache (2026-11-20). `/memory/index` reads ~6,500 rows and
+  // sorts them on EVERY session start; measured 148–757ms end to end, all of
+  // it synchronous on the event loop. Several sessions starting together
+  // serialise those scans, which is part of what makes the face feel slow on
+  // a busy box. Keyed by (rootKey, project, limit) with `MAX(rowid)` as the
+  // version, so a write invalidates it precisely — a TTL would let a fresh
+  // memory stay invisible for up to one interval, which the spec forbids.
+  private indexCache = new Map<string, { version: number; body: string }>();
 
   constructor(readonly opts: ServiceOptions) {
     this.tokens = new TokenStore(opts.dataDir + "/tokens.db", opts.pepper);
@@ -1086,6 +1094,19 @@ export class Service {
       // note 的 title 本身就是一句话结论（例：「规则按行业过滤只认出银行：
       // insurance/securities 共 12 条规则永不命中」），body 才是展开，所以
       // description 取 title。
+      //
+      // Cache probe (2026-11-20): see indexCache. Bounded to 200 entries
+      // because the key includes `limit` and a pathological caller could
+      // otherwise grow this without end; the realistic key count is a handful.
+      const cacheKey = `${iRoot.rootDir}\u0000${iProject}\u0000${want}`;
+      const cached = this.indexCache.get(cacheKey);
+      if (cached) {
+        const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
+        if (ver === cached.version) {
+          res.writeHead(200, { "content-type": "application/json" });
+          return void res.end(cached.body);
+        }
+      }
       const rows = iRoot.db.db
         .prepare(
           `SELECT CASE WHEN type = 'memory-index'
@@ -1313,7 +1334,16 @@ export class Service {
         return hs && hs.length > 1 ? { ...base, harnesses: hs } : base;
       });
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ project: iProject, total: ranked.length, entries: items }));
+      // Cache the SERIALISED body, keyed on the write version (2026-11-20).
+      // `MAX(rowid)` is O(1) and moves on every insert, which is exactly the
+      // set of events that can change this answer (a new page, a distillation,
+      // a supersede edge all write through `pages`). Using the rowid rather
+      // than a TTL is deliberate: the spec requires a freshly written memory to
+      // be visible to the very next session, and a TTL cannot promise that.
+      const bodyOut = JSON.stringify({ project: iProject, total: ranked.length, entries: items });
+      const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
+      this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
+      return void res.end(bodyOut);
     }
 
     // ── /memory/promotions (add-tier-promotion-candidates D2): the 待确认
