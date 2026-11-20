@@ -551,7 +551,8 @@ test("memory_by_domain: 领域键、时间窗口与类型三个条件必须交�
 
     // 只有时间窗口：旧的那条被排除
     const recent = await call("memory_by_domain", { value: "600519", filter: { since: new Date(Date.now() - 86400_000).toISOString() } });
-    assert.ok(recent.pages.length === 2, `时间窗口应剩两条，实际 ${recent.pages.length}`);
+    assert.ok(recent.pages.length === 2,
+      `时间窗口应剩两条，实际 ${recent.pages.length}；明细=${JSON.stringify(recent.pages.map((p: Record<string, unknown>) => ({ t: p.title, at: p.updated_at })))}；旧页时间=${oldStamp}`);
 
     // 只有类型：feedback 之外被排除
     const onlyNote = await call("memory_by_domain", { value: "600519", filter: { layer: "L1" } });
