@@ -491,18 +491,50 @@ export function readIndexFromDisk(
     // far as buildSessionContext's own read.
     const prevStale = stalenessNote(readInjectionState(spoolHome()));
     if (prevStale) lines.push(prevStale);
-    let used = lines.reduce((n, l) => n + l.length + 1, 0);
-    let shown = 0;
+    // Parse every file once, then spend the budget by category (2026-11-21).
+    //
+    // The old shape walked strictly newest-first and stopped at the budget. That
+    // is fine when recency correlates with importance, but it is not what
+    // happens: measured on a fixture where the 20 newest pages are notes,
+    // 20 of 21 injected lines were notes and exactly one discipline survived by
+    // luck — a few more notes and it would have been zero. The HTTP path had
+    // the same starvation and now shares its budget proportionally; the fallback
+    // is the path sessions actually get during an outage, so it must not be the
+    // weaker of the two.
+    //
+    // Two-pass on purpose: the budget cannot be shared by category without
+    // knowing how many of each exist. Files are small and already on local disk.
+    type Row = { title: string; harness: string; kind: string; mtime: number };
+    const parsed: Row[] = [];
     for (const row of rows) {
-      if (used >= maxChars) break;
       let raw: string;
       try { raw = readFileSync(row.p, "utf8"); } catch { continue; }
       const title = /^title:\s*(.+)$/m.exec(raw)?.[1]?.trim();
       if (!title) continue;
-      const harness = /^\s+harness:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "";
-      const kind = /^\s+memory_type:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "";
-      const line = `- 〔${kind || "记忆"}${harness ? `·${harness}` : ""}〕${title}`;
-      if (used + line.length + 1 > maxChars) break;
+      parsed.push({
+        title,
+        harness: /^\s+harness:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "",
+        kind: /^\s+memory_type:\s*(.+)$/m.exec(raw)?.[1]?.trim() ?? "",
+        mtime: row.mtime,
+      });
+    }
+    const isDisc = (k: string) => k === "feedback" || k === "user";
+    const disc = parsed.filter((r) => isDisc(r.kind));
+    const rest = parsed.filter((r) => !isDisc(r.kind));
+    // Same proportional rule as the HTTP path: each group's share follows how
+    // much of the index it is, floored at one line so a category that exists is
+    // never invisible. ~38 lines fit at the observed ~78 chars/line.
+    const SLOTS = Math.max(1, Math.floor(maxChars / 78));
+    const share = (n: number) => Math.max(1, Math.round((n / Math.max(1, parsed.length)) * SLOTS));
+    const discCap = Math.min(disc.length, share(disc.length));
+    const ordered: Row[] = [...disc.slice(0, discCap), ...rest.slice(0, Math.max(0, SLOTS - discCap)), ...rest, ...disc.slice(discCap)];
+
+    let used = lines.reduce((n, l) => n + l.length + 1, 0);
+    let shown = 0;
+    for (const r of ordered) {
+      if (used >= maxChars) break;
+      const line = `- 〔${r.kind || "记忆"}${r.harness ? `·${r.harness}` : ""}〕${r.title}`;
+      if (used + line.length + 1 > maxChars) continue; // try shorter titles later in the list
       lines.push(line);
       used += line.length + 1;
       shown += 1;

@@ -579,3 +579,44 @@ test("注入预算：纪律条目必须在预算耗尽前出现（类别保底�
   assert.ok(d.some((e) => e.harness === "claude-code"), "两个 harness 的纪律都要有代表");
   assert.ok(shown.some((e) => !isDisc(e.memory_type)), "记忆条目也不能被完全挤掉");
 });
+
+test("磁盘兜底：最近写入全是 note 时，纪律条目仍必须出现", async () => {
+  // 2026-11-21 实测：磁盘兜底（服务不可达时走的路径）只按 mtime 倒序取用，
+  // 没有类别配额。造一个「20 条最新全是 note + 5 条较旧 feedback」的场景，
+  // 修复前 21 行里只有 1 条纪律是侥幸挤进来的；note 再多一点就是 0。
+  //
+  // 这是 HTTP 路径那个饥饿缺陷在兜底路径上的同一形态——而兜底是故障期间
+  // 会话唯一能拿到的东西，不能是较弱的那条。
+  const { readIndexFromDisk } = await import("../connect/cli.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "fd-disc-"));
+  try {
+    const D = path.join(home, "owners", "u-demo", "wiki", "default", "memory-index");
+    fs.mkdirSync(D, { recursive: true });
+    const write = (name: string, type: string, title: string, ago: number) => {
+      const p = path.join(D, name);
+      fs.writeFileSync(p, `---\ntype: memory-index\ntitle: ${title}\ngenerated:\n  by: process\n  at: 2026-01-01T00:00:00.000Z\nmetadata:\n  memory_type: ${type}\n  harness: zcode\n---\n正文\n`);
+      const t = new Date(Date.now() - ago * 1000);
+      fs.utimesSync(p, t, t);
+    };
+    // 20 条最新的全是 note，5 条较旧的 feedback
+    for (let i = 0; i < 20; i++) write(`n${i}.md`, "note", `最新笔记 ${i} 标题长度接近真实值以消耗预算`, i);
+    for (let i = 0; i < 5; i++) write(`f${i}.md`, "feedback", `较早的纪律 ${i} 同样长度以公平比较`, 1000 + i);
+
+    const prev = process.env.FD_MEMORY_DATA;
+    process.env.FD_MEMORY_DATA = home;
+    try {
+      const out = readIndexFromDisk("default", { namespace: "u/demo" } as never, 900, false);
+      const lines = out.split("\n").filter((l) => l.startsWith("- 〔"));
+      assert.ok(lines.some((l) => l.includes("纪律")),
+        `纪律条目必须出现在兜底输出里，实际=${JSON.stringify(lines.map((l) => l.slice(0, 24)))}`);
+      assert.ok(lines.some((l) => l.includes("笔记")), "记忆条目也不能被完全挤掉");
+    } finally {
+      if (prev === undefined) delete process.env.FD_MEMORY_DATA; else process.env.FD_MEMORY_DATA = prev;
+    }
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
