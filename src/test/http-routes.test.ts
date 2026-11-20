@@ -490,8 +490,9 @@ test("/memory/index: 同一领域值的多条记忆折叠为一条并标注条�
     // A value with a single page is NOT collapsed — collapsing a group of one
     // would just add noise.
     const single = entries.filter((e) => e.domain_value === "000001");
-    assert.equal(single.length, 1);
-    assert.equal(single[0].domain_count, undefined, "单条不标注条数");
+    assert.ok(single.length === 1, `单条组应恰好一条，实际 ${single.length}；全部=${JSON.stringify(entries)}`);
+    assert.ok(single[0].domain_count === undefined,
+      `单条不标注条数，实际 ${JSON.stringify(single[0])}；全部=${JSON.stringify(entries)}`);
   } finally { await close(); }
 });
 
