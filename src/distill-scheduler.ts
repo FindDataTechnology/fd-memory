@@ -1077,13 +1077,17 @@ export async function hybridCandidates(opts: {
       }
     }
     const scored: Array<DistillCandidate & { score: number }> = [];
-    const superseded = root.db.supersededIds();
+    // Per-project retirement (2026-11-20): a page_id is a basename, so the
+    // same id can be retired in one partition and alive in another. The old
+    // union set let alpha's correction hide beta's live page.
+    const supersededBy = new Map<string, Set<string>>();
+    for (const p of projects) supersededBy.set(p, root.db.supersededIds(p));
     for (const v of root.db.allPageVectors(q.model)) {
       if (v.vector.length !== qv.length) continue;
       const rel = v.page_rel;
       const baseId = rel.split("/").pop()?.replace(/\.md$/, "") ?? "";
-      if (superseded.has(baseId)) continue; // retired by a newer distillation
       const projectOfRel = rel.split("/")[0];
+      if (supersededBy.get(projectOfRel)?.has(baseId)) continue; // retired by a newer distillation in THIS partition
       if (!projects.includes(projectOfRel)) continue;
       let c = byRel.get(rel);
       if (!c) {

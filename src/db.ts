@@ -850,10 +850,20 @@ export class RootDb {
   // superseded candidates via distillCandidates' active set, but the full-scan
   // vector lane reads page_vectors directly — without this set it resurrects
   // pages a newer distillation already retired.
-  supersededIds(): Set<string> {
+  supersededIds(project?: string): Set<string> {
     // Reads the edge table (optimize-yongyi-read-surfaces 3.4): the old shape
     // parsed every page's supersedes JSON on every call, once per digest.
-    const rows = this.db.prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    //
+    // Project-scoped (2026-11-20). `superseded_id` is a page_id = a basename,
+    // so the SAME id can be retired in one project and perfectly alive in
+    // another. Returning every id in the table made one project's correction
+    // silently delete another project's live conclusion from digest recall —
+    // measured: alpha retiring `old-1` made beta's untouched `old-1` report as
+    // superseded. Callers that span partitions (multi-project recall) pass no
+    // project and keep the union; single-project callers must pass one.
+    const rows = project
+      ? this.db.prepare("SELECT superseded_id FROM superseded_edges WHERE project=?").all(project) as Array<{ superseded_id: string }>
+      : this.db.prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
     const ids = new Set<string>();
     for (const r of rows) if (r.superseded_id) ids.add(r.superseded_id);
     return ids;

@@ -78,8 +78,15 @@ export function distillCandidates(root: StoreRoot, projects: string[], queryFor:
   // edge table the write path maintains, instead of re-deriving the set from
   // this project's page files. The old shape also missed a page retired by a
   // supersede that lives outside the requested project set.
-  const superseded = root.db.supersededIds();
-  const active = live.filter((c) => !superseded.has(c.id));
+  //
+  // Per-project (2026-11-20): a page_id is a basename, so "retired" only means
+  // retired within the partition that said so. A single union let alpha's
+  // correction hide beta's live page with the same name.
+  const superseded = new Set<string>();
+  for (const project of projects) {
+    for (const id of root.db.supersededIds(project)) superseded.add(`${project}\u0000${id}`);
+  }
+  const active = live.filter((c) => !superseded.has(`${c.project ?? ""}\u0000${c.id}`));
   if (active.length === 0) return [];
   // keyword overlap ranking; empty query degrades to recency-ish (order kept)
   const terms = String(queryFor ?? "")
