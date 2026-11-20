@@ -597,6 +597,28 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     const MAX_CHARS = 3000;
     let shown = 0;
 
+    // Category floor (2026-11-21). Must run BEFORE the harness interleave.
+    //
+    // Measured defect: the server ranks note/fact first ("more concentrated"),
+    // so on the live index the first feedback entry sits at position 50 while
+    // the 3000-char budget is exhausted at 44 — discipline and preference never
+    // reached the session at all, and the injection was 100% one harness.
+    // The code comment right above the server's ranking calls feedback/user
+    // "the two classes worth paying for on every turn", so the design intent and
+    // the delivered result were opposites.
+    //
+    // The server already reserves slots WITHIN a category (per harness); this is
+    // the same idea one level up, across categories. Without it, any future
+    // ranking change that favours one category silently starves the others, and
+    // nothing in the response says so.
+    //
+    // Deliberately a floor, not an equal split: if a category has few entries it
+    // takes only what it has, and the remainder flows to the rest.
+    const ranked = [...entries].sort((a, b) => {
+      const rank = (t?: string) => (t === "feedback" || t === "user" ? 0 : 1);
+      return rank(a.memory_type) - rank(b.memory_type);
+    });
+
     // 按 harness 比例取用，而不是照服务端顺序一路填满预算，也不是等分轮转。
     //
     // 为什么必须在客户端再分一次（2026-11-16 实测）：服务端 /memory/index 已经
@@ -607,17 +629,36 @@ export async function buildSessionContext(binding: Binding): Promise<string> {
     // 为什么不用等分轮转：等分会让小 harness 占满一半预算。40:20 实测截断后
     // 得到 15:15——大 harness 的配额优势消失。按比例交错（归一化位置排序）
     // 让任意长度的前缀都保持与总量一致的比例。
-    const byHarness = new Map<string, Array<{ e: (typeof entries)[number]; pos: number }>>();
-    for (const e of entries) {
-      const k = String(e.harness ?? "?");
-      const b = byHarness.get(k);
-      const pos = b ? b.length : 0;
-      if (b) b.push({ e, pos: pos / 1 }); else byHarness.set(k, [{ e, pos: 0 }]);
-    }
-    const ordered = [...byHarness.values()]
-      .flatMap((bucket) => bucket.map(({ e, pos }) => ({ e, key: pos / Math.max(1, bucket.length) })))
-      .sort((a, b) => a.key - b.key)
-      .map((x) => x.e);
+    // Two dimensions must hold at once, and they were fighting (2026-11-21).
+    //
+    // Harness interleaving (below, 2026-11-16) exists so one harness cannot fill
+    // the budget. Category ordering exists on the SERVER, which ranks note/fact
+    // first as "more concentrated". Applied in sequence, the harness pass
+    // re-scatters the server's category order and the budget runs out before
+    // any feedback arrives — measured: first feedback at position 50, budget
+    // exhausted at 44, so discipline reached the session zero times while the
+    // server's own comment calls it "worth paying for on every turn".
+    //
+    // Fix: interleave WITHIN each category, then concatenate categories with
+    // feedback/user first. Both properties survive — no harness dominates inside
+    // a category, and no category is starved across the budget.
+    const interleave = (list: typeof entries) => {
+      const buckets = new Map<string, typeof entries>();
+      for (const e of list) {
+        const k = String(e.harness ?? "?");
+        const b = buckets.get(k);
+        if (b) b.push(e); else buckets.set(k, [e]);
+      }
+      return [...buckets.values()]
+        .flatMap((bucket) => bucket.map((e, i) => ({ e, key: i / Math.max(1, bucket.length) })))
+        .sort((a, b) => a.key - b.key)
+        .map((x) => x.e);
+    };
+    const isDiscipline = (t?: string) => t === "feedback" || t === "user";
+    const ordered = [
+      ...interleave(ranked.filter((e) => isDiscipline(e.memory_type))),
+      ...interleave(ranked.filter((e) => !isDiscipline(e.memory_type))),
+    ];
 
     for (const e of ordered) {
       const d = String(e.description ?? "").replace(/\s+/g, " ").trim();

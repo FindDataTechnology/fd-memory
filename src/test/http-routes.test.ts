@@ -543,3 +543,39 @@ test("/memory/index: 领域值都不重复时，domain_value 仍必须出现", a
     assert.ok(entries.every((e) => e.domain_count === undefined), "没有可折叠的，不该有条数");
   } finally { await close(); }
 });
+
+test("注入预算：纪律条目必须在预算耗尽前出现（类别保底）", async () => {
+  // 2026-11-21 实测缺陷：服务端把 note/fact 排在前面（「更浓缩」），
+  // 客户端按顺序消费 —— 真实库上 feedback 首个位置 50，预算在第 44 条耗尽，
+  // 于是纪律条目**一条都没进过会话**，而代码注释称它是「每轮都该付钱买的两类」。
+  //
+  // 这里用同一份排序输入复刻客户端的取用逻辑，断言纪律条进得去。
+  const mem = (i: number) => ({ harness: "yongyi", memory_type: "note",
+    description: `记忆条目 ${i}，内容长度接近真实均值以便消耗预算` });
+  const disc = (h: string, i: number) => ({ harness: h, memory_type: "feedback",
+    description: `纪律 ${i}，同样长度以便公平比较预算消耗情况` });
+  // 服务端顺序：50 条 note 在前，feedback 在后
+  const entries = [
+    ...Array.from({ length: 50 }, (_, i) => mem(i)),
+    ...Array.from({ length: 5 }, (_, i) => disc("zcode", i)),
+    ...Array.from({ length: 5 }, (_, i) => disc("claude-code", i)),
+  ];
+  const isDisc = (t?: string) => t === "feedback" || t === "user";
+  const interleave = (list: typeof entries) => {
+    const b = new Map<string, typeof entries>();
+    for (const e of list) { const k = String(e.harness); const x = b.get(k); if (x) x.push(e); else b.set(k, [e]); }
+    return [...b.values()].flatMap((bucket) => bucket.map((e, i) => ({ e, key: i / Math.max(1, bucket.length) })))
+      .sort((a, b2) => a.key - b2.key).map((x) => x.e);
+  };
+  const ordered = [
+    ...interleave(entries.filter((e) => isDisc(e.memory_type))),
+    ...interleave(entries.filter((e) => !isDisc(e.memory_type))),
+  ];
+  // 3000 字符预算
+  let used = 0; const shown: typeof entries = [];
+  for (const e of ordered) { const len = e.description.length + 12; if (used + len > 3000) break; used += len; shown.push(e); }
+  const d = shown.filter((e) => isDisc(e.memory_type));
+  assert.ok(d.length > 0, `纪律条目必须进预算，实际 0/${shown.length}`);
+  assert.ok(d.some((e) => e.harness === "claude-code"), "两个 harness 的纪律都要有代表");
+  assert.ok(shown.some((e) => !isDisc(e.memory_type)), "记忆条目也不能被完全挤掉");
+});
