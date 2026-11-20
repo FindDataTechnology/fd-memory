@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { Service } from "../http.js";
 import { StoreRoot, normalizeMetadata } from "../store.js";
+import { newPage } from "../okf.js";
 import { __resetMetrics } from "../metrics.js";
 import { __resetEmbedGate } from "../embed-gate.js";
 
@@ -56,6 +57,91 @@ async function mcpSession(base: string, tok: string) {
 }
 
 // ── metadata write face ──────────────────────────────────────────────────────
+
+test("memory_write_page: supersedes retires the old page from injection but keeps it readable", async () => {
+  // 2026-11-20: `supersedes` existed in the page model, the edge table and the
+  // distill lane, but appeared 0 times in mcp.ts — and MCP is the ONLY way a
+  // session writes memory. Measured: 16 of 57,852 pages had ever used it, so
+  // correcting a conclusion three times left three pages side by side.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/alice").token;
+    const call = await mcpSession(base, tok);
+
+    const first = await call("memory_write_page", {
+      title: "旧结论", body: "这条会被更正", metadata: { memory_type: "feedback" },
+    });
+    assert.ok(first.path, `首写失败: ${JSON.stringify(first)}`);
+    const oldId = String(first.path).split("/").pop()!.replace(/\.md$/, "");
+
+    const second = await call("memory_write_page", {
+      title: "新结论", body: "取代上一条", metadata: { memory_type: "feedback" },
+      supersedes: [oldId],
+    });
+    assert.ok(second.path, `更正写失败: ${JSON.stringify(second)}`);
+
+    // The edge exists, keyed by the id the write face speaks.
+    const edges = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    assert.deepEqual(edges.map((e) => e.superseded_id), [oldId], "接替边必须落库");
+
+    // Old page leaves the injection face…
+    const idx = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(tok) });
+    const entries = ((await idx.json()) as { entries: Array<{ description: string }> }).entries;
+    // note 类型的 description 取 title（一句话结论），不是 body。
+    assert.equal(entries.filter((e) => e.description.trim() === "旧结论").length, 0,
+      "被接替的页不得出现在注入里");
+    assert.equal(entries.filter((e) => e.description.trim() === "新结论").length, 1,
+      "接替者照常出现");
+
+    // …but is NOT deleted: it stays readable, because "replaced" is not "forgotten".
+    const back = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT body FROM pages WHERE page_id=?").get(oldId) as { body?: string } | undefined;
+    assert.equal(back?.body?.trim(), "这条会被更正", "被接替页仍可读回");
+  } finally { await close(); }
+});
+
+test("memory_write_page: an unknown supersedes id is ignored, never blocks the write", async () => {
+  // A correction is a deliberate act the user asked for; failing the whole
+  // write because one id was mistyped would lose the new conclusion too.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/alice").token;
+    const call = await mcpSession(base, tok);
+    const r = await call("memory_write_page", {
+      title: "新结论", body: "旧 id 打错了也没关系",
+      supersedes: ["no-such-page-id"],
+    });
+    assert.ok(r.path, `写入不应失败: ${JSON.stringify(r)}`);
+    const edges = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    assert.deepEqual(edges.map((e) => e.superseded_id), ["no-such-page-id"],
+      "不存在的 id 也落边——它对谁都没影响，但写作者的字面意图被保留");
+  } finally { await close(); }
+});
+
+test("supersede edges: the same page id in two projects must not collide", async () => {
+  // 2026-11-20 实测缺陷：superseded_id 是 page_id（= 文件名 basename），只在
+  // 单个 project 内唯一。它曾是唯一 PRIMARY KEY，于是 beta 的接替边被 alpha
+  // 静默覆盖——beta 那页永远退不出注入面，因为读面按 project 过滤边表，
+  // beta 找不到属于自己的那条。
+  const { svc, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-zoe");
+    root.writePage("alpha", "notes", "old-1", newPage("note", "A旧", "A 正文"));
+    root.writePage("alpha", "notes", "new-1", newPage("note", "A新", "A 新正文", { supersedes: ["old-1"] } as never));
+    root.writePage("beta", "notes", "old-1", newPage("note", "B旧", "B 正文"));
+    root.writePage("beta", "notes", "new-1", newPage("note", "B新", "B 新正文", { supersedes: ["old-1"] } as never));
+
+    const edges = root.db.db
+      .prepare("SELECT superseded_id, project FROM superseded_edges ORDER BY project").all() as Array<{ superseded_id: string; project: string }>;
+    assert.deepEqual(
+      edges.map((e) => `${e.project}:${e.superseded_id}`),
+      ["alpha:old-1", "beta:old-1"],
+      "两个 project 各自的接替边都必须存在",
+    );
+  } finally { await close(); }
+});
 
 test("metadata: write lands in frontmatter + index, structured filter finds it by kind and memberId", async () => {
   const { svc, base, close } = await boot();

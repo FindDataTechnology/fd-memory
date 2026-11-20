@@ -223,8 +223,17 @@ export class RootDb {
       -- page, so "is this page still alive" is an index probe instead of a
       -- JSON parse of every page on every read. Derived data: rebuilt by
       -- reindex, droppable, never the truth (the truth stays in frontmatter).
+      --
+      -- Composite key (2026-11-20). superseded_id is a page_id = the file
+      -- basename, which is only unique WITHIN a project. With it as the sole
+      -- PRIMARY KEY, the same basename in two projects collided and the second
+      -- edge silently replaced the first — measured: a page superseded in
+      -- project beta ended up un-retired because project alpha had already
+      -- claimed that id. The read face filters by project, so the orphaned
+      -- project never matched an edge and kept injecting the retired page.
       CREATE TABLE IF NOT EXISTS superseded_edges (
-        superseded_id TEXT PRIMARY KEY, by_path TEXT NOT NULL, project TEXT
+        superseded_id TEXT NOT NULL, by_path TEXT NOT NULL, project TEXT NOT NULL,
+        PRIMARY KEY (superseded_id, project)
       );
       CREATE INDEX IF NOT EXISTS superseded_edges_by ON superseded_edges(by_path);
       CREATE TABLE IF NOT EXISTS tier_proposals (
@@ -343,6 +352,24 @@ export class RootDb {
     if (nullIds.length > 0) {
       const upd = this.db.prepare("UPDATE pages SET page_id=? WHERE path=?");
       for (const row of nullIds) upd.run(this.idOfPath(row.path), row.path);
+    }
+    // Supersede edge table must key on (id, project), not id alone (2026-11-20).
+    // `CREATE TABLE IF NOT EXISTS` cannot change an existing table, and this
+    // database already has the single-column version — so migrate explicitly.
+    // Detected by inspecting the primary key rather than by schema version, so
+    // it also repairs a database whose version marker is already current.
+    const edgePk = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='superseded_edges'").get() as { sql?: string } | undefined;
+    if (edgePk?.sql && /superseded_id\s+TEXT\s+PRIMARY KEY/i.test(edgePk.sql)) {
+      this.db.exec("ALTER TABLE superseded_edges RENAME TO superseded_edges_old");
+      this.db.exec(`CREATE TABLE superseded_edges (
+        superseded_id TEXT NOT NULL, by_path TEXT NOT NULL, project TEXT NOT NULL,
+        PRIMARY KEY (superseded_id, project)
+      )`);
+      this.db.exec(`INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project)
+                    SELECT superseded_id, by_path, COALESCE(project, 'default') FROM superseded_edges_old`);
+      this.db.exec("DROP TABLE superseded_edges_old");
+      this.db.exec("CREATE INDEX IF NOT EXISTS superseded_edges_by ON superseded_edges(by_path)");
+      this.rebuildSupersedeEdges();
     }
     // Edge backfill runs only when the table is empty but pages already carry
     // supersede lists — a one-time catch-up for roots that predate the table.

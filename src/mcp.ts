@@ -538,6 +538,23 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           // Structured metadata (add-agent-memory-foundation): machine
           // addressing rides HERE, never in the title string.
           metadata: { type: "object", description: "Optional structured key/values (scalars or arrays of scalars) — the structured filter lane reads this." },
+          // Explicit correction (2026-11-20). Before this the write face had NO
+          // way to say "this replaces an earlier conclusion": supersedes existed
+          // in the page model, the edge table, and the distill lane, but
+          // appeared 0 times in this file — and MCP is the ONLY way a session
+          // writes memory. Measured: 16 of 57,852 pages had ever used it, so
+          // changing a conclusion three times left three pages side by side and
+          // readers had no way to tell which was current.
+          //
+          // Values are page ids (basename minus .md — the vocabulary
+          // superseded_edges already speaks), NOT paths: a path changes when a
+          // page is rewritten, an id does not. Superseded pages stay readable
+          // through read_page/history; they simply stop being current.
+          supersedes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Page ids this page replaces (the `page` field returned when the old page was written, or a path's basename without .md). Those pages leave the injection and digest faces but remain readable via read_page. Unknown ids are ignored rather than rejected, so a typo never blocks the write.",
+          },
           ...targetProps,
         },
         required: ["title", "body"],
@@ -563,6 +580,18 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           const tier = String(args.tier ?? "draft");
           if (["draft", "stable", "canonical"].includes(tier)) extra.tier = tier;
           if (args.origin) extra.origin = String(args.origin);
+        }
+        // Explicit correction rides the page model's existing `supersedes`
+        // frontmatter key, so the edge table and every read face pick it up
+        // through the same path a distilled correction takes.
+        //
+        // Unknown ids are IGNORED, not rejected: a correction is a deliberate
+        // act the user asked for, and failing the whole write because one id
+        // was misspelled would lose the new conclusion too. The tool
+        // description says so, so the behaviour is not a surprise.
+        if (Array.isArray(args.supersedes)) {
+          const ids = args.supersedes.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20);
+          if (ids.length > 0) extra.supersedes = ids;
         }
         const rel = root.writePage(w.project!, dir, randomUUID().slice(0, 8), newPage(type, String(args.title), String(args.body), extra), auditOf(w.project!));
         notifyWrite(w.project!);
