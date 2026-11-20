@@ -264,9 +264,12 @@ test("domain fill rates are per-domain, and zero shows as zero", () => {
     assert.equal(of("case_no").rate, 0, "没人带 case_no 时必须显示 0，而不是缺席");
     assert.ok(of("case_no"), "零填充的键仍必须出现在结果里");
 
-    // A domain nobody has used reports total 0 and rate 0 — present, not absent.
-    assert.equal(of("supplier").total, 0, "未使用的域分母为 0");
-    assert.equal(of("supplier").rate, 0);
+    // A domain nobody has used: the denominator is the project's page count
+    // (that is the question being asked — "of this project's memories, how many
+    // carry the key"), so total is 3, not 0. The KEY still appears with rate 0 —
+    // present, not absent, which is what this assertion was really about.
+    assert.equal(of("supplier").total, 3, "分母是该 project 的全部页");
+    assert.equal(of("supplier").rate, 0, "零采用必须是 0，而不是缺席");
 
     db.db.close();
   } finally {
