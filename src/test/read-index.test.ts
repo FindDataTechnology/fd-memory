@@ -189,3 +189,48 @@ test("reopening a current-version database still ensures the domain indexes", ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// The domain hint reports, it never enforces (add-domain-memory-schema).
+//
+// The storage layer's standing rule is that the truth write happens FIRST and is
+// never undone — appendObservation says so, and every write path inherits it.
+// Turning a domain schema into a write gate would trade "help memory get better"
+// for "stop memory being written", which is the wrong trade: a rejected memory
+// is gone, a sparse one is merely incomplete.
+test("domain hint: attributes by vocabulary order and lists only same-domain gaps", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-hint-"));
+  try {
+    const db = new RootDb(join(dir, "m.sqlite"));
+
+    // No domain key at all -> no hint. An ordinary note must not be nagged.
+    assert.equal(db.domainHintFor({ harness: "claude-code" }), null);
+    assert.equal(db.domainHintFor(null), null);
+
+    // invest carries exactly one key, so nothing is missing.
+    assert.deepEqual(db.domainHintFor({ instrument: "600519" }), {
+      domain: "invest", present: ["instrument"], missing: [],
+    });
+
+    // lex has two keys; carrying only one names the other.
+    assert.deepEqual(db.domainHintFor({ party: "P1" }), {
+      domain: "lex", present: ["party"], missing: ["case_no"],
+    });
+
+    // Both present -> nothing to say.
+    assert.deepEqual(db.domainHintFor({ case_no: "C1", party: "P1" }), {
+      domain: "lex", present: ["party", "case_no"], missing: [],
+    });
+
+    // erp: supplier alone names sku.
+    assert.deepEqual(db.domainHintFor({ supplier: "S1" }), {
+      domain: "erp", present: ["supplier"], missing: ["sku"],
+    });
+
+    // An unknown key is not evidence of any domain.
+    assert.equal(db.domainHintFor({ portfolio_id: "X" }), null);
+
+    db.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

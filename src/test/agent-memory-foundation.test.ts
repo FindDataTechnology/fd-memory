@@ -433,3 +433,42 @@ test("normalizeMetadata: absent vs invalid vs valid", () => {
   assert.equal(normalizeMetadata({ big: "x".repeat(300) }), null);
   assert.deepEqual(normalizeMetadata({ flag: true }), { flag: true });
 });
+
+test("memory_write_page: a missing domain companion key is reported, never fatal", async () => {
+  // add-domain-memory-schema. Two things must hold at once:
+  //   1. the memory LANDS (truth write is never undone by a derived check)
+  //   2. the response SAYS the domain key is missing (a hint nobody sees is the
+  //      same as no schema)
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/ivy").token;
+    const call = await mcpSession(base, tok);
+
+    // lex has two keys; sending only `party` must still write.
+    const partial = await call("memory_write_page", {
+      title: "某案的争点", body: "记录", metadata: { party: "P-1" },
+    });
+    assert.ok(partial.path, `缺同域键也必须写入成功: ${JSON.stringify(partial)}`);
+    assert.ok(partial.domain_hint, "响应里必须能看到缺失提示");
+    assert.equal(partial.domain_hint.domain, "lex");
+    assert.deepEqual(partial.domain_hint.missing, ["case_no"]);
+
+    // The page really is in the index — the hint did not become a gate.
+    const rows = svc.rootForKey("u-ivy").db.db
+      .prepare("SELECT metadata FROM pages WHERE path=?").get(String(partial.path)) as { metadata?: string } | undefined;
+    assert.ok(rows?.metadata, "缺键的记忆仍必须落索引");
+    assert.equal(JSON.parse(String(rows!.metadata)).party, "P-1");
+
+    // Complete metadata -> no hint at all.
+    const full = await call("memory_write_page", {
+      title: "某案结论", body: "记录", metadata: { party: "P-2", case_no: "C-9" },
+    });
+    assert.ok(full.path);
+    assert.equal(full.domain_hint, undefined, "同域键齐全时不应有提示");
+
+    // A page with no domain key is never nagged.
+    const plain = await call("memory_write_page", { title: "随手记", body: "与领域无关" });
+    assert.ok(plain.path);
+    assert.equal(plain.domain_hint, undefined, "无领域键的普通记忆不该被提示");
+  } finally { await close(); }
+});

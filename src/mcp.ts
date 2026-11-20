@@ -595,6 +595,24 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         }
         const rel = root.writePage(w.project!, dir, randomUUID().slice(0, 8), newPage(type, String(args.title), String(args.body), extra), auditOf(w.project!));
         notifyWrite(w.project!);
+        // Domain-key hint (add-domain-memory-schema). Reported, never enforced:
+        // the storage layer's standing rule is that the truth write happens
+        // first and is never undone, so a missing companion key must not turn a
+        // deliberate memory into a failed one. Making it visible is the point —
+        // a hint nobody can see is the same as no schema at all.
+        const hint = root.db.domainHintFor(meta as Record<string, unknown> | null);
+        if (hint && hint.missing.length > 0) {
+          return text({
+            path: rel,
+            source: sourceOf(w.project!),
+            domain_hint: {
+              domain: hint.domain,
+              present: hint.present,
+              missing: hint.missing,
+              note: `这条记忆已按 ${hint.domain} 域保存，但缺少同域的 ${hint.missing.join(", ")}。补上之后可以按该键聚拢与召回；不补也能读，只是召回时只能按别的条件找。`,
+            },
+          });
+        }
         return text({ path: rel, source: sourceOf(w.project!) });
       },
     },

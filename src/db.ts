@@ -181,6 +181,39 @@ export class RootDb {
     return `pages_domain_${key.replace(/[^a-z0-9_]/gi, "_")}`;
   }
 
+  /**
+   * Which domain does this metadata belong to, and which of that domain's keys
+   * is it missing? (add-domain-memory-schema)
+   *
+   * The service does not know which domain a session is in — nothing in the
+   * request says "this is the investing team". So the hint is driven by what the
+   * caller DID send: the moment metadata carries any key from a domain, that is
+   * evidence of intent, and the useful thing to say is which companion keys of
+   * the same domain are absent.
+   *
+   * Ordering matters: DOMAIN_KEYS lists `party` before `case_no`, so a legal
+   * page that carries both is matched on `party` and told only that `case_no`
+   * is missing — one hint at a time, not a list of everything it could also
+   * have carried.
+   *
+   * Returns null when no domain key is present at all: an ordinary note has no
+   * domain and must not be nagged about one.
+   */
+  domainHintFor(meta: Record<string, unknown> | null | undefined): { domain: string; present: string[]; missing: string[] } | null {
+    if (!meta) return null;
+    const present: string[] = [];
+    for (const { key } of RootDb.DOMAIN_KEYS) if (key in meta) present.push(key);
+    if (present.length === 0) return null;
+    // Attribute the page to the domain of the FIRST vocabulary key it carries —
+    // vocabulary order, not metadata key order, so the answer does not depend on
+    // how the caller happened to order its JSON.
+    const domain = RootDb.domainOfKey(present[0])!;
+    const missing = RootDb.DOMAIN_KEYS
+      .filter((d) => d.domain === domain && !present.includes(d.key))
+      .map((d) => d.key);
+    return { domain, present, missing };
+  }
+
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
