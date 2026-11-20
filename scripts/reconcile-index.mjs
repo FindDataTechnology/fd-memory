@@ -92,6 +92,25 @@ function walk(dir, out) {
   return out;
 }
 
+// Frontmatter -> indexPage meta (2026-11-20). This script used to pass ONLY
+// sources/supersedes, so every page it backfilled lost its metadata column —
+// and metadata is where memory_name / memory_type / harness live, which is
+// exactly what the injection face ranks and dedupes on. Measured: 15 pages
+// backfilled with `metadata: null` while their files carried full frontmatter,
+// so their memory_type read as NULL and they sank to the lowest priority.
+// Must mirror store.writePage or the two write paths disagree.
+function metaOf(fm) {
+  const obj = (v) => (v && typeof v === "object" && !Array.isArray(v) ? v : null);
+  return {
+    sources: Array.isArray(fm.sources) ? fm.sources : [],
+    supersedes: Array.isArray(fm.supersedes) ? fm.supersedes : [],
+    tags: Array.isArray(fm.tags) ? fm.tags.map(String).slice(0, 5) : [],
+    tier: ["draft", "stable", "canonical"].includes(String(fm.tier)) ? String(fm.tier) : "draft",
+    source_ref: fm.source_ref != null ? String(fm.source_ref) : null,
+    metadata: obj(fm.metadata),
+  };
+}
+
 let wikiIsDir = false;
 try { wikiIsDir = statSync(wikiDir).isDirectory(); } catch { /* missing root */ }
 if (!wikiIsDir) {
@@ -185,8 +204,7 @@ for (const s of staleRows) {
     const project = s.rel.split(/[\\/]/)[0];
     db.indexPage(project, s.rel, String(s.page.frontmatter.type ?? "note"),
       String(s.page.frontmatter.title ?? s.rel), s.page.body, {
-        sources: Array.isArray(s.page.frontmatter.sources) ? s.page.frontmatter.sources : [],
-        supersedes: Array.isArray(s.page.frontmatter.supersedes) ? s.page.frontmatter.supersedes : [],
+        ...metaOf(s.page.frontmatter),
       });
     const at = s.keepUpdatedAt;
     db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(at, s.rel);
@@ -202,8 +220,7 @@ for (const m of missing) {
     const project = m.rel.split(/[\\/]/)[0];
     db.indexPage(project, m.rel, String(m.page.frontmatter.type ?? "note"),
       String(m.page.frontmatter.title ?? m.rel), m.page.body, {
-        sources: Array.isArray(m.page.frontmatter.sources) ? m.page.frontmatter.sources : [],
-        supersedes: Array.isArray(m.page.frontmatter.supersedes) ? m.page.frontmatter.supersedes : [],
+        ...metaOf(m.page.frontmatter),
       });
     // indexPage stamps updated_at at call time; overwrite with the frontmatter
     // time on BOTH tables so the repair does not reorder history.
