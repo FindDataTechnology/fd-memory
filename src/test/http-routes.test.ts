@@ -518,3 +518,28 @@ test("/memory/index: 无领域键时输出与折叠功能加入前一致", async
     }
   } finally { await close(); }
 });
+
+test("/memory/index: 领域值都不重复时，domain_value 仍必须出现", async () => {
+  // add-domain-memory-schema. The grouping branch used to run only when some
+  // value had >1 page, so a library where every page carries a DISTINCT domain
+  // value — the normal case once the vocabulary is adopted — took the untouched
+  // path and lost the field entirely. Measured on the live database: three pages
+  // carried instruments and the response reported zero.
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-solo");
+    // Three pages, three DIFFERENT instruments: nothing to fold.
+    for (const v of ["A-1", "A-2", "A-3"]) {
+      root.writePage("default", "notes", `solo-${v}`,
+        newPage("note", `标的 ${v}`, `正文 ${v}`, { metadata: { instrument: v } }));
+    }
+    const person = svc.tokens.mint("person", "u/solo").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ domain_value?: string; domain_count?: number }> }).entries;
+    assert.ok(entries.length === 3, `应三条，实际 ${entries.length}`);
+    const withDomain = entries.filter((e) => e.domain_value !== undefined);
+    assert.ok(withDomain.length === 3,
+      `三条都必须带 domain_value（互不相同，不该折叠但也不该丢），实际 ${JSON.stringify(entries)}`);
+    assert.ok(entries.every((e) => e.domain_count === undefined), "没有可折叠的，不该有条数");
+  } finally { await close(); }
+});

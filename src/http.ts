@@ -1368,19 +1368,25 @@ export class Service {
       });
       const grouped = new Set<string>();
       for (const [v, list] of domainOf) if (list.length > 1) grouped.add(v);
+      // NOTE the condition: this runs when ANY pick carries a domain value, not
+      // only when something was folded. Gating it on `grouped.size > 0` meant a
+      // library whose pages all have DISTINCT domain values — i.e. the normal
+      // case once the vocabulary is adopted — took the untouched path and lost
+      // the field entirely, making "filed under X" indistinguishable from "no
+      // domain at all". Measured on the live database: three pages carried
+      // instruments and the response reported zero.
+      const anyDomain = domainOf.size > 0;
       let outItems: Array<Record<string, unknown>> = items;
-      if (grouped.size > 0) {
+      if (anyDomain) {
         const emitted = new Set<string>();
         outItems = [];
         picked.forEach((r, idx) => {
           const v = (r as { domain_value?: string | null }).domain_value;
           if (!v) { outItems.push(items[idx] as Record<string, unknown>); return; }
           if (!grouped.has(v)) {
-            // A domain value with only ONE page is not folded, but it still
-            // carries the value — that is what lets a reader (and the lookup
-            // path) tell "filed under 000001" from "no domain at all".
-            // Dropping it here was a real defect: the ungrouped branch pushed
-            // `items[idx]`, which never had the field.
+            // Single page for this value: not folded, but it still carries the
+            // value — that is what lets a reader (and the lookup path) tell
+            // "filed under 000001" from "no domain at all".
             outItems.push({ ...(items[idx] as Record<string, unknown>), domain_value: v });
             return;
           }
