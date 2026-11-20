@@ -1098,13 +1098,79 @@ export class Service {
                   CASE WHEN type = 'memory-index'
                        THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
                        ELSE COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) END AS mtime,
-                  CASE WHEN type = 'memory-index' THEN body ELSE title END AS description
+                  CASE WHEN type = 'memory-index' THEN body ELSE title END AS description,
+                  -- Semantic identity for cross-harness dedup (2026-11-20). The
+                  -- same conclusion written by two harnesses carries the same
+                  -- memory_name but lives at two paths (paas/memory/x.md vs
+                  -- bff3/memory/x.md). Measured: 2,846 memory-index pages hold
+                  -- 523 same-name groups, i.e. 18.4% of the injection budget
+                  -- was duplicate copies of conclusions already present.
+                  json_extract(metadata,'$.memory_name') AS memory_name,
+                  -- The page identifier supersede edges speak in (db.idOfPath:
+                  -- basename minus .md). Needed so the read face can ask "has
+                  -- anyone superseded me?".
+                  COALESCE(page_id, path) AS pid
            FROM pages
            WHERE project = ?
              AND (type = 'memory-index' OR type IN ('note','fact'))
-             AND json_extract(metadata,'$.forgotten_at') IS NULL`,
+             AND json_extract(metadata,'$.forgotten_at') IS NULL
+             -- Superseded pages leave the injection face (2026-11-20). The
+             -- superseded_edges table has been written since
+             -- optimize-yongyi-read-surfaces, but NO read face consumed it —
+             -- only a self-check audit did. So a page could be explicitly
+             -- retired and still be injected every session. Filtering here
+             -- makes the write side's intent actually take effect.
+             AND NOT EXISTS (
+               SELECT 1 FROM superseded_edges e
+                WHERE e.superseded_id = COALESCE(page_id, path)
+                  AND e.project = pages.project
+             )`,
         )
-        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string }>;
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string }>;
+
+      // Cross-harness dedup by semantic identity (2026-11-20).
+      //
+      // Why: two harnesses writing the same conclusion produce two pages at
+      // different paths but with the same `memory_name` (claude-code's
+      // `paas/memory/x.md` and zcode's `bff3/memory/x.md`). Measured on the
+      // live index: 523 same-name groups inside 2,846 memory-index pages —
+      // 18.4% of the budget was spent showing the same conclusions twice.
+      //
+      // "Same name ⇒ same conclusion, keep the newest" was validated against
+      // the real data before adopting it: of those 523 groups, 515 had
+      // byte-identical bodies and the 8 that differed were the SAME conclusion
+      // at two points in time (a 10-22 "fixed" note and its 10-23 "archived"
+      // successor). Keeping the newest is right in both cases; requiring equal
+      // bodies would have surfaced both versions and left the reader to guess
+      // which was current.
+      //
+      // Pages WITHOUT a memory_name are never merged — notes, facts, and
+      // hand-written pages have no semantic id, and merging them by body text
+      // would risk collapsing genuinely distinct conclusions. Duplicates are
+      // recoverable by a human; a wrongly-merged memory is gone.
+      const byName = new Map<string, { row: (typeof rows)[number]; harnesses: Set<string> }>();
+      const unknownName: typeof rows = [];
+      for (const r of rows) {
+        const name = r.memory_name ?? "";
+        if (!name) { unknownName.push(r); continue; }
+        const cur = byName.get(name);
+        if (!cur) {
+          byName.set(name, { row: r, harnesses: new Set([r.harness]) });
+        } else {
+          cur.harnesses.add(r.harness);
+          if (r.mtime > cur.row.mtime) cur.row = r;
+        }
+      }
+      // Only add the field when a group actually has >1 source: an extra key on
+      // every entry would be noise for the 2,323 singles.
+      const deduped = [
+        ...[...byName.values()].map((v) => (
+          v.harnesses.size > 1
+            ? { ...v.row, harnesses: [...v.harnesses].sort() as string[] }
+            : { ...v.row }
+        )),
+        ...unknownName.map((r) => ({ ...r })),
+      ];
 
       // 三级优先（2026-11-16 晚）：
       //   0 = note / fact —— 本服务自己蒸馏出来的结论。它们是「从本机所有
@@ -1114,7 +1180,7 @@ export class Service {
       //   1 = feedback / user —— 各 harness 亲手写的纪律与偏好。
       //   2 = 其余（project / reference）。
       // 顺序不是「谁更新」，而是「谁更浓缩」：注入是拿去立刻用的，不是归档。
-      const ranked = rows
+      const ranked = deduped
         .map((r) => {
           const priority =
             r.memory_type === "note" || r.memory_type === "fact" ? 0
@@ -1166,13 +1232,58 @@ export class Service {
         .map(([, list]) => list);
       const remaining = Math.max(0, want - picked.length);
       const restTotal = rest.length || 1;
+      // Per-harness floor for DISCIPLINE entries (2026-11-20).
+      //
+      // Measured defect: of 671 feedback pages, 599 (89%) are zcode and 72
+      // claude-code. Proportional allocation therefore gave zcode ~45 of the
+      // 50 feedback slots, so claude-code's discipline — lessons that say how
+      // THIS tool should be driven — got ~5 slots and often none at all once
+      // the leftovers pass ran. The face is supposed to be cross-harness; a
+      // harness whose rules never appear is just reading its own notes back.
+      //
+      // Fix: before the proportional pass, give every harness that HAS
+      // feedback at least `floor(remaining / n_harness)` of those slots. The
+      // proportional pass then settles the remainder, so a large holder still
+      // gets more in absolute terms — it just cannot monopolise.
+      const feedbackHarnesses = new Set(
+        rest.filter((r) => r.memory_type === "feedback" || r.memory_type === "user")
+          .map((r) => String(r.harness ?? "unknown")),
+      );
+      const FLOOR_FRACTION = Number(process.env.FD_MEMORY_FEEDBACK_FLOOR_FRACTION ?? "0.5");
+      const floorShare = feedbackHarnesses.size > 1
+        ? Math.max(1, Math.floor((remaining * FLOOR_FRACTION) / feedbackHarnesses.size))
+        : 0;
+      if (floorShare > 0) {
+        const takenPer = new Map<string, number>();
+        for (const list of buckets) {
+          if (picked.length >= want) break;
+          const h = String(list[0]?.harness ?? "unknown");
+          if (!feedbackHarnesses.has(h)) continue;
+          let took = 0;
+          for (const r of list) {
+            if (took >= floorShare || picked.length >= want) break;
+            if (r.memory_type !== "feedback" && r.memory_type !== "user") continue;
+            picked.push(r);
+            took++;
+          }
+          takenPer.set(h, took);
+        }
+        // Consumed entries must not be offered again by the proportional pass.
+        for (let i = buckets.length - 1; i >= 0; i--) {
+          const h = String(buckets[i][0]?.harness ?? "unknown");
+          const took = takenPer.get(h) ?? 0;
+          if (took > 0) buckets[i] = buckets[i].filter((r) => !picked.includes(r));
+        }
+      }
+      const remaining2 = Math.max(0, want - picked.length);
       for (const list of buckets) {
         if (picked.length >= want) break;
-        const quota = Math.max(1, Math.round((remaining * list.length) / restTotal));
+        const quota = Math.max(1, Math.round((remaining2 * list.length) / restTotal));
         const take = Math.min(quota, list.length);
         picked.push(...list.slice(0, take));
         if (list.length > take) leftovers.push(list.slice(take));
       }
+      void remaining;
       // Proportional rounding can leave the budget under-spent (ceil vs floor).
       // Settle from the leftovers, largest bucket first, stopping at the
       // budget. No second trim after this: the final sort is stable by
@@ -1188,12 +1299,19 @@ export class Service {
       }
       picked.sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
 
-      const items = picked.map((r) => ({
-        harness: r.harness,
-        memory_type: r.memory_type,
-        description: r.description,
-        source_path: r.source_path,
-      }));
+      // `harnesses` is present only when a dedup group had >1 source, so a
+      // client can tell "two harnesses independently landed on this" from "one
+      // wrote it". Additive: clients that ignore it see the old shape.
+      const items = picked.map((r) => {
+        const base = {
+          harness: r.harness,
+          memory_type: r.memory_type,
+          description: r.description,
+          source_path: r.source_path,
+        };
+        const hs = (r as { harnesses?: string[] }).harnesses;
+        return hs && hs.length > 1 ? { ...base, harnesses: hs } : base;
+      });
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ project: iProject, total: ranked.length, entries: items }));
     }

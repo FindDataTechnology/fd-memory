@@ -262,6 +262,88 @@ test("会话启动注入：预算装不下全部时，每个 harness 都要按�
   assert.ok(hz > hc, `zcode 持有更多，应占更多，实际 zcode ${hz} / claude ${hc}`);
 });
 
+test("/memory/index: 同一结论被两个 harness 各写一份时，注入只出现一次", async () => {
+  // 2026-11-20 实测：2,846 条 memory-index 里 523 组是同一个 memory_name 被
+  // 两个 harness 各存一份（claude-code 的 paas/memory/x.md 与 zcode 的
+  // bff3/memory/x.md），18.4% 的注入预算在展示同一个结论的两份副本。
+  //
+  // 判据「同名即同一结论、取最新」是用存量数据验证过的：523 组里 515 组正文
+  // 完全相同，另 8 组是同一结论的新旧两版（10-22「已修」vs 10-23「已归档」）——
+  // 两种情况都该只显示新的那份。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-dana");
+    const mk = (harness: string, mtime: number, text: string) =>
+      root.writePage("default", "index", `${harness}-dup`,
+        newPage("memory-index", "同名结论", text, {
+          metadata: {
+            harness, memory_type: "feedback", memory_name: "shared-conclusion",
+            source_path: `/m/${harness}/x.md`, source_mtime: mtime,
+          },
+        }));
+    mk("claude-code", 100, "旧版本：已修但仍需验证");
+    mk("zcode", 200, "新版本：已归档完结");
+
+    const person = svc.tokens.mint("person", "u/dana").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ description: string; harness?: string; harnesses?: string[] }> }).entries;
+    const dupes = entries.filter((e) => e.description.includes("版本："));
+    assert.equal(dupes.length, 1, `同一 memory_name 只该出一条，实际 ${dupes.length}`);
+    assert.ok(dupes[0].description.includes("新版本"), "保留 mtime 最新的那份");
+    assert.deepEqual(dupes[0].harnesses, ["claude-code", "zcode"], "标注来源 harness 集合，读者知道两方都写过");
+  } finally { await close(); }
+});
+
+test("/memory/index: 没有 memory_name 的页绝不被去重", async () => {
+  // 手写页与蒸馏产物没有语义身份。按正文合并会误合并真正不同的结论——
+  // 重复可以人工清理，丢掉的记忆找不回来。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-eli");
+    for (const i of [0, 1]) {
+      root.writePage("default", "index", `noname-${i}`,
+        newPage("memory-index", `结论${i}`, "完全相同的正文", {
+          metadata: { harness: "zcode", memory_type: "feedback", source_path: `/m/z/${i}.md`, source_mtime: 100 + i },
+        }));
+    }
+    const person = svc.tokens.mint("person", "u/eli").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ description: string }> }).entries;
+    // `newPage` appends a trailing newline to the body, and the index serves
+    // the body verbatim — compare on the trimmed text.
+    assert.equal(entries.filter((e) => e.description.trim() === "完全相同的正文").length, 2,
+      "没有 memory_name 的两条正文相同也必须都保留");
+  } finally { await close(); }
+});
+
+test("/memory/index: 被接替的页退出注入面", async () => {
+  // superseded_edges 自 optimize-yongyi-read-surfaces 起就在写，但没有任何读面
+  // 消费它——只有 supersedeEdgeAudit 做自检。于是一条被显式退役的页仍会每次
+  // 会话被注入，写侧的意图从未生效。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-finn");
+    root.writePage("default", "index", "old-concl",
+      newPage("memory-index", "旧结论", "这条已被更正", {
+        metadata: { harness: "zcode", memory_type: "feedback", source_path: "/m/z/old.md", source_mtime: 100 },
+      }));
+    root.writePage("default", "index", "new-concl",
+      newPage("memory-index", "新结论", "这条取代旧的", {
+        metadata: { harness: "zcode", memory_type: "feedback", source_path: "/m/z/new.md", source_mtime: 200 },
+        supersedes: ["old-concl"],
+      } as never));
+
+    const person = svc.tokens.mint("person", "u/finn").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ description: string }> }).entries;
+    assert.equal(entries.filter((e) => e.description.trim() === "这条已被更正").length, 0, "被接替的页不得出现在注入里");
+    assert.equal(entries.filter((e) => e.description.trim() === "这条取代旧的").length, 1, "接替者照常出现");
+    // 但仍可经 pages 读面找回
+    const back = svc.rootForKey("u-finn").db.db.prepare("SELECT body FROM pages WHERE page_id=?").get("old-concl") as { body?: string } | undefined;
+    assert.equal(back?.body?.trim(), "这条已被更正", "被接替页不物理删除，仍可读回");
+  } finally { await close(); }
+});
+
 test("/memory/index: 蒸馏出来的 note 要进注入，且排在别人写的纪律之前", async () => {
   // 2026-11-16 实测缺口：distill 在跑、页也在写，但 /memory/index 只取
   // memory-index（由 sync.ts 扫描 harness 文件产生），note/fact 永远进不了
