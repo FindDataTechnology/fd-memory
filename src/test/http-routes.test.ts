@@ -262,6 +262,31 @@ test("会话启动注入：预算装不下全部时，每个 harness 都要按�
   assert.ok(hz > hc, `zcode 持有更多，应占更多，实际 zcode ${hz} / claude ${hc}`);
 });
 
+test("/memory/index: 链式接替 A<-B<-C 只留链尾 C", async () => {
+  // 2026-11-20 真实数据里看到的形态：蒸馏会连续更正同一结论，形成
+  // bff26b7c <- 604caef9 <- b97bcd43 这样的链。中间节点自己已被接替，
+  // 不该出现在注入里——否则读者会拿到一个「已被取代但仍被当作当前」的版本。
+  //
+  // 实现天然支持这一点（判据是「有没有人接替我」，与链长无关），但链式是
+  // 真实数据里最常见的形态，必须钉住而不是假设。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-hana");
+    const mk = (slug: string, title: string, sup?: string[]) =>
+      root.writePage("default", "notes", slug, newPage("note", title, `${title} 正文`, sup ? { supersedes: sup } as never : {}));
+    mk("a", "第一版");
+    mk("b", "第二版", ["a"]);
+    mk("c", "第三版", ["b"]);
+
+    const person = svc.tokens.mint("person", "u/hana").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const titles = ((await r.json()) as { entries: Array<{ description: string }> }).entries.map((e) => e.description.trim());
+    assert.equal(titles.filter((t) => t === "第一版").length, 0, "链头退出注入");
+    assert.equal(titles.filter((t) => t === "第二版").length, 0, "中间节点也退出注入");
+    assert.equal(titles.filter((t) => t === "第三版").length, 1, "只有链尾出现");
+  } finally { await close(); }
+});
+
 test("/memory/index: 缓存不能让刚写入的记忆看不到", async () => {
   // 2026-11-20：注入面每次会话启动都全量扫 ~6,500 行并排序（实测端到端
   // 148–757ms，全在事件循环上同步跑）。加了进程内缓存，以 MAX(rowid) 为
