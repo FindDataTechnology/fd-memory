@@ -1868,8 +1868,17 @@ export class Service {
       // Vector scale is sampled AT READ TIME: a cached number would report
       // the state of the last reader, not the store (harden-memory-surfaces).
       sampleVectorsScale(this.vectorCountsByRoot());
+      // Domain fill rates, per root (add-domain-memory-schema). Computed at read
+      // time like the vector scale: a stale rate would tell an operator that a
+      // domain is being used when nobody has written one since the last restart.
+      // Per-root because each owner has its own database — an aggregate across
+      // owners would average away the team that never adopted the vocabulary.
+      const domainFill: Array<{ root: string; rates: Array<{ key: string; domain: string; filled: number; total: number; rate: number }> }> = [];
+      for (const key of new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()])) {
+        try { domainFill.push({ root: key, rates: this.rootForKey(key).db.domainFillRates() }); } catch { /* unreadable root */ }
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify(metricsSnapshot()));
+      return void res.end(JSON.stringify({ ...metricsSnapshot(), domain_fill: domainFill }));
     }
 
     if (path === "/admin/reindex") {

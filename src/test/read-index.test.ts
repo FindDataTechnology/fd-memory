@@ -234,3 +234,40 @@ test("domain hint: attributes by vocabulary order and lists only same-domain gap
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Domain fill rates report adoption per domain, not as one global average
+// (add-domain-memory-schema). A domain at 100% and one at 0%, averaged, reads as
+// "50%, not great" — which hides both the team that adopted the vocabulary and
+// the one that never touched it. Two different problems must not collapse.
+test("domain fill rates are per-domain, and zero shows as zero", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-fill-"));
+  try {
+    const db = new RootDb(join(dir, "m.sqlite"));
+    const ins = db.db.prepare("INSERT INTO pages(path,project,type,title,body,updated_at,metadata) VALUES(?,?,?,?,?,?,?)");
+    const now = new Date().toISOString();
+    // invest: two pages, both carry instrument -> 100%
+    ins.run("default/notes/i1.md", "default", "note", "t", "b", now, JSON.stringify({ instrument: "600519" }));
+    ins.run("default/notes/i2.md", "default", "note", "t", "b", now, JSON.stringify({ instrument: "000001" }));
+    // lex: one page with only `party` -> party 100%, case_no 0%
+    ins.run("default/notes/l1.md", "default", "note", "t", "b", now, JSON.stringify({ party: "P1" }));
+
+    const rates = db.domainFillRates();
+    const of = (k: string) => rates.find((r) => r.key === k)!;
+
+    assert.equal(of("instrument").rate, 1, "invest 全部带 instrument");
+    assert.equal(of("instrument").total, 2, "invest 的分母只有该域的页，不是全表");
+
+    assert.equal(of("party").rate, 1, "lex 的唯一一页带 party");
+    assert.equal(of("case_no").rate, 0, "没人带 case_no 时必须显示 0，而不是缺席");
+    assert.ok(of("case_no"), "零填充的键仍必须出现在结果里");
+    assert.equal(of("party").total, 1, "lex 的分母是 1（只有一页带该域任一键）");
+
+    // A domain nobody has used reports total 0 and rate 0 — present, not absent.
+    assert.equal(of("supplier").total, 0, "未使用的域分母为 0");
+    assert.equal(of("supplier").rate, 0);
+
+    db.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

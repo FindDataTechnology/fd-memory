@@ -233,6 +233,44 @@ export class RootDb {
     return out;
   }
 
+  /**
+   * How often is each domain key actually filled in? (add-domain-memory-schema)
+   *
+   * Why this exists: the write-side hint is a REPORT, not a gate — the storage
+   * layer never undoes a write for a missing metadata key. A hint nobody can see
+   * is indistinguishable from no schema at all, so the missing half is made
+   * measurable here instead of being left to good intentions.
+   *
+   * Denominator is PER DOMAIN, not the whole table. A domain at 100% and another
+   * at 0%, averaged together, reads as "50%, not great" — which hides both the
+   * team that has adopted it and the one that has never used it. Those are
+   * different problems and must not collapse into one number.
+   */
+  domainFillRates(): Array<{ key: string; domain: string; filled: number; total: number; rate: number }> {
+    // "Total" for a domain is the rows that carry ANY of that domain's keys —
+    // otherwise a legal key like case_no would be scored against the entire
+    // table, including every unrelated note, and sit near 0% forever.
+    const out: Array<{ key: string; domain: string; filled: number; total: number; rate: number }> = [];
+    const domains = [...new Set(RootDb.DOMAIN_KEYS.map((d) => d.domain))];
+    for (const domain of domains) {
+      const keys = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain);
+      const anyClause = keys
+        .map(({ key }) => `json_extract(metadata, '$."${key.replace(/"/g, '""')}"') IS NOT NULL`)
+        .join(" OR ");
+      const totalRow = this.db.prepare(`SELECT COUNT(*) AS n FROM pages WHERE ${anyClause}`).get() as { n: number } | undefined;
+      const total = Number(totalRow?.n ?? 0);
+      for (const { key } of keys) {
+        const path = `'$."${key.replace(/"/g, '""')}"'`;
+        const filledRow = this.db
+          .prepare(`SELECT COUNT(*) AS n FROM pages WHERE json_extract(metadata, ${path}) IS NOT NULL`)
+          .get() as { n: number } | undefined;
+        const filled = Number(filledRow?.n ?? 0);
+        out.push({ key, domain, filled, total, rate: total > 0 ? filled / total : 0 });
+      }
+    }
+    return out;
+  }
+
   domainHintFor(meta: Record<string, unknown> | null | undefined): { domain: string; present: string[]; missing: string[] } | null {
     if (!meta) return null;
     const present: string[] = [];
