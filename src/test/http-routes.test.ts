@@ -460,14 +460,18 @@ test("/memory/index: 同一领域值的多条记忆折叠为一条并标注条�
   const { svc, base, close } = await boot();
   try {
     const root = svc.rootForKey("u-lex");
+    // No memory_type: the priority rule keys off memory_type, so tagging these
+    // "feedback" would push them into the harness-quota pool and only some
+    // would be picked — the grouping would then have nothing to fold, which is
+    // a test artifact, not a defect.
     for (let i = 0; i < 3; i++) {
       root.writePage("default", "notes", `same-${i}`,
         newPage("note", `600519 复盘 ${i}`, `第 ${i} 条`, {
-          metadata: { instrument: "600519", memory_type: "feedback" },
+          metadata: { instrument: "600519" },
         }));
     }
     root.writePage("default", "notes", "other",
-      newPage("note", "别的标的", "另一条", { metadata: { instrument: "000001", memory_type: "feedback" } }));
+      newPage("note", "别的标的", "另一条", { metadata: { instrument: "000001" } }));
 
     const person = svc.tokens.mint("person", "u/lex").token;
     const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
