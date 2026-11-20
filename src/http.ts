@@ -1413,6 +1413,21 @@ export class Service {
       const bodyOut = JSON.stringify({ project: iProject, total: ranked.length, entries: outItems });
       const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
       this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
+      // Bounded eviction (2026-11-21). The comment above the probe has claimed
+      // "bounded to 200 entries" since the cache was added, but there was no
+      // eviction code at all — the claim was in a comment and nowhere else.
+      // The key includes the caller-chosen `limit`, so one project can produce
+      // 200 keys on its own; several roots × projects and this grows without
+      // bound, each entry holding a serialised 100-entry response.
+      //
+      // Oldest-first (Map preserves insertion order) is enough: a key nobody
+      // re-requests is exactly the one worth dropping, and a hot key is
+      // re-inserted each time it is recomputed.
+      while (this.indexCache.size > 200) {
+        const oldest = this.indexCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.indexCache.delete(oldest);
+      }
       return void res.end(bodyOut);
     }
 

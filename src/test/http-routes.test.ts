@@ -620,3 +620,24 @@ test("磁盘兜底：最近写入全是 note 时，纪律条目仍必须出现",
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("/memory/index: 缓存的条目数有上限", async () => {
+  // 2026-11-21：缓存的注释从它诞生起就写着「bounded to 200 entries」，
+  // 但根本没有驱逐代码——承诺只在注释里。
+  // 键含调用方指定的 `limit`，单项目就能产生 200 个键；多 root × 多 project
+  // 时无上限，每条都存一份序列化后的 100 条响应。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-cap");
+    root.writePage("default", "notes", "seed",
+      newPage("note", "种子", "内容", { metadata: { memory_type: "feedback" } }));
+    const person = svc.tokens.mint("person", "u/cap").token;
+    // 用不同 limit 打满缓存：键含 limit，所以每次都是新键
+    for (let i = 1; i <= 260; i++) {
+      await fetch(`${base}/memory/index?project=default&limit=${i}`, { headers: json(person) });
+    }
+    const cache = (svc as unknown as { indexCache: Map<string, unknown> }).indexCache;
+    assert.ok(cache instanceof Map);
+    assert.ok(cache.size <= 200, `缓存条目必须被上限约束，实际 ${cache.size}`);
+  } finally { await close(); }
+});
