@@ -401,7 +401,7 @@ test("mcp tools: handoff claim-once across agents; scope has no namespace param"
     })();
     const names = tools.map((t) => t.name);
     assert.deepEqual(names.sort(), [
-      "memory_handoff_accept", "memory_handoff_begin", "memory_handoff_cancel",
+      "memory_by_domain", "memory_handoff_accept", "memory_handoff_begin", "memory_handoff_cancel",
       "memory_handoff_list", "memory_overview", "memory_query", "memory_read_page", "memory_recent", "memory_write_page",
     ]);
     // no tool schema carries a namespace field — scope cannot be overridden
@@ -538,7 +538,7 @@ test("http service: auth 401, capture 200, mcp initialize + tools/list round-tri
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
     const tools = (await toolsList.json()).result.tools as unknown as { name: string }[];
-    assert.equal(tools.length, 9); // eight legacy + memory_overview (add-agent-memory-foundation)
+    assert.equal(tools.length, 10); // eight legacy + memory_overview + memory_by_domain
   } finally {
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
