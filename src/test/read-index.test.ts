@@ -271,3 +271,30 @@ test("domain fill rates are per-domain, and zero shows as zero", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// The spec forbids "key in the vocabulary, index missing" — and until now
+// nothing checked it. The migration creates indexes unconditionally, so the two
+// can only drift through a stale dist, a hand-edited database, or a migration
+// that threw halfway; drift has no symptom except recall quietly scanning.
+//
+// This pins the audit itself: it must find the indexes when they exist, and it
+// must NAME the missing one when it does not.
+test("domain index audit detects a dropped index and names it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-didx-"));
+  try {
+    const db = new RootDb(join(dir, "m.sqlite"));
+    const ok = db.domainIndexAudit();
+    assert.equal(ok.ok, true, `fresh database should have every domain index: ${JSON.stringify(ok.missing)}`);
+    assert.equal(ok.expected.length, RootDb.DOMAIN_KEYS.length);
+
+    // Drop one and the audit must catch it, by name.
+    const victim = db.domainIndexName(RootDb.DOMAIN_KEYS[0].key);
+    db.db.exec(`DROP INDEX ${victim}`);
+    const bad = db.domainIndexAudit();
+    assert.equal(bad.ok, false, "a dropped index must fail the audit");
+    assert.deepEqual(bad.missing, [victim], `audit must name the missing index, got ${JSON.stringify(bad.missing)}`);
+    db.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

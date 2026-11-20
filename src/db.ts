@@ -620,6 +620,29 @@ export class RootDb {
     return { pages_with_supersedes: rows.length, distinct_targets: targets.size, edges, ok: edges === targets.size };
   }
 
+  /**
+   * Every vocabulary key must have its index (add-domain-memory-schema).
+   *
+   * The spec forbids the intermediate state "key is in the vocabulary, index is
+   * not" — but the migration creates indexes unconditionally, so nothing
+   * actually CHECKS that the two stayed in step. A future key added to
+   * DOMAIN_KEYS without the migration running (a stale dist, a hand-edited
+   * database, a migration that threw halfway) would leave a key that recalls
+   * by full scan and nothing would say so.
+   *
+   * Returns the keys whose index is missing, so a caller can fail loudly the way
+   * supersedeEdgeAudit does, rather than serving a silently-slow read face.
+   */
+  domainIndexAudit(): { expected: string[]; missing: string[]; ok: boolean } {
+    const expected = RootDb.DOMAIN_KEYS.map((d) => this.domainIndexName(d.key));
+    const present = new Set(
+      (this.db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+        .map((r) => r.name),
+    );
+    const missing = expected.filter((n) => !present.has(n));
+    return { expected, missing, ok: missing.length === 0 };
+  }
+
   close(): void {
     this.db.close();
   }

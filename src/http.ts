@@ -1978,8 +1978,18 @@ export class Service {
         res.writeHead(500, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "supersede_edge_audit_failed", reindexed: count, audit }));
       }
+      // Domain-index audit (add-domain-memory-schema): the spec forbids "key in
+      // the vocabulary, index missing", and until now nothing checked it — the
+      // migration creates them unconditionally, so the two can only drift via a
+      // stale dist or a half-run migration, and drift is exactly the case with
+      // no symptom other than recall quietly scanning.
+      const dIdx = root.db.domainIndexAudit();
+      if (!dIdx.ok) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "domain_index_audit_failed", reindexed: count, audit: dIdx }));
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ reindexed: count, supersede_edges: audit.edges }));
+      return void res.end(JSON.stringify({ reindexed: count, supersede_edges: audit.edges, domain_indexes: dIdx.expected.length }));
     }
 
     // Rebuild EVERY vector of one root under the sidecar's CURRENT model
