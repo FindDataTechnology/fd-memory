@@ -8,7 +8,7 @@
 
 import { StoreRoot, rootKeyForNamespace, normalizeMetadata } from "./store.js";
 import { namespaceParts, Scope } from "./auth.js";
-import { PageFilter } from "./db.js";
+import { PageFilter, pageFilterSql } from "./db.js";
 import { newPage } from "./okf.js";
 import { randomUUID } from "node:crypto";
 
@@ -631,6 +631,12 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         properties: {
           value: { type: "string", description: "The domain value to look up, e.g. a ticker '600519' or a party name." },
           limit: { type: "number", description: `Max pages to return (default ${DOMAIN_LOOKUP_LIMIT}).` },
+          // Composable with the same filter shape the other read tools take
+          // (add-domain-memory-schema: "MUST 与既有的 project、时间窗口、类型等
+          // 过滤条件可组合"). Without it a caller could not ask "this
+          // instrument, since the last review, notes only" — the spec requires
+          // the three conditions to intersect rather than one being ignored.
+          filter: FILTER_SCHEMA,
           ...targetProps,
         },
         required: ["value"],
@@ -659,12 +665,19 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         // so the lookup silently returned nothing for exactly the callers who
         // have the broadest access.
         const projectClause = r.projects ? "AND project IN (SELECT value FROM json_each(?))" : "";
+        // Composable filters (add-domain-memory-schema). Reuses the same
+        // readFilter the other read faces take, so the three conditions
+        // INTERSECT — a caller asking "instrument X, since last week, notes
+        // only" gets the intersection, never just one of them.
+        const f = readFilter(args);
+        if (f.error) return f.error;
+        const extra = pageFilterSql(f.filter, null, "project", "updated_at", "type");
         for (const m of matches) {
           const args: unknown[] = [];
           if (r.projects) args.push(JSON.stringify(r.projects));
-          args.push(`$."${m.key}"`, value, cap);
+          args.push(`$."${m.key}"`, value, ...(extra.args as unknown[]), cap);
           const rows = root.db.db
-            .prepare(`SELECT path, project, type, title, updated_at FROM pages WHERE 1=1 ${projectClause} AND json_extract(metadata, ?) = ? ORDER BY updated_at DESC LIMIT ?`)
+            .prepare(`SELECT path, project, type, title, updated_at FROM pages WHERE 1=1 ${projectClause} AND json_extract(metadata, ?) = ?${extra.clause} ORDER BY updated_at DESC LIMIT ?`)
             .all(...(args as never[])) as Array<{ path: string; project: string; type: string; title: string; updated_at: string }>;
           for (const row of rows) {
             if (seen.has(row.path)) continue;

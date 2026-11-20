@@ -526,3 +526,43 @@ test("memory_by_domain: a value matching two domain keys reports both", async ()
     assert.equal(r.pages.length, 2, "两个来源的页都要返回");
   } finally { await close(); }
 });
+
+test("memory_by_domain: 领域键、时间窗口与类型三个条件必须交集", async () => {
+  // add-domain-memory-schema：「该过滤 MUST 与既有的 project、时间窗口、类型等
+  // 过滤条件可组合」，且 scenario 明确要求「三个条件同时生效（交集），而不是
+  // 任一条件被忽略」。实现此前只接受 value/limit —— spec 承诺了，代码没有。
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/lia").token;
+    const call = await mcpSession(base, tok);
+
+    // 同一标的四条：#1 note（新）、#2 feedback（新）、#3 note（旧）
+    await call("memory_write_page", { title: "600519 笔记新", body: "a", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "600519 纪律", body: "b", metadata: { instrument: "600519", memory_type: "feedback" } });
+    // 先写 #3，再把它的 updated_at 改旧
+    const old3 = await call("memory_write_page", { title: "600519 笔记旧", body: "c", metadata: { instrument: "600519" } });
+    const root = svc.rootForKey("u/lia");
+    const oldStamp = new Date(Date.now() - 30 * 86400_000).toISOString();
+    root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(oldStamp, String(old3.path));
+
+    // 无过滤：三条都在
+    const all = await call("memory_by_domain", { value: "600519" });
+    assert.ok(all.pages.length === 3, `无过滤应三条，实际 ${all.pages.length}`);
+
+    // 只有时间窗口：旧的那条被排除
+    const recent = await call("memory_by_domain", { value: "600519", filter: { since: new Date(Date.now() - 86400_000).toISOString() } });
+    assert.ok(recent.pages.length === 2, `时间窗口应剩两条，实际 ${recent.pages.length}`);
+
+    // 只有类型：feedback 之外被排除
+    const onlyNote = await call("memory_by_domain", { value: "600519", filter: { layer: "L1" } });
+    assert.ok(onlyNote.pages.length >= 1, `按 layer 过滤应至少一条，实际 ${onlyNote.pages.length}`);
+
+    // 组合：时间窗口 + metadata（memory_type=feedback）—— 只剩 #2
+    const combo = await call("memory_by_domain", {
+      value: "600519",
+      filter: { since: new Date(Date.now() - 86400_000).toISOString(), metadata: { memory_type: "feedback" } },
+    });
+    assert.ok(combo.pages.length === 1, `三个条件交集应只剩一条，实际 ${combo.pages.length}：${JSON.stringify(combo.pages.map((p: { title: string }) => p.title))}`);
+    assert.ok(String(combo.pages[0].title).includes("纪律"), "交集的结果应是那条纪律");
+  } finally { await close(); }
+});

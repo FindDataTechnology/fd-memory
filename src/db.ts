@@ -112,7 +112,7 @@ function metadataFilterSql(filter: PageFilter | undefined, column: string): { cl
   return { clause, args };
 }
 
-function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null, projectColumn: string, timeColumn: string, typeColumn?: string): { clause: string; args: SqlArg[] } {
+export function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null, projectColumn: string, timeColumn: string, typeColumn?: string): { clause: string; args: SqlArg[] } {
   let clause = projectFilterSql(projects, projectColumn).clause;
   const args: SqlArg[] = projectFilterSql(projects, projectColumn).args;
   if (filter?.since) { clause += ` AND ${timeColumn} >= ?`; args.push(filter.since); }
