@@ -254,13 +254,15 @@ test("domain fill rates are per-domain, and zero shows as zero", () => {
     const rates = db.domainFillRates();
     const of = (k: string) => rates.find((r) => r.key === k)!;
 
-    assert.equal(of("instrument").rate, 1, "invest 全部带 instrument");
-    assert.equal(of("instrument").total, 2, "invest 的分母只有该域的页，不是全表");
-
-    assert.equal(of("party").rate, 1, "lex 的唯一一页带 party");
+    // Denominator is the PROJECT's whole page count, not "pages that already
+    // carry some domain key" — that older reading made a project with zero
+    // adoption contribute nothing and therefore look perfect (measured: 100
+    // memories at 0% coverage + 2 at 100% reported 100%).
+    assert.equal(of("instrument").total, 3, "分母是该 project 的全部页");
+    assert.equal(of("instrument").rate, 2 / 3, "2 条带 instrument / 3 条总页");
+    assert.equal(of("party").total, 3);
     assert.equal(of("case_no").rate, 0, "没人带 case_no 时必须显示 0，而不是缺席");
     assert.ok(of("case_no"), "零填充的键仍必须出现在结果里");
-    assert.equal(of("party").total, 1, "lex 的分母是 1（只有一页带该域任一键）");
 
     // A domain nobody has used reports total 0 and rate 0 — present, not absent.
     assert.equal(of("supplier").total, 0, "未使用的域分母为 0");
@@ -293,6 +295,44 @@ test("domain index audit detects a dropped index and names it", () => {
     const bad = db.domainIndexAudit();
     assert.equal(bad.ok, false, "a dropped index must fail the audit");
     assert.deepEqual(bad.missing, [victim], `audit must name the missing index, got ${JSON.stringify(bad.missing)}`);
+    db.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The metric must not let one project's adoption hide another's absence
+// (add-domain-memory-schema: "一个域填充率高、另一个域为 0，与两者都在 50%，
+// 是不同的问题" — the same confusion applies one level over, between projects).
+//
+// Measured defect of the first version: a project with 100 memories and ZERO
+// domain keys, plus a project with 2 memories fully covered, reported 100%.
+// The busiest project had adopted nothing and the metric said everything was
+// fine, because it only counted rows that already carried a domain key.
+test("domain fill rates: a project with zero adoption reports 0, not absence", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-fill2-"));
+  try {
+    const db = new RootDb(join(dir, "m.sqlite"));
+    const ins = db.db.prepare("INSERT INTO pages(path,project,type,title,body,updated_at,metadata) VALUES(?,?,?,?,?,?,?)");
+    const now = new Date().toISOString();
+    // alpha: 5 条记忆，零领域覆盖
+    for (let i = 0; i < 5; i++) ins.run(`alpha-${i}.md`, "alpha", "note", "t", "b", now, JSON.stringify({ harness: "h" }));
+    // beta: 2 条，全带 instrument
+    ins.run("beta-1.md", "beta", "note", "t", "b", now, JSON.stringify({ instrument: "X" }));
+    ins.run("beta-2.md", "beta", "note", "t", "b", now, JSON.stringify({ instrument: "Y" }));
+
+    const rates = db.domainFillRates();
+    const alphaInst = rates.find((r) => r.key === "instrument" && r.project === "alpha");
+    const betaInst = rates.find((r) => r.key === "instrument" && r.project === "beta");
+
+    assert.ok(alphaInst, "零采用的 project 必须出现在结果里，而不是消失");
+    assert.equal(alphaInst.rate, 0, "零采用必须是 0，不能被 beta 掩盖成 100%");
+    assert.equal(alphaInst.total, 5, "分母是该 project 的全部页");
+    assert.equal(alphaInst.filled, 0);
+
+    assert.ok(betaInst);
+    assert.equal(betaInst.rate, 1, "beta 全带 instrument");
+    assert.equal(betaInst.total, 2);
     db.db.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });

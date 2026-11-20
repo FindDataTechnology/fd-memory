@@ -246,26 +246,37 @@ export class RootDb {
    * team that has adopted it and the one that has never used it. Those are
    * different problems and must not collapse into one number.
    */
-  domainFillRates(): Array<{ key: string; domain: string; filled: number; total: number; rate: number }> {
-    // "Total" for a domain is the rows that carry ANY of that domain's keys —
-    // otherwise a legal key like case_no would be scored against the entire
-    // table, including every unrelated note, and sit near 0% forever.
-    const out: Array<{ key: string; domain: string; filled: number; total: number; rate: number }> = [];
+  domainFillRates(): Array<{ key: string; domain: string; project: string; filled: number; total: number; rate: number }> {
+    // Grouped by (project, domain), not domain alone (2026-11-21).
+    //
+    // The denominator is "rows carrying ANY key of this domain", which keeps an
+    // unrelated note from dragging `case_no` toward 0% forever. But that same
+    // definition makes a project that uses NO domain key contribute nothing at
+    // all — measured: a project with 100 memories and zero vocabulary coverage
+    // plus a project with 2 memories and full coverage reported 100%, i.e. "the
+    // vocabulary is doing great" while the busiest project had adopted none of
+    // it. That is the exact confusion the spec forbids between domains, one
+    // level over.
+    //
+    // Per project, the honest total is "every page in that project", because the
+    // question being asked is "of this project's memories, how many carry the
+    // key" — not "of the ones that already carry a key, how many carry this
+    // one". The zero-adoption project therefore reports 0/N rather than
+    // vanishing.
+    const out: Array<{ key: string; domain: string; project: string; filled: number; total: number; rate: number }> = [];
     const domains = [...new Set(RootDb.DOMAIN_KEYS.map((d) => d.domain))];
-    for (const domain of domains) {
-      const keys = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain);
-      const anyClause = keys
-        .map(({ key }) => `json_extract(metadata, '$."${key.replace(/"/g, '""')}"') IS NOT NULL`)
-        .join(" OR ");
-      const totalRow = this.db.prepare(`SELECT COUNT(*) AS n FROM pages WHERE ${anyClause}`).get() as { n: number } | undefined;
-      const total = Number(totalRow?.n ?? 0);
-      for (const { key } of keys) {
-        const path = `'$."${key.replace(/"/g, '""')}"'`;
-        const filledRow = this.db
-          .prepare(`SELECT COUNT(*) AS n FROM pages WHERE json_extract(metadata, ${path}) IS NOT NULL`)
-          .get() as { n: number } | undefined;
-        const filled = Number(filledRow?.n ?? 0);
-        out.push({ key, domain, filled, total, rate: total > 0 ? filled / total : 0 });
+    const projects = (this.db.prepare("SELECT DISTINCT project FROM pages").all() as Array<{ project: string }>)
+      .map((r) => r.project);
+    for (const project of projects) {
+      const projTotal = Number((this.db.prepare("SELECT COUNT(*) AS n FROM pages WHERE project=?").get(project) as { n: number }).n);
+      for (const domain of domains) {
+        for (const { key } of RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain)) {
+          const path = `'$."${key.replace(/"/g, '""')}"'`;
+          const filled = Number((this.db
+            .prepare(`SELECT COUNT(*) AS n FROM pages WHERE project=? AND json_extract(metadata, ${path}) IS NOT NULL`)
+            .get(project) as { n: number }).n);
+          out.push({ key, domain, project, filled, total: projTotal, rate: projTotal > 0 ? filled / projTotal : 0 });
+        }
       }
     }
     return out;
