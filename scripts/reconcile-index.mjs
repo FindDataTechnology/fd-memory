@@ -48,6 +48,7 @@ const { values } = parseArgs({
     root: { type: "string", default: "u-chengsishi" },
     data: { type: "string" },
     apply: { type: "boolean", default: false },
+    "repair-stale": { type: "boolean", default: false },
     project: { type: "string" },
   },
 });
@@ -99,8 +100,33 @@ if (!wikiIsDir) {
 }
 
 const db = new RootDb(dbPath);
+db.db.exec("PRAGMA busy_timeout = 30000");
 const files = walk(wikiDir, []);
 const indexed = new Set(db.db.prepare("SELECT path FROM pages").all().map((r) => r.path));
+
+// Content staleness (2026-11-20). The add-only path above only notices pages
+// that are ABSENT from the index. It cannot see the other divergence: a row
+// whose body no longer matches its markdown. That gap is real — trimming the
+// Bash backlog with scripts/trim-bash-bodies.mjs rewrote 20k files and then hit
+// "database is locked" on the index half (39 live sessions), leaving 12,724
+// rows where the truth said 256 bytes and the index still held the old blob.
+// Add-only reconcile reported "待补 0" through all of it, which is exactly the
+// kind of green that means nothing.
+//
+// `--repair-stale` closes that: compare the indexed body against the file's and
+// re-index on mismatch. Off by default because it reads every file (slow on a
+// 55k-page wiki) and is only needed after a bulk rewrite.
+const staleRows = [];
+if (values["repair-stale"]) {
+  const rows = db.db.prepare("SELECT path, body, updated_at FROM pages").all();
+  for (const r of rows) {
+    const f = files.find((x) => x.rel === r.path);
+    if (!f) continue; // orphans are reported separately, never "repaired"
+    let page;
+    try { page = readPageFile(f.full); } catch { continue; }
+    if (page.body !== r.body) staleRows.push({ rel: r.path, page, keepUpdatedAt: r.updated_at });
+  }
+}
 
 const missing = [];
 const forgotten = [];
@@ -121,8 +147,9 @@ console.log(`已索引    ${alreadyOk}`);
 console.log(`待补      ${missing.length}${values.project ? ` (project=${values.project})` : ""}`);
 console.log(`已遗忘    ${forgotten.length}（frontmatter 标记，跳过，与 reindex 一致）`);
 console.log(`孤儿索引  ${stale.length}（索引有、磁盘无；本脚本只报告，不删）`);
+if (values["repair-stale"]) console.log(`内容过期  ${staleRows.length}（索引正文与文件不符，--repair-stale 重索引）`);
 
-if (missing.length === 0) {
+if (missing.length === 0 && staleRows.length === 0) {
   console.log("");
   console.log("✅ 索引与盘面一致，无需修补");
   db.close();
@@ -130,11 +157,13 @@ if (missing.length === 0) {
 }
 
 // Sample what would be written so the dry run is checkable, not just a count.
-console.log("");
-console.log("待补样例（前 5 条，含将要采用的 updated_at）：");
-for (const m of missing.slice(0, 5)) {
-  const at = isoFromFrontmatter(m.page.frontmatter, m.full);
-  console.log(`  ${m.rel}  updated_at=${at}`);
+if (missing.length > 0) {
+  console.log("");
+  console.log("待补样例（前 5 条，含将要采用的 updated_at）：");
+  for (const m of missing.slice(0, 5)) {
+    const at = isoFromFrontmatter(m.page.frontmatter, m.full);
+    console.log(`  ${m.rel}  updated_at=${at}`);
+  }
 }
 
 if (!values.apply) {
@@ -146,6 +175,28 @@ if (!values.apply) {
 
 let written = 0;
 let failed = 0;
+
+// Stale repair first: these rows exist, so their frontmatter timestamp is the
+// one already in the index — keep it, only the body changes. Re-using
+// indexPage would stamp updated_at = now and reorder history, which is the
+// whole reason this script does not call reindexFromWiki.
+for (const s of staleRows) {
+  try {
+    const project = s.rel.split(/[\\/]/)[0];
+    db.indexPage(project, s.rel, String(s.page.frontmatter.type ?? "note"),
+      String(s.page.frontmatter.title ?? s.rel), s.page.body, {
+        sources: Array.isArray(s.page.frontmatter.sources) ? s.page.frontmatter.sources : [],
+        supersedes: Array.isArray(s.page.frontmatter.supersedes) ? s.page.frontmatter.supersedes : [],
+      });
+    const at = s.keepUpdatedAt;
+    db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(at, s.rel);
+    db.db.prepare("UPDATE pages_fts SET updated_at=? WHERE path=?").run(at, s.rel);
+    written++;
+  } catch (err) {
+    failed++;
+    if (failed <= 3) console.error(`  过期行修复失败 ${s.rel}: ${err.message}`);
+  }
+}
 for (const m of missing) {
   try {
     const project = m.rel.split(/[\\/]/)[0];

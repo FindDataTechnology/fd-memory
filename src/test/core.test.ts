@@ -443,6 +443,60 @@ test("audit: page writes and handoff ops each leave a write row", () => {
   }
 });
 
+test("mcp: a session id survives a restart — a live client is never bricked by one", async () => {
+  // 2026-11-20: the session map is process memory, so any `launchctl kickstart`
+  // empties it while connected clients keep their `mcp-session-id`. The old
+  // code answered those with a hard 400 "session not initialized", which meant
+  // a routine restart silently broke every live MCP client until each one
+  // happened to re-initialize — observed in production as a session that could
+  // not write memory and had no clue why.
+  //
+  // The session is a CACHE, not an auth gate: `route()` verifies the token on
+  // every request. So a stale id must be resumed, not refused.
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const tok = svc.tokens.mint("deployment", "d/p/a").token;
+    server = createServer((req, res) => {
+      (svc as any).route(req, res).catch((e: unknown) => { res.writeHead(500); res.end(String(e)); });
+    });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const call = (sid: string, method: string, params: Record<string, unknown> = {}) =>
+      fetch(base + "/mcp", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+      });
+
+    const init = await fetch(base + "/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const sid = init.headers.get("mcp-session-id")!;
+    assert.equal((await call(sid, "tools/list")).status, 200, "baseline: the session works before the restart");
+
+    // Simulate the restart exactly: the process's session map is gone, the
+    // client's id is not.
+    (svc as unknown as { sessions: Map<string, unknown> }).sessions.clear();
+
+    const afterRestart = await call(sid, "tools/list");
+    assert.equal(afterRestart.status, 200, "a pre-restart session id must still work");
+    const body = (await afterRestart.json()) as { result?: { tools?: unknown[] }; error?: { message: string } };
+    assert.equal(body.error, undefined, "no -32000 session error after a restart");
+    assert.ok((body.result?.tools?.length ?? 0) > 0, "and it serves real tools, not an empty shell");
+
+    // A tools/call must work too — that is the path memory writes take.
+    const write = await call(sid, "tools/call", { name: "memory_write_page", arguments: { project: "default", type: "note", title: "重启后写入", body: "会话恢复" } });
+    assert.equal(write.status, 200, "writes still land on a resumed session");
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("http service: auth 401, capture 200, mcp initialize + tools/list round-trip", async () => {
   const data = tmpData();
   const svc = new Service({ dataDir: data, port: 0, pepper: "p" });

@@ -1527,10 +1527,31 @@ export class Service {
       }));
     }
 
-    const session = this.sessions.get(sid);
+    // Session resumption after a restart (2026-11-20).
+    //
+    // The map above is process memory, so a restart empties it while every
+    // connected client still holds its `mcp-session-id`. The old code answered
+    // those with a hard 400 "session not initialized" — which meant a routine
+    // `launchctl kickstart` permanently broke every live MCP client until each
+    // one happened to re-`initialize`. Hit in production: a restart to pick up
+    // an unrelated change left a user's session unable to write memory at all,
+    // and nothing in the error hinted that restarting was the cause.
+    //
+    // Rebuilding is the correct behaviour, because the session is a CACHE and
+    // never an authorization gate: `route()` has already verified the token on
+    // THIS request, and the comment above says so ("token re-verified on every
+    // request; sessions just cache the resolved root"). Refusing here added no
+    // security — it only let a stale id deny a fully-authenticated caller.
+    //
+    // Grants are still read fresh per call, and the resolved root comes from
+    // this request's own scope, so a resumed session can never reach a root its
+    // current token does not cover.
+    let session = this.sessions.get(sid);
     if (!session) {
-      res.writeHead(400, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32000, message: "session not initialized" } }));
+      session = { scope, root: this.rootFor(scope) };
+      // Re-key under the id the client is already using, so its subsequent
+      // requests hit the cache instead of repeating this path.
+      if (sid) this.sessions.set(sid, session);
     }
 
     if (msg.method === "notifications/initialized" || msg.method?.startsWith("notifications/")) {
