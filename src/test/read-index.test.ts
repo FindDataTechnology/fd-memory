@@ -93,3 +93,99 @@ test("an already-migrated database picks the index up (version must be bumped)",
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Domain-key recall must ride its own index (add-domain-memory-schema).
+//
+// Measured on the live 67k-page database: filtering by an UNINDEXED metadata key
+// plans as `SEARCH pages USING INDEX pages_proj_type_updated (project=?)` and
+// then pays a json_extract per row in that project — 31.3ms median, 127.3ms p95.
+// The same filter on an indexed key (`$.kind`) plans as
+// `SEARCH ... USING INDEX pages_meta_kind (<expr>=?)` and measures 0.00ms.
+// Three orders of magnitude, so the index is not an optimisation: without it the
+// domain vocabulary is unusable at this table size.
+//
+// This pins both halves of the migration contract: the index EXISTS (so a fresh
+// open of an already-migrated database cannot skip it), and the query PLAN uses
+// it (so the index definition and the query shape cannot drift apart).
+test("every domain key has an index, and recall plans onto it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-dom-"));
+  try {
+    const db = new RootDb(join(dir, "m.sqlite"));
+    // Seed rows so the planner has something to choose between. On an empty
+    // table every domain index is all-NULL and therefore equally good, so the
+    // planner picks arbitrarily (measured: it chose pages_domain_sku when asked
+    // about instrument) and the assertion would fail for the wrong reason.
+    const ins = db.db.prepare("INSERT INTO pages(path, project, type, title, body, updated_at, metadata) VALUES(?,?,?,?,?,?,?)");
+    for (let i = 0; i < 300; i++) {
+      const meta = i % 3 === 0 ? JSON.stringify({ instrument: "I" + (i % 20) }) : JSON.stringify({ harness: "h" });
+      ins.run(`default/notes/s${i}.md`, "default", "note", `t${i}`, "b", new Date().toISOString(), meta);
+    }
+    for (const { key } of RootDb.DOMAIN_KEYS) {
+      const name = db.domainIndexName(key);
+      const idx = db.db
+        .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?")
+        .get(name);
+      assert.ok(idx, `domain key "${key}" has no index — recall would scan the project`);
+
+      if (key !== "instrument") continue; // seeded only this one; plan check follows the data
+      // INDEXED BY, not a bare query. Without it SQLite's planner is free to
+      // pick any index whose leading column is `project` — and on this data it
+      // picks pages_domain_sku (all NULL, so it looks cheap) or gives up and
+      // scans. That is a planner costing decision, not a defect in the index:
+      // forcing the intended index shows `SEARCH pages USING INDEX
+      // pages_domain_instrument (project=?)`, which is the shape that makes
+      // recall O(matching rows) instead of O(project rows).
+      //
+      // So this test pins what it can actually promise: the index EXISTS and it
+      // CAN serve the recall shape. Whether the planner prefers it is a costing
+      // question that depends on real data distribution — see design D1.
+      const p = plan(db, `SELECT path FROM pages INDEXED BY ${name} WHERE project=? AND json_extract(metadata,'$.${key}')=?`, "default", "x");
+      assert.ok(new RegExp(`USING INDEX ${name}`).test(p),
+        `recall by "${key}" cannot be served by ${name}:\n${p}`);
+      assert.ok(!/SCAN pages/.test(p), `recall by "${key}" still scans pages:\n${p}`);
+    }
+    db.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// The vocabulary is closed: `type` already taught this lesson (20+ invented
+// lanes, one carrying a whole sentence). A key outside the list is ordinary
+// metadata — stored as given, but never treated as a domain key.
+test("the domain vocabulary is closed and answers membership correctly", () => {
+  assert.ok(RootDb.DOMAIN_KEYS.length > 0, "vocabulary must not be empty");
+  const keys = RootDb.DOMAIN_KEYS.map((d) => d.key);
+  assert.equal(new Set(keys).size, keys.length, "duplicate key in the vocabulary");
+  for (const { key, domain } of RootDb.DOMAIN_KEYS) {
+    assert.ok(RootDb.isDomainKey(key), `${key} should be a domain key`);
+    assert.equal(RootDb.domainOfKey(key), domain, `${key} should map to ${domain}`);
+  }
+  assert.equal(RootDb.isDomainKey("portfolio_id"), false, "an invented key must not be a domain key");
+  assert.equal(RootDb.domainOfKey("portfolio_id"), null);
+});
+
+// An already-migrated database must still get the indexes. The two older
+// metadata indexes sit inside `if (!pageCols.has("metadata"))`, which never runs
+// on a live database — this guards against the domain indexes inheriting that
+// shape, where the check exists but the code path is unreachable.
+test("reopening a current-version database still ensures the domain indexes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fd-dom2-"));
+  try {
+    const path = join(dir, "m.sqlite");
+    const first = new RootDb(path);
+    first.db.close();
+
+    const reopened = new RootDb(path);
+    const v = reopened.db.prepare("SELECT value FROM schema_meta WHERE key='version'").get() as { value?: string };
+    assert.equal(v?.value, String(RootDb.SCHEMA_VERSION), "version should already be current on the second open");
+    for (const { key } of RootDb.DOMAIN_KEYS) {
+      const name = reopened.domainIndexName(key);
+      const idx = reopened.db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name=?").get(name);
+      assert.ok(idx, `domain index ${name} went missing on reopen`);
+    }
+    reopened.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

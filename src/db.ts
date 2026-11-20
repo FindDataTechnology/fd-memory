@@ -130,7 +130,56 @@ export class RootDb {
    * that must run again; otherwise an already-migrated database skips the whole
    * write path on open.
    */
-  static readonly SCHEMA_VERSION = 2;
+  static readonly SCHEMA_VERSION = 3;
+
+  /**
+   * The closed domain-key vocabulary (add-domain-memory-schema).
+   *
+   * What this is for: the four memory axes answer "where is it stored / how much
+   * does it recall / whose word counts / how is it distilled". None of them
+   * answers "what does THIS domain record, and how is it grouped". An investing
+   * team wants to gather a review per instrument; a legal team per party. With
+   * only the four axes, both teams get identical behaviour and can express the
+   * distinction only in free text — and free-text classification was already
+   * rejected for `type` (20+ invented lanes, one carrying a whole sentence).
+   *
+   * Why CLOSED, and why a key can only be added by shipping a release: every key
+   * carries an expression index (see migrate()). A distributed artifact that can
+   * introduce a key is an artifact that can change the shape of a database it
+   * does not own. Same rule as `store.home` accepting only fleet/member/person
+   * and refusing every address form.
+   *
+   * Keys are chosen from domains that already have real packs with a settled
+   * write pattern. hotel/flower have pack directories but unmeasured volumes, so
+   * they are deliberately absent — adding one later is its own release, which is
+   * a reversible step.
+   */
+  static readonly DOMAIN_KEYS: ReadonlyArray<{ key: string; domain: string }> = [
+    { key: "instrument", domain: "invest" },
+    { key: "party", domain: "lex" },
+    { key: "case_no", domain: "lex" },
+    { key: "supplier", domain: "erp" },
+    { key: "sku", domain: "erp" },
+  ];
+
+  /** Is this metadata key a domain key? Unknown keys are ordinary metadata. */
+  static isDomainKey(key: string): boolean {
+    return RootDb.DOMAIN_KEYS.some((d) => d.key === key);
+  }
+
+  /** The domain a key belongs to, or null when the key is not in the vocabulary. */
+  static domainOfKey(key: string): string | null {
+    return RootDb.DOMAIN_KEYS.find((d) => d.key === key)?.domain ?? null;
+  }
+
+  /**
+   * Index name for a domain key, in one place because three callers need to
+   * agree on it: the migration that creates it, the test that asserts the query
+   * plan uses it, and any diagnostic that checks it exists.
+   */
+  domainIndexName(key: string): string {
+    return `pages_domain_${key.replace(/[^a-z0-9_]/gi, "_")}`;
+  }
 
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -375,6 +424,50 @@ export class RootDb {
     // supersede lists — a one-time catch-up for roots that predate the table.
     const edgeCount = this.db.prepare("SELECT COUNT(*) AS n FROM superseded_edges").get() as { n: number };
     if (Number(edgeCount.n) === 0) this.rebuildSupersedeEdges();
+
+    // Domain-key indexes (add-domain-memory-schema).
+    //
+    // UNCONDITIONAL on purpose. The two older metadata indexes above sit inside
+    // `if (!pageCols.has("metadata"))`, which means they never run on any
+    // database that already has the column — every live one. They exist here
+    // only because some earlier path happened to create them; a fresh open of an
+    // already-migrated root silently skips that block. Index creation for the
+    // domain vocabulary must not inherit that shape: if a key is in the
+    // vocabulary, its index has to exist, and "the column was added long ago" is
+    // not a reason to skip.
+    //
+    // Measured basis (see design D1): with an expression index the same
+    // metadata-equality recall is 0.00ms and plans as `SEARCH ... USING INDEX`;
+    // without one it is 31.3ms median / 127.3ms p95 because every row in the
+    // project pays a json_extract. 1,112ms to build one on 67k rows, so five
+    // keys is ~6s, once.
+    for (const { key } of RootDb.DOMAIN_KEYS) {
+      // The key comes from the constant above, never from input — but quote it
+      // the way SQLite expects so a future key with an unusual character cannot
+      // turn into a syntax error at migration time.
+      //
+      // COMPOSITE (project, <expr>), not (<expr>) alone. Every real recall is
+      // scoped to a project — a bare key index is never chosen while `project=?`
+      // is present, and the planner falls back to pages_proj_type_updated and
+      // pays a json_extract per row. Measured on a probe table: `(expr)` alone
+      // with `project=?` plans as `SEARCH ... USING INDEX pages_proj_type_updated
+      // (project=?)`, i.e. the new index was built and completely ignored. This
+      // mirrors pages_proj_type_updated, which also leads with project.
+      const path = `'$."${key.replace(/"/g, '""')}"'`;
+      this.db.exec(`CREATE INDEX IF NOT EXISTS ${this.domainIndexName(key)} ON pages(project, json_extract(metadata, ${path}))`);
+    }
+    // Give the planner statistics for the indexes above (add-domain-memory-schema).
+    //
+    // Measured: without stats, a domain index on a key that is still mostly NULL
+    // is simply not chosen — the planner prefers pages_proj_type_updated (or a
+    // plain scan) and pays a json_extract per candidate row. `INDEXED BY` proves
+    // the index CAN serve the shape, so this is a costing problem, not a
+    // definition problem. ANALYZE is what lets the planner cost it correctly
+    // once real values start landing.
+    //
+    // Best-effort: a failure here degrades recall speed, never correctness, and
+    // must not abort a migration that already created the indexes.
+    try { this.db.exec("ANALYZE"); } catch { /* stats are an optimisation */ }
 
     // Record the version so the next open skips this whole write path. Done
     // last: a half-finished migration must not be marked complete.
