@@ -728,3 +728,67 @@ test("/admin/metrics: 注入耗时给出中位数与最大值，慢调用不被�
     assert.ok(m.injection!.max_ms! >= m.injection!.median_ms!, "最大值不可能小于中位数");
   } finally { await close(); }
 });
+
+// ── the declared schema reaches the injection face BEFORE the write ─────────
+//
+// add-memory-schema-axis gave `key_by` a CONSUMER (the write-side hint). That
+// is still one-directional: the agent learns "you forgot instrument" only
+// after it has already written without one, every turn. The declaration is a
+// standing convention for the team, so it has to be visible on the READ face —
+// that is where an agent looks before deciding what to write.
+//
+// These tests pin both halves: the block appears when declared, and the
+// response is byte-identical to the pre-change shape when it is not (the same
+// "additive, absent-by-default" discipline the domain folding follows).
+
+test("/memory/index: a declared key_by is reported on the read face", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-sch");
+    root.db.setMemoryPolicy("root", { key_by: "instrument" });
+    root.writePage("default", "notes", "seed", newPage("note", "种子", "内容", {}));
+
+    const person = svc.tokens.mint("person", "u/sch").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    assert.equal(r.status, 200);
+    const body = (await r.json()) as { schema?: { key_by: string; domain: string | null } };
+    assert.ok(body.schema, "声明的 key_by 必须出现在注入面（否则 agent 只能写完才知道）");
+    assert.equal(body.schema!.key_by, "instrument");
+    assert.equal(body.schema!.domain, "invest", "域由词表推导，不是另存一份");
+  } finally { await close(); }
+});
+
+test("/memory/index: without a declaration the response carries no schema key", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-nosch");
+    root.writePage("default", "notes", "seed", newPage("note", "种子", "内容", {}));
+
+    const person = svc.tokens.mint("person", "u/nosch").token;
+    const body = (await (await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) })).json()) as Record<string, unknown>;
+    // Absent, not null: a root that never adopted the vocabulary must get the
+    // exact pre-change shape, so nothing downstream starts branching on a field
+    // that means "we have no idea" for everyone.
+    assert.equal("schema" in body, false, "无声明时不得出现 schema 字段");
+  } finally { await close(); }
+});
+
+test("/memory/index: declaring a key invalidates the injection cache", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-cache");
+    root.writePage("default", "notes", "seed", newPage("note", "种子", "内容", {}));
+
+    const person = svc.tokens.mint("person", "u/cache").token;
+    const first = (await (await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) })).json()) as Record<string, unknown>;
+    assert.equal("schema" in first, false);
+
+    // Declare AFTER the first read cached a no-schema body. Nothing writes a
+    // page here on purpose: the only thing that changed is the policy row, so
+    // a cache keyed on `MAX(rowid)` alone would keep serving the old answer —
+    // which reads exactly like "the declaration was ignored".
+    root.db.setMemoryPolicy("root", { key_by: "party" });
+    const second = (await (await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) })).json()) as { schema?: { key_by: string } };
+    assert.equal(second.schema?.key_by, "party", "声明变化必须让注入缓存失效");
+  } finally { await close(); }
+});

@@ -1103,7 +1103,14 @@ export class Service {
       // Cache probe (2026-11-20): see indexCache. Bounded to 200 entries
       // because the key includes `limit` and a pathological caller could
       // otherwise grow this without end; the realistic key count is a handful.
-      const cacheKey = `${iRoot.rootDir}\u0000${iProject}\u0000${want}`;
+      //
+      // The declared key joins the key (2026-11-22) because the answer now
+      // carries it. Skipping this would pin the FIRST answer: declare a key on
+      // a root that had none and every session keeps reading the cached
+      // no-declaration body until some page happens to be written — a stale
+      // answer that looks like the declaration was ignored.
+      const declaredKeyNow = iRoot.db.declaredDomainKey(iProject);
+      const cacheKey = `${iRoot.rootDir}\u0000${iProject}\u0000${want}\u0000${declaredKeyNow ?? ""}`;
       const cached = this.indexCache.get(cacheKey);
       if (cached) {
         const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
@@ -1432,7 +1439,28 @@ export class Service {
       // a supersede edge all write through `pages`). Using the rowid rather
       // than a TTL is deliberate: the spec requires a freshly written memory to
       // be visible to the very next session, and a TTL cannot promise that.
-      const bodyOut = JSON.stringify({ project: iProject, total: ranked.length, entries: outItems });
+      //
+      // The declared domain key is part of the response, not of the entry list
+      // (2026-11-22). Without it the write-side hint is the ONLY channel: an
+      // agent learns "you forgot instrument" only AFTER it has already written
+      // a memory without one, every single time. The declaration is a standing
+      // convention for the team — it belongs on the read face where the agent
+      // can see it BEFORE writing, not as a correction afterwards.
+      //
+      // Additive and absent-by-default: no declaration → no `schema` key at all,
+      // so the response is byte-identical to before for every root that has not
+      // adopted the vocabulary (the same discipline task 5.3 pins for domain
+      // grouping).
+      const declaredKey = declaredKeyNow;
+      const schemaBlock = declaredKey
+        ? { key_by: declaredKey, domain: RootDb.domainOfKey(declaredKey) }
+        : undefined;
+      const bodyOut = JSON.stringify({
+        project: iProject,
+        total: ranked.length,
+        entries: outItems,
+        ...(schemaBlock ? { schema: schemaBlock } : {}),
+      });
       const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
       this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
       // Bounded eviction (2026-11-21). The comment above the probe has claimed
