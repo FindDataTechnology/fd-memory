@@ -1057,3 +1057,49 @@ test("supersede edges: rebuilt by reindex, and the audit catches a short table (
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── the FTS leg must actually run, not silently degrade to LIKE ─────────────
+//
+// 2026-11-22 measured defect: `searchPages`'s FTS statement combined
+// `snippet()` with `COUNT(*) OVER ()`, which SQLite rejects with
+// "unable to use function snippet in the requested context". The `catch`
+// swallowed it, so EVERY search fell through to the LIKE branch — a full scan
+// of 89k pages' bodies, ~2s per query, while still returning plausible rows.
+// Nothing looked broken; it was just 100× slower and ignored the index.
+//
+// The assertion has to hit the REAL code path. A first version of this test
+// hand-wrote the SQL and checked ITS plan — which stayed green even after the
+// bug was re-injected, because it never exercised `searchPages` at all. Instead:
+// make the LIKE branch observably different from the FTS branch, then assert
+// which one produced the answer.
+test("searchPages uses the FTS leg, not the LIKE fallback (3+ char query)", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-fts");
+    // A page whose BODY contains the term but whose TITLE does not. The FTS leg
+    // indexes title+body and will find it; the LIKE fallback searches
+    // (title LIKE ? OR body LIKE ?) and would also find it — so filter by what
+    // each branch returns differently instead: the FTS leg's snippet comes from
+    // `snippet(pages_fts, ...)`, which brackets matches with '[' ']' … '…'.
+    root.writePage("default", "notes", "n0",
+      newPage("note", "部署结论", "这一条正文提到 ArgoCD 的配置", {}));
+
+    const hits = root.db.searchPages("ArgoCD", 20);
+    assert.equal(hits.length, 1, "必须命中那一条");
+
+    // The discriminator: the LIKE branch builds its snippet with substr/instr
+    // and never inserts the '[' … ']' match brackets that `snippet()` adds.
+    assert.match(
+      hits[0].snippet,
+      /\[ArgoCD\]/i,
+      `snippet 应来自 FTS 的 snippet()（带 [] 高亮）；没有说明走了 LIKE 兜底。实际：${JSON.stringify(hits[0].snippet)}`,
+    );
+
+    // And total is still right now that it comes from its own statement.
+    const meta: { total?: number } = {};
+    root.db.searchPages("ArgoCD", 1, null, undefined, meta);
+    assert.equal(meta.total, 1, `total 应报全部命中（独立 COUNT），实际 ${meta.total}`);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

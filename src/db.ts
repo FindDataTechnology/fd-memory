@@ -854,17 +854,44 @@ export class RootDb {
     const hasPageOnlyFilter = Boolean(filter && (filter.metadata || filter.since || filter.until || filter.types?.length));
     const fts = (() => {
       try {
+        // `snippet()` and a window function cannot appear in the same statement:
+        // SQLite rejects it with "unable to use function snippet in the requested
+        // context". Measured 2026-11-22 — the combination threw on EVERY query,
+        // `catch` swallowed it, and searchPages silently fell through to the LIKE
+        // branch. Result: `memory_query` never used the FTS index at all and every
+        // search cost ~2s (a full scan of 89k pages' bodies) while still returning
+        // plausible answers, so nothing looked broken.
+        //
+        // `_total` therefore comes from its own statement below. Two queries is
+        // cheaper than one broken one: the count reuses the same MATCH and needs
+        // no snippet.
         return this.db
           .prepare(
-            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip, COUNT(*) OVER () AS _total
+            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snippet
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
              WHERE pages_fts MATCH ?${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY rank LIMIT ?`,
           )
-          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>;
+          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>;
       } catch {
         return [];
       }
     })();
+    // True match count for the FTS leg (the window-function trick is unavailable
+    // alongside `snippet`, see above). Only computed when the FTS leg produced
+    // rows — otherwise the LIKE fallback owns the count.
+    let ftsTotal = 0;
+    if (fts.length > 0) {
+      try {
+        ftsTotal = Number((this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
+             WHERE pages_fts MATCH ?${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)}`,
+          )
+          .get(this.ftsQuery(query), ...mf.args) as { c: number }).c);
+      } catch {
+        ftsTotal = fts.length;
+      }
+    }
     let rows: Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }> = fts;
     if (rows.length === 0) {
       // trigram needs >=3 chars; fall back to LIKE for shorter queries
@@ -878,7 +905,12 @@ export class RootDb {
           .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
       );
     }
-    const pagesTotal = rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
+    // FTS rows carry no `_total` (see the comment above the query); the LIKE
+    // fallback still uses the window function, which is legal there because it
+    // has no `snippet()` in the projection.
+    const pagesTotal = fts.length > 0
+      ? ftsTotal
+      : rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
     if (hasPageOnlyFilter) {
       if (meta) meta.total = pagesTotal;
       return rows.slice(0, limit);
