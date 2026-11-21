@@ -7,6 +7,9 @@ Working memory for agentic platforms — durable, layered, self-distilling memor
 
 > **永久免费**：永忆本体自托管免费，无计量面、无付费墙、无 license 检查机制；嵌入与蒸馏的模型成本由运营者自担（BYO 模型）。Free forever — self-host free, no metering, no paywall; bring your own model budget.
 
+> **别和 `FindDataTechnology/finddata-memory` 搞混。** 那个是**我们自己的 agent 记忆账本**
+> （Markdown 索引 + 事故取证记录，内部用），不是本产品的代码仓。名字像，内容无关。
+
 ## 为什么
 
 Agentic 平台的共同问题：
