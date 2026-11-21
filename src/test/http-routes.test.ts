@@ -792,3 +792,45 @@ test("/memory/index: declaring a key invalidates the injection cache", async () 
     assert.equal(second.schema?.key_by, "party", "声明变化必须让注入缓存失效");
   } finally { await close(); }
 });
+
+// ── the budget's blind spot is named, not silent ───────────────────────────
+//
+// Measured 2026-11-22 on the live store: 10,049 pages are candidates for
+// injection and, at limit=100, only 50 distilled slots exist — 0.5% coverage.
+// The other 99.5% are not lost (memory_query / memory_overview reach them), but
+// a reader shown 50 entries with no remainder count has no way to know they
+// exist. That is the same failure `domain_note` already guards against one
+// level down ("该领域下另有 N 条").
+
+test("/memory/index: a clipped budget reports how many memories it left out", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-many");
+    for (let i = 0; i < 12; i++) {
+      root.writePage("default", "notes", `n${i}`, newPage("note", `结论 ${i}`, `正文 ${i}`, {}));
+    }
+    const person = svc.tokens.mint("person", "u/many").token;
+    const body = (await (await fetch(`${base}/memory/index?project=default&limit=4`, { headers: json(person) })).json()) as {
+      total: number;
+      entries: unknown[];
+      more?: { beyond_budget: number; note: string };
+    };
+    assert.equal(body.total, 12, "total 报全池");
+    assert.ok(body.entries.length <= 4, `entries 受预算约束，实际 ${body.entries.length}`);
+    assert.ok(body.more, "被裁剪时必须报出剩余量，否则读者会把这一小撮当成全部");
+    assert.equal(body.more!.beyond_budget, 12 - body.entries.length);
+    // The hint has to name the way out, or it is just a complaint.
+    assert.match(body.more!.note, /memory_query/);
+  } finally { await close(); }
+});
+
+test("/memory/index: when everything fits, no `more` block appears", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-few");
+    root.writePage("default", "notes", "only", newPage("note", "唯一一条", "正文", {}));
+    const person = svc.tokens.mint("person", "u/few").token;
+    const body = (await (await fetch(`${base}/memory/index?project=default&limit=50`, { headers: json(person) })).json()) as Record<string, unknown>;
+    assert.equal("more" in body, false, "全部装得下时不得出现 more —— 小库的响应保持原样");
+  } finally { await close(); }
+});

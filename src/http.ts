@@ -1455,11 +1455,24 @@ export class Service {
       const schemaBlock = declaredKey
         ? { key_by: declaredKey, domain: RootDb.domainOfKey(declaredKey) }
         : undefined;
+      // Count what the BUDGET admitted (`picked`), not what the renderer emitted
+      // (`outItems`): domain folding collapses several picks into one entry, so
+      // the two differ exactly when a reader most needs the honest number. An
+      // item folded away is still visible — it is named in its group's
+      // `domain_note` — so counting it as omitted would overstate the loss.
+      const omitted = Math.max(0, ranked.length - picked.length);
+      const more = omitted > 0
+        ? {
+            beyond_budget: omitted,
+            note: `另有 ${omitted} 条记忆未进入本次注入（预算内只展示最相关/最新的 ${picked.length} 条）。用 memory_query 按词检索，或 memory_overview 看分布。`,
+          }
+        : undefined;
       const bodyOut = JSON.stringify({
         project: iProject,
         total: ranked.length,
         entries: outItems,
         ...(schemaBlock ? { schema: schemaBlock } : {}),
+        ...(more ? { more } : {}),
       });
       const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
       this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
