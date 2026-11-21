@@ -19,7 +19,7 @@ import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-sche
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { startStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, noteInjectionLatency, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
 import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
@@ -1073,6 +1073,11 @@ export class Service {
     // first within each group. `limit` is clamped hard because this rides the
     // system prompt of every session.
     if (path === "/memory/index" && req.method === "GET") {
+      // Wall-clock for the whole read face (slim-injection-query-and-expose-latency).
+      // Recorded on EVERY exit path via the helper below, so a cached hit, a
+      // timeout-slow call and a full recompute all land in the same series.
+      const injStartedAt = process.hrtime.bigint();
+      const injDone = () => noteInjectionLatency(Number(process.hrtime.bigint() - injStartedAt) / 1e6);
       let iRoot: StoreRoot;
       if (scope.kind === "person") {
         iRoot = this.rootFor(scope);
@@ -1104,6 +1109,7 @@ export class Service {
         const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
         if (ver === cached.version) {
           res.writeHead(200, { "content-type": "application/json" });
+          injDone();
           return void res.end(cached.body);
         }
       }
@@ -1444,6 +1450,7 @@ export class Service {
         if (oldest === undefined) break;
         this.indexCache.delete(oldest);
       }
+      injDone();
       return void res.end(bodyOut);
     }
 

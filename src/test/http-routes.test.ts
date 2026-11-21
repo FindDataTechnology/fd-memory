@@ -702,3 +702,29 @@ test("/memory/index: 跨类型同 semantic identity 仍然只出现一次", asyn
       `跨类型同 identity 必须收敛为一条，实际 ${hitting.length}: ${JSON.stringify(entries.map((e) => e.description))}`);
   } finally { await close(); }
 });
+
+test("/admin/metrics: 注入耗时给出中位数与最大值，慢调用不被平均掉", async () => {
+  // slim-injection-query-and-expose-latency 2.2/2.4。平均值会主动误导：
+  // 一次 2,100ms 混在十九次 30ms 里读作 130ms，而那一次正是让会话降级的那个。
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/lat").token;
+    svc.rootForKey("u/lat").writePage("default", "notes", "seed",
+      newPage("note", "种子", "内容", { metadata: { memory_type: "feedback" } }));
+
+    // 打几次注入，产生样本
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    }
+    const runner = svc.tokens.mint("runner", "d/lat").token;
+    const m = await (await fetch(`${base}/admin/metrics`, { method: "POST", headers: json(runner) })).json() as {
+      injection?: { samples: number; median_ms: number | null; max_ms: number | null; budget_ms: number; near_budget?: boolean };
+    };
+    assert.ok(m.injection, "metrics 必须暴露 injection 段");
+    assert.ok(m.injection!.samples >= 3, `至少三次样本，实际 ${m.injection!.samples}`);
+    assert.ok(typeof m.injection!.median_ms === "number", "必须有中位数");
+    assert.ok(typeof m.injection!.max_ms === "number", "必须有最大值");
+    assert.equal(m.injection!.budget_ms, 2500, "预算默认 2500，与客户端一致");
+    assert.ok(m.injection!.max_ms! >= m.injection!.median_ms!, "最大值不可能小于中位数");
+  } finally { await close(); }
+});

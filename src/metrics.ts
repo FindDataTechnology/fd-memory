@@ -135,6 +135,38 @@ export function sampleVectorsScale(perRootCounts: number[]): void {
   vectorsScaleSample = { roots: live.length, total, max_root: max, over_threshold: max > t.max_per_root || total > t.total, threshold: t };
 }
 
+// Injection latency (slim-injection-query-and-expose-latency). The injection
+// read face runs once per session start and must finish inside the client's
+// budget, or the session silently degrades to the disk fallback and simply gets
+// less memory with no indication. Measured on this machine: typical cold start
+// 876 ms, but 2,112 ms was observed under load — against a 2,500 ms budget.
+//
+// MEDIAN AND MAX, never an average. One 2,100 ms call averaged with nineteen
+// 30 ms calls reads as 130 ms, which is precisely the number that would hide the
+// one call that broke the session. The max is the one that matters; the median
+// tells you whether the whole face drifted or just one outlier.
+const injectionSamples: number[] = [];
+const INJECTION_SAMPLE_MAX = 50;
+
+/**
+ * The client's injection budget, mirrored here so the read face can say "how
+ * much headroom is left" instead of leaving the operator to find it in another
+ * file's constant. Default 2,500 ms is what src/connect/cli.ts aborts at; if
+ * that changes, this env var keeps the two in step rather than letting the
+ * reported headroom quietly become fiction.
+ */
+function injectionBudgetMs(): number {
+  const raw = Number(process.env.FD_MEMORY_INJECTION_BUDGET_MS ?? 2500);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 2500;
+}
+
+/** Record one injection call's wall time (ms). Called from the route, cheap. */
+export function noteInjectionLatency(ms: number): void {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  injectionSamples.push(Math.round(ms));
+  if (injectionSamples.length > INJECTION_SAMPLE_MAX) injectionSamples.shift();
+}
+
 const distillSamples: Array<{ items: number; calls: number; tokens: number; pages: number }> = [];
 // Per-stage token profile (optimize-yongyi-read-surfaces 7.1). A distill run is
 // several engine calls — extract, then a reconcile per stream — and "tokens per
@@ -266,6 +298,20 @@ export function metricsSnapshot(): Record<string, unknown> {
   const total = digestRungs.vector + digestRungs.keyword + digestRungs.cooling;
   return {
     started_at: startedAt,
+    // max is the field that matters: one slow call is what degrades a session.
+    injection: (() => {
+      if (injectionSamples.length === 0) return { samples: 0, median_ms: null, max_ms: null, budget_ms: injectionBudgetMs() };
+      const s = [...injectionSamples].sort((a, b) => a - b);
+      return {
+        samples: s.length,
+        median_ms: s[Math.floor(s.length / 2)],
+        max_ms: s[s.length - 1],
+        budget_ms: injectionBudgetMs(),
+        // Ready-made answer to "are we close to the ceiling?" so an operator
+        // does not have to divide two numbers by hand at 3am.
+        near_budget: s[s.length - 1] >= injectionBudgetMs() * 0.8,
+      };
+    })(),
     digest: {
       total,
       ...digestRungs,
