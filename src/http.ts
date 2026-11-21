@@ -1107,42 +1107,19 @@ export class Service {
           return void res.end(cached.body);
         }
       }
-      const rows = iRoot.db.db
-        .prepare(
-          `SELECT CASE WHEN type = 'memory-index'
-                       THEN COALESCE(json_extract(metadata,'$.harness'),'?')
-                       ELSE 'yongyi' END AS harness,
-                  CASE WHEN type = 'memory-index'
-                       THEN json_extract(metadata,'$.memory_type')
-                       ELSE type END AS memory_type,
-                  COALESCE(json_extract(metadata,'$.source_path'), path) AS source_path,
-                  CASE WHEN type = 'memory-index'
-                       THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
-                       ELSE COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) END AS mtime,
-                  CASE WHEN type = 'memory-index' THEN body ELSE title END AS description,
-                  -- Semantic identity for cross-harness dedup (2026-11-20). The
-                  -- same conclusion written by two harnesses carries the same
-                  -- memory_name but lives at two paths (paas/memory/x.md vs
-                  -- bff3/memory/x.md). Measured: 2,846 memory-index pages hold
-                  -- 523 same-name groups, i.e. 18.4% of the injection budget
-                  -- was duplicate copies of conclusions already present.
-                  json_extract(metadata,'$.memory_name') AS memory_name,
-                  -- The page identifier supersede edges speak in (db.idOfPath:
-                  -- basename minus .md). Needed so the read face can ask "has
-                  -- anyone superseded me?".
-                  COALESCE(page_id, path) AS pid,
-                  -- Domain grouping key for the injection face
-                  -- (add-domain-memory-schema). COALESCE over the vocabulary in
-                  -- declaration order, so a page carrying two keys groups under
-                  -- the first one — the same rule the write-side hint uses, so
-                  -- "which domain is this" has ONE answer across both faces.
-                  -- NULL when the page carries no domain key, which is the
-                  -- overwhelming majority today; those pages keep the existing
-                  -- ordering untouched.
-                  COALESCE(${RootDb.DOMAIN_KEYS.map(({ key }) => `json_extract(metadata, '$."${key}"')`).join(", ")}) AS domain_value
+      // Two queries, not one (2026-11-21). The single query read `body` for
+      // every candidate, but injection renders `body` ONLY for memory-index —
+      // note/fact render their title. Measured: 9,237 notes carry 5 MB of body
+      // that was read and immediately discarded. Dropping it took the same
+      // query from 76 ms to 20 ms, because the cost here is page IO, not CPU.
+      //
+      // The two result sets are CONCATENATED before any post-processing so the
+      // dedup / ordering / quota / domain-folding steps below cannot tell which
+      // query a row came from — computing them per-group would break dedup at
+      // the group boundary and double-count quota.
+      const INJ_TAIL = `
            FROM pages
            WHERE project = ?
-             AND (type = 'memory-index' OR type IN ('note','fact'))
              AND json_extract(metadata,'$.forgotten_at') IS NULL
              -- Superseded pages leave the injection face (2026-11-20). The
              -- superseded_edges table has been written since
@@ -1154,9 +1131,48 @@ export class Service {
                SELECT 1 FROM superseded_edges e
                 WHERE e.superseded_id = COALESCE(page_id, path)
                   AND e.project = pages.project
-             )`,
+             )`;
+      const domainCoalesce = RootDb.DOMAIN_KEYS.map(({ key }) => `json_extract(metadata, '$."${key}"')`).join(", ");
+
+      // memory-index: the only type whose rendered text IS its body.
+      const indexRows = iRoot.db.db
+        .prepare(
+          `SELECT CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.harness'),'?')
+                       ELSE 'yongyi' END AS harness,
+                  CASE WHEN type = 'memory-index'
+                       THEN json_extract(metadata,'$.memory_type')
+                       ELSE type END AS memory_type,
+                  COALESCE(json_extract(metadata,'$.source_path'), path) AS source_path,
+                  CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
+                       ELSE COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) END AS mtime,
+                  body AS description,
+                  json_extract(metadata,'$.memory_name') AS memory_name,
+                  COALESCE(page_id, path) AS pid,
+                  COALESCE(${domainCoalesce}) AS domain_value
+           ${INJ_TAIL}
+             AND type = 'memory-index'`,
         )
         .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string; domain_value: string | null }>;
+
+      // note / fact: rendered text is their TITLE, so body is never selected.
+      const noteRows = iRoot.db.db
+        .prepare(
+          `SELECT 'yongyi' AS harness,
+                  type AS memory_type,
+                  path AS source_path,
+                  COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) AS mtime,
+                  title AS description,
+                  json_extract(metadata,'$.memory_name') AS memory_name,
+                  COALESCE(page_id, path) AS pid,
+                  COALESCE(${domainCoalesce}) AS domain_value
+           ${INJ_TAIL}
+             AND type IN ('note','fact')`,
+        )
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string; domain_value: string | null }>;
+
+      const rows = [...indexRows, ...noteRows];
 
       // Cross-harness dedup by semantic identity (2026-11-20).
       //

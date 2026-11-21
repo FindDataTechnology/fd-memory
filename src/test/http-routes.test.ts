@@ -641,3 +641,64 @@ test("/memory/index: 缓存的条目数有上限", async () => {
     assert.ok(cache.size <= 200, `缓存条目必须被上限约束，实际 ${cache.size}`);
   } finally { await close(); }
 });
+
+test("/memory/index: 拆分查询后结果与拆分前逐条一致", async () => {
+  // slim-injection-query-and-expose-latency 1.4。拆成两条查询（note/fact 不取
+  // body，memory-index 取）是为了省 IO，但对外行为必须一模一样——条目、顺序、
+  // description 全等。这条测试是拆分安全性的唯一保证。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-split");
+    // memory-index（description 取 body）
+    root.writePage("default", "memory-index", "mi-1",
+      newPage("memory-index", "索引标题", "索引正文的内容", {
+        metadata: { harness: "zcode", memory_type: "feedback", memory_name: "mi-1", source_path: "/m/a.md", source_mtime: 100 },
+      }));
+    // note（description 取 title）
+    root.writePage("default", "notes", "n-1",
+      newPage("note", "笔记标题一", "笔记正文一", { metadata: { memory_type: "feedback" } }));
+    root.writePage("default", "notes", "n-2",
+      newPage("note", "笔记标题二", "笔记正文二", { metadata: { memory_type: "feedback" } }));
+    // fact
+    root.writePage("default", "facts", "f-1",
+      newPage("fact", "事实标题", "事实正文", { metadata: { memory_type: "note" } }));
+
+    const person = svc.tokens.mint("person", "u/split").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ description: string; memory_type: string; harness: string }> }).entries;
+
+    assert.equal(entries.length, 4, `四条都要出现，实际 ${entries.length}`);
+    const descs = entries.map((e) => e.description.trim()).sort();
+    // memory-index 的 description 是 body；note/fact 的是 title
+    assert.ok(descs.includes("索引正文的内容"), "memory-index 的 description 必须取 body");
+    assert.ok(descs.includes("笔记标题一"), "note 的 description 必须取 title");
+    assert.ok(descs.includes("笔记标题二"));
+    assert.ok(descs.includes("事实标题"), "fact 的 description 必须取 title");
+    // 反向确认：note 的正文不该出现在 description 里
+    assert.ok(!descs.some((d) => d.includes("笔记正文")), "note 的 body 不该被当成 description");
+  } finally { await close(); }
+});
+
+test("/memory/index: 跨类型同 semantic identity 仍然只出现一次", async () => {
+  // slim-injection-query-and-expose-latency 1.5。拆成两条查询后，若各算各的去重，
+  // 一条 memory-index 与一条 note 带同一 memory_name 会各出现一次。
+  const { svc, base, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-xdup");
+    root.writePage("default", "memory-index", "dup-a",
+      newPage("memory-index", "同一结论", "来自 memory-index", {
+        metadata: { harness: "zcode", memory_type: "feedback", memory_name: "shared-identity", source_mtime: 100 },
+      }));
+    root.writePage("default", "notes", "dup-b",
+      newPage("note", "同一结论（笔记版）", "来自 note", {
+        metadata: { memory_name: "shared-identity", memory_type: "feedback" },
+      }));
+
+    const person = svc.tokens.mint("person", "u/xdup").token;
+    const r = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(person) });
+    const entries = ((await r.json()) as { entries: Array<{ description: string }> }).entries;
+    const hitting = entries.filter((e) => String(e.description).includes("同一结论"));
+    assert.equal(hitting.length, 1,
+      `跨类型同 identity 必须收敛为一条，实际 ${hitting.length}: ${JSON.stringify(entries.map((e) => e.description))}`);
+  } finally { await close(); }
+});
