@@ -10,6 +10,7 @@ import { readdirSync, statSync, mkdirSync, readFileSync } from "node:fs";
 import { join, dirname, sep } from "node:path";
 import { createHash } from "node:crypto";
 import { readPageFile } from "./okf.js";
+import { DOMAIN_KEY_VOCABULARY } from "./policy.js";
 
 /**
  * Identity of one observation as it appears in the append-only log.
@@ -162,6 +163,26 @@ export class RootDb {
     { key: "sku", domain: "erp" },
   ];
 
+  /**
+   * The two halves of the domain vocabulary must not drift: `policy.ts` validates
+   * a declaration against its copy without importing SQLite, and this table
+   * decides which keys are actually indexed. A key accepted by one and unknown to
+   * the other would be a declaration that resolves and never participates in
+   * recall — the failure mode this whole change exists to remove.
+   *
+   * Checked at module load, not in a test, because both halves are frozen data
+   * and the cost is one comparison per process.
+   */
+  static {
+    const indexed = RootDb.DOMAIN_KEYS.map((d) => d.key).sort();
+    const declarable = [...DOMAIN_KEY_VOCABULARY].sort();
+    if (JSON.stringify(indexed) !== JSON.stringify(declarable)) {
+      throw new Error(
+        `domain vocabulary drift: db.ts indexes ${JSON.stringify(indexed)} but policy.ts accepts ${JSON.stringify(declarable)}`,
+      );
+    }
+  }
+
   /** Is this metadata key a domain key? Unknown keys are ordinary metadata. */
   static isDomainKey(key: string): boolean {
     return RootDb.DOMAIN_KEYS.some((d) => d.key === key);
@@ -282,7 +303,40 @@ export class RootDb {
     return out;
   }
 
-  domainHintFor(meta: Record<string, unknown> | null | undefined): { domain: string; present: string[]; missing: string[] } | null {
+  /**
+   * The domain key this project's chain actually declares, or null.
+   *
+   * This is the consumer that makes `schema.key_by` an EXECUTED sub-key rather
+   * than a declared-and-ignored one: the write face asks here instead of inferring
+   * the domain from whatever metadata the caller happened to send. Resolved
+   * through the same project → root chain the process axis uses, so a pack-level
+   * declaration reaches its members without every member restating it.
+   */
+  declaredDomainKey(project: string): string | null {
+    const level = this.getMemoryPolicy(project);
+    const root = this.getMemoryPolicy("root");
+    const value = level.key_by ?? root.key_by;
+    if (typeof value !== "string" || !RootDb.isDomainKey(value)) return null;
+    return value;
+  }
+
+  domainHintFor(meta: Record<string, unknown> | null | undefined, declaredKey?: string | null): { domain: string; present: string[]; missing: string[] } | null {
+    // A declared `schema.key_by` says which key this root files under, so the
+    // hint stops guessing from whatever the caller happened to include
+    // (add-memory-schema-axis). Without a declaration the previous behaviour
+    // stands exactly: infer the domain from the first vocabulary key present.
+    if (declaredKey) {
+      const domain = RootDb.domainOfKey(declaredKey);
+      if (domain) {
+        const present = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain && meta && d.key in meta).map((d) => d.key);
+        const missing = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain && !present.includes(d.key)).map((d) => d.key);
+        return { domain, present, missing };
+      }
+      // An unrecognised declaration (a hand-edited row, an older vocabulary) must
+      // not be silently treated as "no declaration": that would make the hint
+      // describe a different domain than the one in force. Fall through to the
+      // inference path and let the read face name the bad value.
+    }
     if (!meta) return null;
     const present: string[] = [];
     for (const { key } of RootDb.DOMAIN_KEYS) if (key in meta) present.push(key);

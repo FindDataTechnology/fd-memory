@@ -29,20 +29,55 @@ export const DISTILL_VALUES = [DISTILL_ON, DISTILL_OFF, DISTILL_INHERIT] as cons
 export const PROCESS_KEYS = ["distill", "promote_after", "cold_after_days"] as const;
 export type ProcessKey = (typeof PROCESS_KEYS)[number];
 
+// ── schema axis (add-memory-schema-axis) ─────────────────────────────────────
+//
+// The fifth axis: "which key groups same-subject memories". Separate from
+// `process` (lifecycle: distill / promote / cold-store) and from `read`
+// (visibility + budget) because it answers a different question — the root spec
+// forbids one axis standing in for another, and folding "what do we record under"
+// into a lifecycle axis is exactly that.
+//
+// `key_by` accepts ONLY keys from the closed DOMAIN_KEYS vocabulary. A free-form
+// string would let a distributed pack define database structure — every domain
+// key carries an expression index — which is the same boundary `store.home`
+// enforces by refusing every address form.
+export const SCHEMA_KEYS = ["key_by", "domain"] as const;
+export type SchemaKey = (typeof SCHEMA_KEYS)[number];
+
 /**
- * Sub-keys that resolve to a value AND have a consumer in this version.
+ * The closed domain-key vocabulary (add-memory-schema-axis).
  *
- * Only `distill` is here. `promote_after` and `cold_after_days` resolve and are
- * reported as NOT executed, because this version has no data to act on them with:
- * the promotion lane selects pages by tier and cursor (there is no per-page
- * evidence counter to threshold), and there is no cold-store/eviction pass. Wiring
- * them to a nearby-looking field would produce a policy that "exists" and does
- * nothing — the exact failure this change removes.
+ * MUST equal fd-agent-graph's `memory_decl.DOMAIN_KEY_VOCABULARY` and
+ * `RootDb.DOMAIN_KEYS`'s key list — the parity gate compares all three. It is
+ * closed because each key carries an expression index: a pack that could name a
+ * new one would be changing the shape of a database it does not own.
+ *
+ * Lives here (dependency-free) rather than in db.ts so the policy module can
+ * validate a declaration without importing SQLite; db.ts asserts the two agree
+ * at load.
  */
-export const EXECUTED_SUBKEYS: ReadonlySet<string> = new Set(["distill"]);
+export const DOMAIN_KEY_VOCABULARY = ["instrument", "party", "case_no", "supplier", "sku"] as const;
+export type DomainKey = (typeof DOMAIN_KEY_VOCABULARY)[number];
+
+/**
+ * `promote_after` and `cold_after_days` resolve and are reported as NOT executed,
+ * because this version has no data to act on them with: the promotion lane
+ * selects pages by tier and cursor (there is no per-page evidence counter to
+ * threshold), and there is no cold-store/eviction pass. Wiring them to a
+ * nearby-looking field would produce a policy that "exists" and does nothing —
+ * the exact failure this module exists to prevent.
+ *
+ * `key_by` IS here (add-memory-schema-axis), and unlike the earlier version of
+ * this set the claim is real rather than aspirational: `resolvePolicy` now
+ * iterates SCHEMA_KEYS too, and `RootDb.declaredDomainKey` reads the resolved
+ * value to drive the write-side hint. Before that reader existed this comment
+ * said the opposite — declaring a sub-key executed because another repo's
+ * vocabulary said so is precisely the drift this file is written against.
+ */
+export const EXECUTED_SUBKEYS: ReadonlySet<string> = new Set(["distill", "key_by"]);
 
 /** Platform defaults. Authority has none; process defaults live here. */
-export const PLATFORM_DEFAULTS: Record<ProcessKey, string | number> = {
+export const PLATFORM_DEFAULTS: Partial<Record<PolicySubkey, string | number>> = {
   distill: DISTILL_ON,
   promote_after: 3,
   cold_after_days: 0,
@@ -54,7 +89,7 @@ export interface PolicyError {
   message: string;
 }
 
-export type PolicyDoc = Partial<Record<ProcessKey, string | number>>;
+export type PolicyDoc = Partial<Record<ProcessKey, string | number>> & Partial<Record<SchemaKey, string>>;
 
 export type NormalizeResult =
   | { ok: true; doc: PolicyDoc }
@@ -99,12 +134,32 @@ export function normalizePolicyPartial(raw: unknown, where = "process"): Partial
   const doc: PolicyDoc = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     const path = `${where}.${key}`;
-    if (!(PROCESS_KEYS as readonly string[]).includes(key)) {
+    if (!(POLICY_SUBKEYS as readonly string[]).includes(key)) {
       errors.push({
         key: path,
         code: "policy_key_unknown",
-        message: `${path} is not a known key (known: ${JSON.stringify([...PROCESS_KEYS])})`,
+        message: `${path} is not a known key (known: ${JSON.stringify([...POLICY_SUBKEYS])})`,
       });
+      continue;
+    }
+    if (key === "key_by") {
+      if (typeof value !== "string" || !(DOMAIN_KEY_VOCABULARY as readonly string[]).includes(value)) {
+        errors.push({
+          key: path,
+          code: "policy_key_by_invalid",
+          message: `${path} must be one of ${JSON.stringify([...DOMAIN_KEY_VOCABULARY])} — domain keys are a closed set, because each one carries an expression index in this store`,
+        });
+        continue;
+      }
+      doc.key_by = value;
+      continue;
+    }
+    if (key === "domain") {
+      if (typeof value !== "string" || value.trim() === "") {
+        errors.push({ key: path, code: "policy_domain_invalid", message: `${path} must be a non-empty string` });
+        continue;
+      }
+      doc.domain = value.trim();
       continue;
     }
     if (key === "distill") {
@@ -167,7 +222,21 @@ export interface PolicyRow {
   executed: boolean;
 }
 
-export type PolicyRowMap = Record<ProcessKey, PolicyRow>;
+export type PolicyRowMap = Record<ProcessKey | SchemaKey, PolicyRow>;
+
+/** Every sub-key this face reports, in the canonical order the row table renders. */
+export const POLICY_SUBKEYS = [...PROCESS_KEYS, ...SCHEMA_KEYS] as const;
+export type PolicySubkey = (typeof POLICY_SUBKEYS)[number];
+
+/**
+ * Which axis a policy sub-key belongs to. The document is FLAT (`{distill: "on",
+ * key_by: "instrument"}`), because that is the shape the `/policy` route and the
+ * pack compiler already send — splitting it into per-axis objects here would
+ * change the wire format for a cosmetic reason.
+ */
+export function axisOfSubkey(sub: PolicySubkey): "process" | "schema" {
+  return (PROCESS_KEYS as readonly string[]).includes(sub) ? "process" : "schema";
+}
 
 /**
  * Resolve the inheritance chain into one row per sub-key.
@@ -178,10 +247,10 @@ export type PolicyRowMap = Record<ProcessKey, PolicyRow>;
  */
 export function resolvePolicy(
   levels: Array<[string, PolicyDoc]>,
-  deploymentDefault: Partial<Record<ProcessKey, string | number>> = {},
+  deploymentDefault: Partial<Record<PolicySubkey, string | number>> = {},
 ): PolicyRowMap {
   const out = {} as PolicyRowMap;
-  for (const key of PROCESS_KEYS) {
+  for (const key of POLICY_SUBKEYS) {
     let declared: string | number | null = null;
     for (const [, doc] of levels) {
       if (doc[key] !== undefined) {
@@ -238,8 +307,8 @@ export function distillEnabled(
  * This list is the actionable subset — "you asked for this and nothing does it" —
  * so it stays empty until someone declares something the version cannot honour.
  */
-export function unexecuted(rows: PolicyRowMap): ProcessKey[] {
-  return PROCESS_KEYS.filter(
+export function unexecuted(rows: PolicyRowMap): PolicySubkey[] {
+  return POLICY_SUBKEYS.filter(
     (k) => rows[k].declared !== null && !rows[k].executed,
   );
 }

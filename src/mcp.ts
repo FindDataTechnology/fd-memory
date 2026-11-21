@@ -604,7 +604,13 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         // first and is never undone, so a missing companion key must not turn a
         // deliberate memory into a failed one. Making it visible is the point —
         // a hint nobody can see is the same as no schema at all.
-        const hint = root.db.domainHintFor(meta as Record<string, unknown> | null);
+        //
+        // The declared key (add-memory-schema-axis) drives WHICH domain is being
+        // asked about; without a declaration this is the old infer-from-metadata
+        // behaviour, byte for byte. That read is what makes `schema.key_by` have
+        // a consumer rather than being a declaration nothing honours.
+        const declaredKey = root.db.declaredDomainKey(w.project!);
+        const hint = root.db.domainHintFor(meta as Record<string, unknown> | null, declaredKey);
         if (hint && hint.missing.length > 0) {
           return text({
             path: rel,

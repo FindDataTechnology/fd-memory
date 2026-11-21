@@ -660,3 +660,103 @@ test("policy read failure still distils, but is counted and warned (not a silent
     "the fallback is logged, not silent",
   );
 });
+
+// ── schema axis: the declaration must have a consumer, not just a validator ──
+//
+// add-memory-schema-axis claimed fd-memory "became the executor". The first
+// implementation only added the words to a vocabulary: `SCHEMA_KEYS` existed and
+// nothing read it, so a `key_by` declaration would have been refused by the
+// normalizer (unknown key) or accepted and ignored. These tests pin the reader,
+// because "declared but nothing honours it" is the exact defect the `executed`
+// column was built to expose.
+
+test("normalize: key_by is accepted; a key outside the vocabulary is refused by name", () => {
+  const ok = normalizePolicy({ key_by: "instrument" }, "process");
+  assert.ok(ok.ok, "declared key_by must survive validation");
+  if (ok.ok) assert.deepEqual(ok.doc, { key_by: "instrument" });
+
+  const bad = normalizePolicy({ key_by: "portfolio_id" }, "process");
+  assert.equal(bad.ok, false);
+  if (!bad.ok) {
+    assert.equal(bad.errors[0].code, "policy_key_by_invalid");
+    assert.match(bad.errors[0].message, /instrument/, "the message lists the usable keys");
+  }
+});
+
+test("resolve: key_by travels the same inheritance chain as process", () => {
+  const rows = resolvePolicy([["project", {}], ["root", { key_by: "party" }]]);
+  assert.equal(rows.key_by.effective, "party");
+  assert.equal(rows.key_by.inherited_from, "root");
+  assert.equal(rows.key_by.executed, true, "key_by has a consumer (declaredDomainKey), so it is executed");
+});
+
+test("resolve: a declared key_by is NOT reported as unexecuted", () => {
+  const rows = resolvePolicy([["project", { key_by: "sku", cold_after_days: 90 }]]);
+  // The actionable list must name only what nothing honours — cold_after_days —
+  // and NOT the schema key, which would mean the declaration is decoration.
+  assert.deepEqual(unexecuted(rows), ["cold_after_days"]);
+});
+
+test("write face: a declared key_by is stored, resolved and reported as executed", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/schema").token;
+    const auth = json(person);
+
+    // Declare at ROOT level so a member inherits it. The body groups by axis,
+    // which the write face must merge into the flat document the store uses.
+    const put = await fetch(`${base}/policy?scope=root`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ schema: { key_by: "instrument" } }),
+    });
+    assert.equal(put.status, 200, await put.text());
+
+    const read = await fetch(`${base}/policy?project=default`, { headers: auth });
+    const body = (await read.json()) as {
+      rows: Record<string, { effective: unknown; executed: boolean; inherited_from: string | null }>;
+      not_executed: string[];
+    };
+    assert.equal(body.rows.key_by.effective, "instrument", "the root declaration reaches the project level");
+    assert.equal(body.rows.key_by.inherited_from, "root");
+    assert.equal(body.rows.key_by.executed, true, "key_by is executed — declaredDomainKey reads it");
+    assert.deepEqual(body.not_executed, [], "nothing declared here is unhonoured");
+  } finally {
+    await close();
+  }
+});
+
+test("write face: a key_by outside the closed vocabulary is refused, naming the usable keys", async () => {
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/schema").token;
+    const res = await fetch(`${base}/policy?scope=root`, {
+      method: "PUT", headers: json(person), body: JSON.stringify({ schema: { key_by: "portfolio_id" } }),
+    });
+    assert.equal(res.status, 400);
+    const body = (await res.json()) as { errors: Array<{ code: string; message: string }> };
+    assert.equal(body.errors[0].code, "policy_key_by_invalid");
+    assert.match(body.errors[0].message, /instrument/);
+  } finally {
+    await close();
+  }
+});
+
+test("write face: the declared key_by drives the write-side domain hint", () => {
+  // Unit-level, on the RootDb seam the MCP write face calls: a page with NO
+  // metadata produces a hint about the DECLARED domain, which the pre-change
+  // code could not do (it inferred from the caller's own keys, so no keys meant
+  // no hint at all). This is the consumer that makes the executed flag honest.
+  const data = tmpData("fdm-policy-domain-");
+  const root = new StoreRoot(data, "u-schema");
+  root.db.setMemoryPolicy("root", { key_by: "instrument" });
+
+  assert.equal(root.db.declaredDomainKey("default"), "instrument");
+  const hint = root.db.domainHintFor(null, root.db.declaredDomainKey("default"));
+  assert.ok(hint, "a declared domain yields a hint even with empty metadata");
+  assert.equal(hint.domain, "invest");
+  assert.deepEqual(hint.missing, ["instrument"]);
+
+  // And the undeclared path is byte-for-byte the old behaviour: no keys, no hint.
+  const plain = new StoreRoot(data, "u-plain");
+  assert.equal(plain.db.declaredDomainKey("default"), null);
+  assert.equal(plain.db.domainHintFor(null, plain.db.declaredDomainKey("default")), null);
+});

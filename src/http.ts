@@ -22,7 +22,7 @@ import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-
 import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, noteInjectionLatency, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
-import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
+import { POLICY_SUBKEYS, PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -1675,7 +1675,7 @@ export class Service {
           const { errors } = normalizePolicyPartial(doc, "process");
           for (const e of errors) {
             const short = e.key.includes(".") ? e.key.slice(e.key.lastIndexOf(".") + 1) : e.key;
-            if ((PROCESS_KEYS as readonly string[]).includes(short)) {
+            if ((POLICY_SUBKEYS as readonly string[]).includes(short)) {
               const row = rows[short as keyof typeof rows];
               // First (most specific) level wins the marker: that is where a fix
               // belongs.
@@ -1700,20 +1700,28 @@ export class Service {
       }
 
       if (req.method === "PUT" || req.method === "POST") {
-        const body = await this.body<{ process?: unknown; scope?: unknown }>(req);
+        const body = await this.body<{ process?: unknown; schema?: unknown; scope?: unknown }>(req);
         // `scope` names WHICH level the write applies to; default = this project.
         const target = String(body.scope ?? url.searchParams.get("scope") ?? "project");
         if (target !== "project" && target !== "root") {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "scope_must_be_project_or_root" }));
         }
-        const normalized = normalizePolicy(body.process, "process");
+        // The document is flat (`{distill, key_by}`) — that is the shape the pack
+        // compiler already emits and the shape `getMemoryPolicy` stores. A caller
+        // that groups by axis (`{process:{...}, schema:{...}}`) is merged into the
+        // same flat shape so both spellings land one row, not two.
+        const flat = {
+          ...(body.process && typeof body.process === "object" && !Array.isArray(body.process) ? body.process : {}),
+          ...(body.schema && typeof body.schema === "object" && !Array.isArray(body.schema) ? body.schema : {}),
+        };
+        const normalized = normalizePolicy(flat, "process");
         if (!normalized.ok) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({
             error: "policy_invalid",
             errors: normalized.errors,
-            known_keys: PROCESS_KEYS,
+            known_keys: POLICY_SUBKEYS,
           }));
         }
         const key = target === "root" ? "root" : project;
