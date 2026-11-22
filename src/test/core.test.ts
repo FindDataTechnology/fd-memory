@@ -1357,3 +1357,53 @@ test("only a settled AND published page is shareable", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── cross-root read: a grant is a row, never an inference ───────────────────
+//
+// Batch 3 tasks 3.1/3.3/3.5. This is the only path in the service that reads a
+// root other than the caller's, so every condition is pinned separately:
+//   no grant        -> refuse
+//   grant           -> only settled AND published pages
+//   similar name    -> still refuse (naming is not permission)
+//   write side      -> does not exist at all
+test("a grant is required and only exposes settled+published pages", () => {
+  const data = tmpData();
+  try {
+    const owner = new StoreRoot(data, "u-owner");
+    const reader = new StoreRoot(data, "d-alice-pack");
+
+    // Three pages in the owner's root, in the three states that matter.
+    owner.writePage("default", "notes", "draft", newPage("note", "草稿", "正文", {}));
+    owner.writePage("default", "notes", "stableOnly", newPage("note", "稳定未发布", "正文", {}));
+    owner.writePage("default", "notes", "shared", newPage("note", "稳定已发布", "正文", {}));
+    for (const slug of ["stableOnly", "shared"]) {
+      owner.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", `default/notes/${slug}.md`, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+      owner.db.promotePage(`default/notes/${slug}.md`, "stable", "测试", "2026-11-22T01:00:00Z");
+    }
+    owner.db.setPageShareable("default/notes/shared.md", true, "2026-11-22T02:00:00Z");
+    // A draft must be refused even if someone tries to publish it.
+    assert.equal(owner.db.setPageShareable("default/notes/draft.md", true, "2026-11-22T02:00:00Z"), false);
+
+    // 1. No grant -> the reader sees nothing.
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), false, "未授权时不得有任何读权限");
+
+    // 2. A similar-looking name proves nothing.
+    assert.equal(owner.db.hasShareGrant("u-owner2"), false, "名字像不等于授权");
+
+    // 3. Grant, then read: only the published+s settled page appears.
+    assert.equal(owner.db.setShareGrant("d-alice-pack", true, "2026-11-22T03:00:00Z", "试用"), true);
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), true);
+    const visible = owner.db.sharedPages().map((p) => p.path);
+    assert.deepEqual(visible, ["default/notes/shared.md"], "草稿与「稳定但未发布」都不可见");
+
+    // 4. Revoke closes it.
+    assert.equal(owner.db.setShareGrant("d-alice-pack", false, "2026-11-22T04:00:00Z"), true);
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), false);
+
+    // The reader's own root has its own (empty) grant table — grants are not global.
+    assert.deepEqual(reader.db.shareGrants(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

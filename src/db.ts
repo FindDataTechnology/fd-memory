@@ -470,6 +470,20 @@ export class RootDb {
         accepted_at TEXT, ignored_at TEXT,
         PRIMARY KEY (project, page_rel)
       );
+      -- Cross-root read grants (batch 3 task 3.1/3.3 of
+      -- memory-integration-with-product-lines).
+      --
+      -- Lives in the TARGET root's own database, not in a global table: the grant
+      -- "root X may read my shared pages" is a statement the owner of this root
+      -- makes about their own data. A global table would let one root's row be
+      -- read as another's permission.
+      --
+      -- Explicit by construction. There is no way to derive a grant from a name,
+      -- a path, or any string: d-u-chengsishi containing chengsishi is a
+      -- coincidence of naming, not a permission.
+      CREATE TABLE IF NOT EXISTS share_grants (
+        reader_root TEXT PRIMARY KEY, granted_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+      );
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
         handoff_cursor TEXT NOT NULL DEFAULT '', note_cursor TEXT NOT NULL DEFAULT '',
@@ -1522,7 +1536,40 @@ export class RootDb {
   }
 
   /**
-   * Mark (or unmark) a page as shareable outward (batch 3 task 3.2).
+   * Grant (or revoke) another root's right to READ this root's shared pages
+   * (batch 3 tasks 3.1/3.3).
+   *
+   * Read-only grants: there is no write counterpart anywhere in this module.
+   * The spec says writes never cross roots, and the cheapest way to keep that
+   * true is to not build a path for it.
+   */
+  setShareGrant(readerRoot: string, granted: boolean, at: string, note = ""): boolean {
+    const id = String(readerRoot ?? "").trim();
+    if (!id) return false;
+    if (granted) {
+      const res = this.db
+        .prepare("INSERT OR IGNORE INTO share_grants (reader_root, granted_at, note) VALUES (?,?,?)")
+        .run(id, at, note.slice(0, 200));
+      return Number(res.changes ?? 0) > 0;
+    }
+    const res = this.db.prepare("DELETE FROM share_grants WHERE reader_root=?").run(id);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  /** Roots allowed to read this root's shared pages. */
+  shareGrants(): Array<{ reader_root: string; granted_at: string; note: string }> {
+    return this.db.prepare("SELECT reader_root, granted_at, note FROM share_grants ORDER BY granted_at DESC").all() as Array<{
+      reader_root: string; granted_at: string; note: string;
+    }>;
+  }
+
+  /** Does `readerRoot` hold a grant from this root? */
+  hasShareGrant(readerRoot: string): boolean {
+    return this.db.prepare("SELECT 1 AS hit FROM share_grants WHERE reader_root=?").get(String(readerRoot ?? "")) !== undefined;
+  }
+
+  /**
+   * Marker (or unmark) a page as shareable outward (batch 3 task 3.2).
    *
    * Refuses unless the page is settled (`stable`/`canonical`): sharing a draft
    * is exactly what the isolation rule protects against, and letting a caller

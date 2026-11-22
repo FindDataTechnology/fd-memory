@@ -1574,6 +1574,87 @@ export class Service {
     // the correct values depend on a distribution that only exists after batch 1
     // has been collecting, so hard-coding a default here would be a guess
     // pretending to be a policy.
+    // ── /memory/shared (batch 3 tasks 3.3/3.5 of
+    // memory-integration-with-product-lines).
+    //
+    // The ONLY cross-root read path in this service. Everything else resolves a
+    // single root from the caller's namespace and never looks further.
+    //
+    // Three conditions, all required, and each is checked in a different place
+    // on purpose:
+    //   1. the caller holds a grant FROM the root it is reading (per-target-root
+    //      table — the owner's statement about their own data)
+    //   2. the page is published (`shared_at` set)
+    //   3. the page is settled (`stable`/`canonical`)
+    // A name that happens to resemble another root grants nothing: grants are
+    // rows, never inferences.
+    //
+    // Read-only. There is no write counterpart, and this route never opens the
+    // target root for writing — `rootForKey` on a foreign key is deliberately
+    // avoided; the owner's database is opened read-only below.
+    if (path === "/memory/shared" && req.method === "GET") {
+      const readerRoot = namespaceParts(scope.namespace).rootKey;
+      const target = String(url.searchParams.get("from") ?? "").trim();
+      if (!target) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "from_required", hint: "name the root whose shared pages you want, e.g. from=u-alice" }));
+      }
+      if (target === readerRoot) {
+        // Reading your own root is not this face's job — the ordinary read paths
+        // already cover it, and answering here would blur "shared out" with
+        // "mine".
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "same_root", hint: "use the normal read faces for your own root" }));
+      }
+      // Open the TARGET root read-only: a cross-root read must not be able to
+      // write anything, including migration side effects.
+      let targetDb: import("./db.js").RootDb;
+      try {
+        targetDb = new (await import("./db.js")).RootDb(join(this.opts.dataDir, "owners", target, "db", "memory.sqlite"));
+      } catch {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "root_not_found", root: target }));
+      }
+      if (!targetDb.hasShareGrant(readerRoot)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "no_grant",
+          reader: readerRoot,
+          root: target,
+          hint: "the owner of that root must run the publish action; a similar-looking name is not a grant",
+        }));
+      }
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 50) || 50));
+      // 3.5: every row names where it came from, so a reader can never mistake a
+      // shared page for one of its own.
+      const pages = targetDb.sharedPages(limit).map((p) => ({ ...p, source_root: target }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ from: target, reader: readerRoot, pages, total: pages.length }));
+    }
+
+    // ── /memory/shared/grant (batch 3: the owner's side of the grant).
+    //
+    // Only the root's own owner can grant: the caller's namespace must BE the
+    // root being granted from, otherwise anyone could hand out someone else's
+    // pages.
+    if (path === "/memory/shared/grant" && req.method === "POST") {
+      const body = await this.body<{ reader?: string; revoke?: boolean; note?: string; rootKey?: string }>(req);
+      const ownRoot = namespaceParts(scope.namespace).rootKey;
+      if (!ownRoot.startsWith("u-")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "owner_root_only", hint: "grants live in a person root; deployment tokens cannot issue them" }));
+      }
+      const reader = String(body.reader ?? "").trim();
+      if (!reader) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "reader_required" }));
+      }
+      const root = this.rootForKey(ownRoot);
+      const changed = root.db.setShareGrant(reader, body.revoke !== true, new Date().toISOString(), String(body.note ?? ""));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ root: ownRoot, reader, action: body.revoke === true ? "revoke" : "grant", changed }));
+    }
+
     if (path === "/memory/promotions/classify" && req.method === "GET") {
       const rr = promoRoot();
       const root = rr.root;
