@@ -126,12 +126,24 @@ const DEFAULT_SIDECAR_TIMEOUT_MS = 660_000;
  * Without it the AbortSignal above is decoration: undici's own 300 s body
  * timeout fires first and surfaces as a bare `fetch failed`. Lazily created so
  * importing this module never touches the network stack.
+ *
+ * Typed structurally on purpose — `undici` is a *transitive* dependency here
+ * (Node ships it, but this package does not declare it), so importing its types
+ * compiles locally and fails on a clean `npm ci` in CI with
+ * `TS2307: Cannot find module 'undici'`. All we need is an opaque object to
+ * hand back to fetch, so the declaration describes exactly that.
  */
-let sidecarDispatcher: import("undici").Dispatcher | null = null;
-async function dispatcherForSidecar(): Promise<import("undici").Dispatcher | undefined> {
+interface SidecarDispatcher {
+  readonly __brand?: "undici-dispatcher";
+}
+let sidecarDispatcher: SidecarDispatcher | null = null;
+async function dispatcherForSidecar(): Promise<SidecarDispatcher | undefined> {
   if (sidecarDispatcher) return sidecarDispatcher;
   try {
-    const { Agent } = await import("undici");
+    // Same reason: the specifier is resolved at runtime, not compile time.
+    const { Agent } = (await import("undici")) as {
+      Agent: new (opts: { bodyTimeout: number; headersTimeout: number; connectTimeout: number }) => SidecarDispatcher;
+    };
     sidecarDispatcher = new Agent({
       bodyTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
       headersTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
