@@ -1520,10 +1520,18 @@ export class RootDb {
                 -- Downstream signals (2026-11-22). These already exist in the
                 -- data and are the only ones with real spread: how many other
                 -- pages cite this one, and whether a newer page superseded it.
+                -- sources entries look like "session:<path>" (measured
+                -- 2026-11-22). Matching them against page_id never fired: a
+                -- first version compared j.value = page_id and the answer was 0
+                -- for every page while 891 pages actually carry citations. Strip
+                -- the prefix and match on path.
                 (SELECT COUNT(*) FROM pages src
                   WHERE src.sources IS NOT NULL AND json_valid(src.sources)
                     AND EXISTS (SELECT 1 FROM json_each(src.sources) j
-                                 WHERE j.value = pg.page_id)) AS cited_by,
+                                 WHERE j.value = 'session:' || pg.path
+                                    OR j.value = pg.path
+                                    OR j.value = 'session:' || pg.page_id
+                                    OR j.value = pg.page_id)) AS cited_by,
                 CASE WHEN EXISTS (SELECT 1 FROM superseded_edges e
                                    WHERE e.superseded_id = pg.page_id) THEN 1 ELSE 0 END AS superseded
          FROM tier_proposals p JOIN pages pg ON pg.path = p.page_rel

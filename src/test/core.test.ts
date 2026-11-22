@@ -1534,3 +1534,28 @@ test("citation count is the primary positive signal", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// Citation matching must understand the real sources format.
+//
+// 2026-11-22: a first version compared `j.value = page_id` and returned 0 for
+// every page in the live store, while 891 pages actually carried citations —
+// because sources entries are `session:<path>`, not bare ids. A criterion that
+// silently matches nothing looks exactly like "nobody cited this".
+test("cited_by matches session:<path> entries, not just bare ids", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-cite");
+    root.writePage("default", "notes", "base", newPage("note", "被引用的", "正文", {}));
+    // The shape the live store actually uses.
+    root.writePage("default", "notes", "c1", newPage("note", "引用一", "正文", { sources: ["session:default/notes/base.md"] } as never));
+    root.writePage("default", "notes", "c2", newPage("note", "引用二", "正文", { sources: ["session:default/notes/base.md"] } as never));
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/base.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    const c = root.db.classifyPendingProposals("default", { minCited: 2 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/base.md"], "session:<path> 形式的引用必须被算到");
+    assert.match(c.auto[0].why, /cited_by=2/);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
