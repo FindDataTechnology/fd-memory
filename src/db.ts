@@ -521,6 +521,27 @@ export class RootDb {
     if (!pageCols.has("source_ref")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN source_ref TEXT");
     }
+    // Usage signals (memory-integration-with-product-lines, batch 1).
+    //
+    // Two counters and one denominator, on purpose:
+    //   retrieved_n        — how many times memory_query RETURNED this page to a
+    //                        caller. Matching in SQL does not count; use does.
+    //   injected_n         — how many times the injection face picked it.
+    //   injected_seen_n    — how many candidates that batch had in total.
+    //
+    // The last column exists because injection sees 50 of 10,049 candidates
+    // (measured 2026-11-22, 0.5%). Without the denominator, "was injected" is
+    // just "was lucky", and a page written today would outrank a page written
+    // three months ago purely by arriving into a smaller pool.
+    if (!pageCols.has("retrieved_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN retrieved_n INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!pageCols.has("injected_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN injected_n INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!pageCols.has("injected_seen_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN injected_seen_n INTEGER NOT NULL DEFAULT 0");
+    }
     // Structured metadata (add-agent-memory-foundation): one JSON column —
     // the markdown frontmatter is the truth, this is the filterable mirror.
     // Expression indexes cover the two high-frequency keys; other keys stay
@@ -913,7 +934,9 @@ export class RootDb {
       : rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
     if (hasPageOnlyFilter) {
       if (meta) meta.total = pagesTotal;
-      return rows.slice(0, limit);
+      const out = rows.slice(0, limit);
+      this.notePagesRetrieved(out.map((r) => String((r as { path: string }).path)));
+      return out;
     }
     // observations join the search face (spec: manager-captured observations
     // are searchable) — LIKE scan at v1 scale, FTS promotion later. The
@@ -941,7 +964,14 @@ export class RootDb {
     const isNote = (t: string) => t !== "observation";
     const pageNotes = rows.filter((r) => isNote(r.type));
     const pageObs = rows.filter((r) => !isNote(r.type));
-    return [...pageNotes, ...pageObs, ...obs].slice(0, limit);
+    const out = [...pageNotes, ...pageObs, ...obs].slice(0, limit);
+    // Count only what actually survived the merge+slice AND lives in `pages`.
+    // The observation leg is a synthesized path (`project/session/event`) with no
+    // row in `pages`, so bumping it would silently do nothing — and counting the
+    // whole `rows` before the slice would credit pages the caller never saw.
+    const pagePaths = new Set(rows.map((r) => String((r as { path: string }).path)));
+    this.notePagesRetrieved(out.map((r) => String((r as { path: string }).path)).filter((p) => pagePaths.has(p)));
+    return out;
   }
 
   // Alive predicate (optimize-yongyi-read-surfaces 3.3): one definition of
@@ -956,7 +986,98 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
+  /**
+   * Record that these pages were actually handed to a caller (batch 1 of
+   * memory-integration-with-product-lines).
+   *
+   * "Returned", not "matched": a row the SQL touched but the caller never saw is
+   * not a use. Callers pass the final result array, which is exactly the set the
+   * caller received.
+   *
+   * Best-effort and never throws — a counter is a companion record; it must not
+   * be able to fail the search it describes.
+   */
+  notePagesRetrieved(paths: string[]): void {
+    if (paths.length === 0) return;
+    try {
+      const stmt = this.db.prepare("UPDATE pages SET retrieved_n = retrieved_n + 1 WHERE path = ?");
+      this.db.exec("BEGIN");
+      try {
+        for (const p of paths) stmt.run(p);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* usage counters are advisory; a failed bump must not break the read */
+    }
+  }
+
+  /**
+   * Injection half of the usage signal (batch 1 of
+   * memory-integration-with-product-lines).
+   *
+   * Keyed by `page_id`, not `path`, because that is what the injection query
+   * already selects (`COALESCE(page_id, path)`) and injection rows do not carry
+   * a stable path. Both columns live on `pages`, so the UPDATE is equally cheap.
+   *
+   * `poolSize` is the candidate count that batch competed in. The per-page
+   * counters only become comparable across time when the denominator is stored
+   * alongside them — see the schema comment.
+   *
+   * Best-effort: never throws.
+   */
+  notePagesInjected(pageIds: string[], poolSize: number): void {
+    const ids = pageIds.filter(Boolean);
+    if (ids.length === 0) return;
+    try {
+      const stmt = this.db.prepare(
+        "UPDATE pages SET injected_n = injected_n + 1, injected_seen_n = injected_seen_n + ? WHERE page_id = ?",
+      );
+      this.db.exec("BEGIN");
+      try {
+        for (const id of ids) stmt.run(poolSize, id);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* advisory */
+    }
+  }
+
+  /**
+   * Usage-signal distribution for the operator (batch 1 tasks 1.4/1.5).
+   *
+   * Reports both halves separately on purpose. Retrieval is sparse and
+   * unbiased; injection is dense and biased by the 0.5% budget. Reading only
+   * one of them would answer a different question than the operator is asking:
+   *   retrieved_n >= 1   — "how much of the store has ever been used"
+   *   injected_rate      — "of the times it competed, how often was it picked"
+   *
+   * `injected_rate` is null (not 0) when the page never competed — 0/0 is
+   * "never offered", which is a different fact from "offered and always lost".
+   */
+  usageSignalStats(): {
+    total: number;
+    retrieved_at_least_once: number;
+    injected_at_least_once: number;
+    never_touched: number;
+    top_retrieved: Array<{ path: string; retrieved_n: number }>;
+  } {
+    const total = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages").get() as { c: number }).c);
+    const retrieved = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n > 0").get() as { c: number }).c);
+    const injected = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE injected_n > 0").get() as { c: number }).c);
+    const untouched = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n = 0 AND injected_n = 0").get() as { c: number }).c);
+    const top = this.db
+      .prepare("SELECT path, retrieved_n FROM pages WHERE retrieved_n > 0 ORDER BY retrieved_n DESC LIMIT 10")
+      .all() as Array<{ path: string; retrieved_n: number }>;
+    return { total, retrieved_at_least_once: retrieved, injected_at_least_once: injected, never_touched: untouched, top_retrieved: top };
+  }
+
+  /** Recent pages (see searchPages for the retrieval-counter contract). */  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
     const mf = pageFilterSql(filter, projects, "f.project", "f.updated_at", "p.type");
     const rows = this.db
       .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata, COUNT(*) OVER () AS _total FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY f.updated_at DESC LIMIT ?`)

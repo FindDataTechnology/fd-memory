@@ -1103,3 +1103,69 @@ test("searchPages uses the FTS leg, not the LIKE fallback (3+ char query)", () =
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── usage signals: "returned" is not "matched" ──────────────────────────────
+//
+// Batch 1 of memory-integration-with-product-lines. Two counters, and the
+// distinction that makes them meaningful: a page counts as USED only when the
+// caller received it, not when the SQL touched it.
+test("searchPages counts only the pages the caller actually received", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-signal");
+    for (let i = 0; i < 5; i++) {
+      root.writePage("default", "notes", `s${i}`, newPage("note", `信号 ${i}`, `正文 ${i}`, {}));
+    }
+    // limit=1: five match, one is returned.
+    const hits = root.db.searchPages("信号", 1);
+    assert.equal(hits.length, 1);
+
+    const counts = root.db.db.prepare("SELECT path, retrieved_n FROM pages ORDER BY path").all() as Array<{ path: string; retrieved_n: number }>;
+    const bumped = counts.filter((c) => c.retrieved_n > 0);
+    assert.equal(bumped.length, 1, "只有被返回的那一条计数；SQL 匹配到但没返回的不算");
+    assert.equal(bumped[0].path, String((hits[0] as { path: string }).path));
+
+    // A page with no hits stays at zero forever.
+    assert.equal(counts.filter((c) => c.retrieved_n === 0).length, 4);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("injection count records the pool size it competed in", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-pool");
+    root.writePage("default", "notes", "a", newPage("note", "池 A", "正文", {}));
+    const pageId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE '%/a.md'").get() as { page_id: string }).page_id;
+
+    // Two injections, pools of 100 and 400 candidates.
+    root.db.notePagesInjected([pageId], 100);
+    root.db.notePagesInjected([pageId], 400);
+
+    const row = root.db.db.prepare("SELECT injected_n, injected_seen_n FROM pages WHERE page_id = ?").get(pageId) as { injected_n: number; injected_seen_n: number };
+    assert.equal(row.injected_n, 2, "选中两次");
+    assert.equal(row.injected_seen_n, 500, "分母累加：100 + 400 —— 没有它，选中次数跨时间不可比");
+
+    const st = root.db.usageSignalStats();
+    assert.equal(st.total, 1);
+    assert.equal(st.injected_at_least_once, 1);
+    assert.equal(st.retrieved_at_least_once, 0, "注入不等于检索，两个信号分开记");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("usage stats distinguish never-offered from never-used", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-untouched");
+    root.writePage("default", "notes", "x", newPage("note", "没被碰过", "正文", {}));
+    const st = root.db.usageSignalStats();
+    assert.equal(st.total, 1);
+    assert.equal(st.never_touched, 1, "0/0 是「从未被提供过」，与「提供过但没中」不同");
+    assert.equal(st.retrieved_at_least_once, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

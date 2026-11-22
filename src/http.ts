@@ -1467,6 +1467,18 @@ export class Service {
             note: `另有 ${omitted} 条记忆未进入本次注入（预算内只展示最相关/最新的 ${picked.length} 条）。用 memory_query 按词检索，或 memory_overview 看分布。`,
           }
         : undefined;
+      // Usage signal, injection half (batch 1 of memory-integration-with-product-lines).
+      //
+      // Records, per picked page: times injected, and the size of the candidate
+      // pool it competed in. The denominator is what makes the signal comparable
+      // across time — injection admits 50 of 10,049 candidates (0.5%), so
+      // "was injected" alone is mostly "was lucky". A page written today and one
+      // written last month are only comparable by their selection rate.
+      //
+      // Best-effort: the counters are advisory and must never fail an injection.
+      try {
+        iRoot.db.notePagesInjected(picked.map((r) => String((r as { pid?: string }).pid ?? "")), ranked.length);
+      } catch { /* advisory */ }
       const bodyOut = JSON.stringify({
         project: iProject,
         total: ranked.length,
@@ -2034,8 +2046,15 @@ export class Service {
       for (const key of new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()])) {
         try { domainFill.push({ root: key, rates: this.rootForKey(key).db.domainFillRates() }); } catch { /* unreadable root */ }
       }
+      // Usage-signal distribution, per root (batch 1 of
+      // memory-integration-with-product-lines). Read-time like domain_fill: a
+      // cached number would describe the last reader, not the store.
+      const usageSignal: Array<{ root: string; stats: ReturnType<StoreRoot["db"]["usageSignalStats"]> }> = [];
+      for (const key of new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()])) {
+        try { usageSignal.push({ root: key, stats: this.rootForKey(key).db.usageSignalStats() }); } catch { /* unreadable root */ }
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ ...metricsSnapshot(), domain_fill: domainFill }));
+      return void res.end(JSON.stringify({ ...metricsSnapshot(), domain_fill: domainFill, usage_signal: usageSignal }));
     }
 
     if (path === "/admin/reindex") {
