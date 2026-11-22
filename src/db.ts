@@ -1494,7 +1494,7 @@ export class RootDb {
    */
   classifyPendingProposals(
     project: string,
-    opts: { minRetrieved?: number; minInjectedRate?: number; limit?: number } = {},
+    opts: { minRetrieved?: number; minInjectedRate?: number; minCited?: number; limit?: number } = {},
   ): {
     auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }>;
     conflict: Array<{ page_rel: string; reason: string; why: string }>;
@@ -1506,12 +1506,26 @@ export class RootDb {
     const hasRetrieved = typeof opts.minRetrieved === "number" && Number.isFinite(opts.minRetrieved) && opts.minRetrieved >= 1;
     const minRetrieved = hasRetrieved ? Number(opts.minRetrieved) : Number.POSITIVE_INFINITY;
     const minRate = Number(opts.minInjectedRate ?? NaN);
+    // Citation count threshold. Omitted -> Infinity (inert), same discipline as
+    // the other thresholds: "we have not measured the distribution yet" must
+    // mean "promote nothing", never "promote everything".
+    const hasCited = typeof opts.minCited === "number" && Number.isFinite(opts.minCited) && opts.minCited >= 1;
+    const minCited = hasCited ? Number(opts.minCited) : Number.POSITIVE_INFINITY;
     const rows = this.db
       .prepare(
         `SELECT p.page_rel, p.proposed_tier, p.reason,
                 COALESCE(pg.retrieved_n, 0) AS retrieved_n,
                 COALESCE(pg.injected_n, 0) AS injected_n,
-                COALESCE(pg.injected_seen_n, 0) AS injected_seen_n
+                COALESCE(pg.injected_seen_n, 0) AS injected_seen_n,
+                -- Downstream signals (2026-11-22). These already exist in the
+                -- data and are the only ones with real spread: how many other
+                -- pages cite this one, and whether a newer page superseded it.
+                (SELECT COUNT(*) FROM pages src
+                  WHERE src.sources IS NOT NULL AND json_valid(src.sources)
+                    AND EXISTS (SELECT 1 FROM json_each(src.sources) j
+                                 WHERE j.value = pg.page_id)) AS cited_by,
+                CASE WHEN EXISTS (SELECT 1 FROM superseded_edges e
+                                   WHERE e.superseded_id = pg.page_id) THEN 1 ELSE 0 END AS superseded
          FROM tier_proposals p JOIN pages pg ON pg.path = p.page_rel
          WHERE p.project=? AND p.accepted_at IS NULL AND p.ignored_at IS NULL AND pg.tier='draft'
          ORDER BY p.proposed_at DESC LIMIT ?`,
@@ -1519,6 +1533,7 @@ export class RootDb {
       .all(project, Math.max(1, opts.limit ?? 200)) as Array<{
         page_rel: string; proposed_tier: string; reason: string;
         retrieved_n: number; injected_n: number; injected_seen_n: number;
+        cited_by: number; superseded: number;
       }>;
 
     const auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }> = [];
@@ -1526,28 +1541,52 @@ export class RootDb {
     const no_signal: Array<{ page_rel: string; reason: string }> = [];
 
     for (const r of rows) {
+      // Downstream signals are the primary evidence (2026-11-22, measured).
+      //
+      // The two "usage" counters turned out to be unusable as automatic
+      // criteria: retrieval is 700:5 and almost never happens, and injection is
+      // deterministic (98 pages shared the exact same 7/78654), so it measures
+      // "is on the fixed shortlist", not "was useful".
+      //
+      // Citation and supersede DO vary across pages — cited_by spreads 3..9 in
+      // the live data — and they answer the actual question: did anyone build on
+      // this, and did a newer conclusion replace it.
       const rate = r.injected_seen_n > 0 ? r.injected_n / r.injected_seen_n : null;
       const rateOk = Number.isFinite(minRate) && rate !== null && rate >= minRate;
       const countOk = r.retrieved_n >= minRetrieved;
-      const hasAnyEvidence = r.retrieved_n > 0 || r.injected_seen_n > 0;
+      const hasUsage = r.retrieved_n > 0 || r.injected_seen_n > 0;
 
-      if (!hasAnyEvidence) {
-        // Not "the model is wrong" — just "nothing has happened yet". Keeping it
-        // in the queue is right; calling it a conflict would be a lie.
+      // Superseded is the strongest single signal there is: someone wrote a page
+      // specifically to replace this one. It vetoes promotion regardless of
+      // everything else.
+      if (r.superseded === 1) {
+        conflict.push({
+          page_rel: r.page_rel, reason: r.reason,
+          why: `已被更新的页取代（superseded）—— 不该提升，模型判断与事实相反`,
+        });
+        continue;
+      }
+
+      const citedOk = Number.isFinite(minCited) && r.cited_by >= Number(minCited);
+      if (citedOk || countOk || rateOk) {
+        auto.push({
+          page_rel: r.page_rel, proposed_tier: r.proposed_tier, reason: r.reason,
+          why: `模型判为可复用，且有证据（cited_by=${r.cited_by}${countOk ? `, retrieved=${r.retrieved_n}` : ""}${rateOk ? `, rate=${rate.toFixed(4)}` : ""}）`,
+        });
+        continue;
+      }
+
+      if (!hasUsage && r.cited_by === 0) {
+        // Nothing has happened at all: no citation, no read, no injection.
+        // Not a conflict — just no evidence yet.
         no_signal.push({ page_rel: r.page_rel, reason: r.reason });
         continue;
       }
-      if (countOk || rateOk) {
-        auto.push({
-          page_rel: r.page_rel, proposed_tier: r.proposed_tier, reason: r.reason,
-          why: `模型判为可复用，且使用证据达标（retrieved=${r.retrieved_n}${rate !== null ? `, rate=${rate.toFixed(4)}` : ""}）`,
-        });
-      } else {
-        conflict.push({
-          page_rel: r.page_rel, reason: r.reason,
-          why: `模型判为可复用，但使用证据不足（retrieved=${r.retrieved_n}, seen=${r.injected_seen_n}）—— 交人裁决`,
-        });
-      }
+
+      conflict.push({
+        page_rel: r.page_rel, reason: r.reason,
+        why: `模型判为可复用，但无支持证据（cited_by=${r.cited_by}, retrieved=${r.retrieved_n}, seen=${r.injected_seen_n}）—— 交人裁决`,
+      });
     }
     return { auto, conflict, no_signal };
   }

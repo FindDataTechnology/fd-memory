@@ -1477,3 +1477,60 @@ test("the share_reads table appears on a database that predates it", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── downstream signals: citation and supersede ──────────────────────────────
+//
+// 2026-11-22: the two usage counters proved unusable as automatic criteria —
+// retrieval almost never fires (700:5, and those 5 were manual tests) and
+// injection is deterministic (98 pages shared the identical 7/78654). Citation
+// and supersede DO vary and answer the real question: did anyone build on this,
+// and did a newer page replace it.
+test("a superseded page can never be auto-promoted, even with usage", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-superseded");
+    root.writePage("default", "notes", "old", newPage("note", "旧结论", "正文", {}));
+    root.writePage("default", "notes", "new", newPage("note", "新结论", "正文", {}));
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/old.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    // The newer page supersedes the older one.
+    const oldId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get("%/old.md") as { page_id: string }).page_id;
+    root.db.db.prepare("INSERT INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)")
+      .run(oldId, "default/notes/new.md", "default");
+
+    // Heavily "used" — that must not save it.
+    for (let i = 0; i < 10; i++) root.db.notePagesRetrieved(["default/notes/old.md"]);
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 1 });
+    assert.equal(c.auto.length, 0, "被取代的页不该因为「用得多」而提升");
+    assert.equal(c.conflict.length, 1);
+    assert.match(c.conflict[0].why, /已被更新的页取代/);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("citation count is the primary positive signal", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-cited");
+    root.writePage("default", "notes", "base", newPage("note", "被引用的结论", "正文", {}));
+    const baseId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get("%/base.md") as { page_id: string }).page_id;
+    // Three later pages cite it.
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `c${i}`, newPage("note", `引用 ${i}`, "正文", { sources: [baseId] } as never));
+    }
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/base.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    // No reads, no injections — only citations. Must still be enough.
+    const c = root.db.classifyPendingProposals("default", { minCited: 3 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/base.md"], "被引用 3 次足以支撑提升");
+    assert.match(c.auto[0].why, /cited_by=3/);
+
+    // And the threshold is inert when omitted.
+    assert.equal(root.db.classifyPendingProposals("default", {}).auto.length, 0, "没给阈值就不提升");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
