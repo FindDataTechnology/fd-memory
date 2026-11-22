@@ -529,3 +529,40 @@ test("u-root: a batch that never stops truncating is stepped over after the gap 
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// The chunked path must clear a previous failure once a run completes.
+//
+// Measured 2026-11-22: a u- root that had ever failed kept `last_error` set
+// forever — the read face reported "fetch failed" while 320 pages were produced
+// in that same half hour. The single-extract path always cleared it; the chunked
+// one wrote only cursors per batch, so the two paths disagreed about what "done"
+// means and only the chunked roots (u-) looked permanently broken.
+//
+// The asymmetry below is the whole point: completion clears, an early stop
+// (budget) does NOT — that stop's reason has to survive for the next reader.
+test("u-root: a completed chunked run clears a previous failure", async () => {
+  const data = tmpData();
+  const sidecar = okSidecar([]);
+  try {
+    const fx = fixture(data, sidecar, { ...GATES, FD_MEMORY_DISTILL_DAILY_TOKENS: "5000000" });
+    const root = fx.openRoot("u-recover@test");
+    // Seed a stale failure, as a real earlier outage would have left.
+    root.db.upsertDistillState("default", { last_error: "fetch failed" });
+    assert.equal(root.db.getDistillState("default")!.last_error, "fetch failed");
+
+    for (let i = 1; i <= 3; i++) {
+      root.writePage("default", "notes", `r${i}`, {
+        frontmatter: { type: "note", title: `恢复 ${i}`, generated: { by: "test", at: `2026-10-25T0${i}:00:00.000Z` } },
+        body: `第 ${i} 条足够长的正文，让这批有一条真实候选可以蒸。`,
+      } as never);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await fx.sched.distillNow("u-recover@test", "default");
+
+    const st = root.db.getDistillState("default")!;
+    assert.equal(st.last_error, null, "跑完一轮就该把旧失败清掉，否则读面永远显示陈旧的故障");
+    assert.equal(st.next_attempt_at, 0, "也不该留着 backoff");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

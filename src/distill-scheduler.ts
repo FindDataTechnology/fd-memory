@@ -776,6 +776,10 @@ export class DistillScheduler {
         // A chunk that hits the cap stops the run cleanly: cursors keep the work
         // that already landed, and the gap is recorded for the next day.
         let truncationStalled = false;
+        // Set when a chunk hits the daily budget. That stop records its own
+        // `last_error` and must survive — clearing it below would turn a real
+        // "we ran out of budget" into a clean-looking state.
+        let budgetStopped = false;
         // Read from opts.env, not process.env: the scheduler's configuration
         // surface is opts.env everywhere else (dailyLimit, gates), and a knob
         // that only honours process.env is untestable and silently divergent.
@@ -793,6 +797,7 @@ export class DistillScheduler {
                 root.db.upsertDistillState(project, { last_error: "daily_budget_exhausted", gaps: (state?.gaps ?? 0) + 1, next_attempt_at: tomorrowMs(this.now()) });
                 this.opts.tokens.distillBudgetStopAdd(rootKey, day);
                 this.log.warn(`[distill] ${key}: daily budget hit mid-run (${this.opts.tokens.distillBudgetUsed(rootKey, day).tokens}/${this.dailyLimit()}) — stopping, cursors kept`);
+                budgetStopped = true;
                 return;
               }
               throw e;
@@ -819,6 +824,23 @@ export class DistillScheduler {
         }));
         // The ledger was already fed per call (7.3); only the run-level metrics
         // report the total here.
+        //
+        // Clear the failure state once a run actually completes (2026-11-22).
+        // The chunked path wrote `note_cursor` per batch and nothing else, so a
+        // root that had EVER failed kept `last_error` set forever — the read face
+        // showed "fetch failed" while 320 pages were being produced that same
+        // half hour. The single-extract path below has always cleared it; this
+        // one had no equivalent, which is why only u- roots (the chunked ones)
+        // looked stuck.
+        //
+        // NOT unconditional: a run that stopped early — daily budget exhausted,
+        // or a truncation stall that held the cursor — is not a success, and the
+        // reason it stopped must survive for the next reader. Only a run that
+        // reached this line having cleared every chunk counts as complete.
+        const earlyStop = budgetStopped || truncatedRuns > 0;
+        if (!earlyStop) {
+          root.db.upsertDistillState(project, { last_error: null, next_attempt_at: 0, last_tokens: spentTotal });
+        }
         noteDistill(true, wrote, spentTotal, undefined, { items: handoffs.length + notes.length, calls: chunksIssued });
         noteDistillStages(stageCalls);
         noteDistillTruncation(truncatedRuns > 0);
