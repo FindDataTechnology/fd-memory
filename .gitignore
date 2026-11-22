@@ -8,3 +8,7 @@ python/**/*.egg-info/
 python/build/
 python/dist/
 .pytest_cache/
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
