@@ -1209,3 +1209,23 @@ test("reopening an older database adds the usage-signal columns", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("injected_rate is a rate, and null rather than 0 when never offered", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-rate");
+    root.writePage("default", "notes", "a", newPage("note", "常被选中", "正文", {}));
+    root.writePage("default", "notes", "b", newPage("note", "从未参选", "正文", {}));
+    const idOf = (slug: string) => (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get(`%/${slug}.md`) as { page_id: string }).page_id;
+
+    // "a" competed twice in a pool of 100 → rate 0.02. "b" never competed.
+    root.db.notePagesInjected([idOf("a")], 100);
+    root.db.notePagesInjected([idOf("a")], 100);
+    const top = root.db.usageSignalStats().top_retrieved;
+    const a = top.find((r) => r.path.endsWith("/a.md"))!;
+    assert.equal(a.injected_rate, 0.01, "选中率 = 2 次 / (100+100) = 200 候选，即 1%");
+    assert.equal(top.some((r) => r.path.endsWith("/b.md")), false, "从未参选的页不出现在 top 里");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

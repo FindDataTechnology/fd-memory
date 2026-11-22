@@ -1070,15 +1070,23 @@ export class RootDb {
     retrieved_at_least_once: number;
     injected_at_least_once: number;
     never_touched: number;
-    top_retrieved: Array<{ path: string; retrieved_n: number }>;
+    top_retrieved: Array<{ path: string; retrieved_n: number; injected_rate: number | null }>;
   } {
     const total = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages").get() as { c: number }).c);
     const retrieved = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n > 0").get() as { c: number }).c);
     const injected = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE injected_n > 0").get() as { c: number }).c);
     const untouched = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n = 0 AND injected_n = 0").get() as { c: number }).c);
-    const top = this.db
-      .prepare("SELECT path, retrieved_n FROM pages WHERE retrieved_n > 0 ORDER BY retrieved_n DESC LIMIT 10")
-      .all() as Array<{ path: string; retrieved_n: number }>;
+    const rows = this.db
+      .prepare("SELECT path, retrieved_n, injected_n, injected_seen_n FROM pages WHERE retrieved_n > 0 OR injected_n > 0 ORDER BY retrieved_n DESC, injected_n DESC LIMIT 10")
+      .all() as Array<{ path: string; retrieved_n: number; injected_n: number; injected_seen_n: number }>;
+    const top = rows.map((r) => ({
+      path: r.path,
+      retrieved_n: r.retrieved_n,
+      // Selection RATE, not count: injection admits 50 of ~10k candidates, so a
+      // raw count mostly measures how many batches the page happened to be in.
+      // null when it never competed — 0/0 is "never offered", not "always lost".
+      injected_rate: r.injected_seen_n > 0 ? Number((r.injected_n / r.injected_seen_n).toFixed(4)) : null,
+    }));
     return { total, retrieved_at_least_once: retrieved, injected_at_least_once: injected, never_touched: untouched, top_retrieved: top };
   }
 
