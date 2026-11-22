@@ -198,6 +198,16 @@ async def embed_texts(provider_factory, texts):
     SAME provider env the engine uses. Returns (vectors, model, tokens, errors)."""
     errors = []
     vectors = []
+    # The kill switch has to be honored HERE too, not only on the /embed route
+    # (2026-11-22 measured). `app.py` answers /embed without touching upstream
+    # when MEMORY_EMBED=off, but distill() calls this function directly — so the
+    # switch silenced the standalone endpoint while every distillation still
+    # tried to reach the embedding lane, failed with FileNotFoundError, and the
+    # scheduler recorded `engine errors: …` on every tick. A kill switch that
+    # only covers one of two entry points is a half-off switch: the operator
+    # sees "off" in the config and a wall of failures in the ledger.
+    if str(os.environ.get("MEMORY_EMBED", "")).strip().lower() in ("off", "0", "false", "no"):
+        return [], EMBED_MODEL, 0, errors
     # Lane credentials resolved HERE (same chain as hy's provider config:
     # MEMORY_EMBED_* → MEMORY_LLM_* → LLM_*) — a construction-time empty key
     # raises outside the try below, so resolve before touching openai.
