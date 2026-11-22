@@ -1693,18 +1693,83 @@ export class Service {
       const projects = projectFilter ? [projectFilter] : root.db.distinctProjects();
       const minRetrieved = url.searchParams.has("min_retrieved") ? Number(url.searchParams.get("min_retrieved")) : undefined;
       const minRate = url.searchParams.has("min_rate") ? Number(url.searchParams.get("min_rate")) : undefined;
+      const minCited = url.searchParams.has("min_cited") ? Number(url.searchParams.get("min_cited")) : undefined;
       const out: Record<string, ReturnType<StoreRoot["db"]["classifyPendingProposals"]>> = {};
       for (const p of projects) {
-        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate });
+        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate, minCited });
         if (c.auto.length || c.conflict.length || c.no_signal.length) out[p] = c;
       }
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({
-        thresholds: { min_retrieved: minRetrieved ?? null, min_rate: minRate ?? null },
+        thresholds: { min_retrieved: minRetrieved ?? null, min_rate: minRate ?? null, min_cited: minCited ?? null },
         // Named so a caller cannot mistake this for an action.
         dry_run: true,
         by_project: out,
       }));
+    }
+
+    // ── /memory/promotions/apply (batch 2 task 2.2's missing caller).
+    //
+    // The classifier existed but nothing executed it: `promotePage` had no
+    // caller on any production path, so auto-promotion was a method nobody ran.
+    //
+    // Deliberately awkward to call:
+    //   · at least ONE threshold must be present — an empty call promotes
+    //     nothing by design, and saying so is better than silently doing nothing
+    //   · `confirm: true` is required, so a curl typo cannot promote pages
+    //   · `dry_run: true` returns the plan without touching anything
+    //
+    // Conflicts are never applied. They are reported and left in the queue —
+    // that rule lives in the classifier and this route must not second-guess it.
+    if (path === "/memory/promotions/apply" && req.method === "POST") {
+      const body = await this.body<{
+        scope?: string; min_retrieved?: number; min_rate?: number; min_cited?: number;
+        dry_run?: boolean; confirm?: boolean; rootKey?: string;
+      }>(req);
+      const rr = promoRoot(String(body.rootKey ?? ""));
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const minCited = typeof body.min_cited === "number" ? body.min_cited : undefined;
+      const minRetrieved = typeof body.min_retrieved === "number" ? body.min_retrieved : undefined;
+      const minRate = typeof body.min_rate === "number" ? body.min_rate : undefined;
+      if (minCited === undefined && minRetrieved === undefined && minRate === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "threshold_required",
+          hint: "pass at least one of min_cited / min_retrieved / min_rate; an empty call promotes nothing by design",
+        }));
+      }
+      const projects = body.scope ? [String(body.scope)] : root.db.distinctProjects();
+      const plan: Array<{ project: string; page_rel: string; why: string }> = [];
+      for (const p of projects) {
+        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate, minCited });
+        for (const a of c.auto) plan.push({ project: p, page_rel: a.page_rel, why: a.why });
+      }
+      if (body.dry_run === true) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ dry_run: true, would_promote: plan.length, plan }));
+      }
+      if (body.confirm !== true) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "confirm_required",
+          hint: "pass confirm:true to actually promote; use dry_run:true to preview",
+          would_promote: plan.length,
+        }));
+      }
+      const at = new Date().toISOString();
+      let promoted = 0;
+      for (const item of plan) {
+        try {
+          root.db.promotePage(item.page_rel, "stable", item.why, at);
+          promoted += 1;
+        } catch { /* one bad row must not abort the batch */ }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ promoted, planned: plan.length, at }));
     }
 
     if (path === "/memory/promotions/accept" && req.method === "POST") {
