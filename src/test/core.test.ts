@@ -1407,3 +1407,28 @@ test("a grant is required and only exposes settled+published pages", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// New TABLES need the version bump too, not just new columns.
+//
+// Hit for real on 2026-11-22 (twice in one night): `migrate()` short-circuits
+// when the stored version matches, so a `CREATE TABLE IF NOT EXISTS` added
+// inside it never runs on an existing database. The idempotent guard makes the
+// statement look harmless; the version number is the only trigger.
+test("reopening an older database creates newly-added tables", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-tables");
+    // Simulate a database written before the share_grants table existed.
+    first.db.db.exec("DROP TABLE IF EXISTS share_grants; UPDATE schema_meta SET value = '5' WHERE key = 'version';");
+    const before = first.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_grants'").all() as Array<{ name: string }>;
+    assert.equal(before.length, 0, "前提：老库确实没有该表");
+
+    const second = new StoreRoot(data, "u-tables");
+    const after = second.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_grants'").all() as Array<{ name: string }>;
+    assert.equal(after.length, 1, "reopen 后必须建出新表");
+    // And it must be usable, not just present.
+    assert.deepEqual(second.db.shareGrants(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

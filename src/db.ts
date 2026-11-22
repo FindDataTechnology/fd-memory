@@ -139,7 +139,12 @@ export class RootDb {
   // 5 — batch 3 adds shared_at (cross-root sharing marker) and the usage
   // columns that came with it. Bump for the same reason as 3->4: the idempotent
   // column guards are not triggers; the version number is what makes them run.
-  static readonly SCHEMA_VERSION = 5;
+  // 6 — batch 3 added the share_grants TABLE (the 3->4 and 4->5 bumps covered
+  // column additions). Same trap twice in one night: an idempotent
+  // CREATE TABLE IF NOT EXISTS inside migrate() is not a trigger either; if the
+  // stored version already matches, the whole block is skipped and the table is
+  // simply absent while everything else looks healthy.
+  static readonly SCHEMA_VERSION = 6;
 
   /**
    * The closed domain-key vocabulary (add-domain-memory-schema).
