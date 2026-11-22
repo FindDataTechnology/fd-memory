@@ -1561,6 +1561,44 @@ export class Service {
       }));
     }
 
+    // Dry-run classification of the pending queue (batch 2 task 2.4 of
+    // memory-integration-with-product-lines).
+    //
+    // READ-ONLY on purpose: this answers "if auto-promotion ran with these
+    // thresholds, what would it do?" without doing it. The first real run has to
+    // be inspected by a person, because the only thing this can get wrong is
+    // promoting a wrong page into the layer that will later be shared across
+    // roots — and that is not recoverable by looking at a count.
+    //
+    // Thresholds come from the query string and are passed through verbatim:
+    // the correct values depend on a distribution that only exists after batch 1
+    // has been collecting, so hard-coding a default here would be a guess
+    // pretending to be a policy.
+    if (path === "/memory/promotions/classify" && req.method === "GET") {
+      const rr = promoRoot();
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const projectFilter = url.searchParams.get("scope");
+      const projects = projectFilter ? [projectFilter] : root.db.distinctProjects();
+      const minRetrieved = url.searchParams.has("min_retrieved") ? Number(url.searchParams.get("min_retrieved")) : undefined;
+      const minRate = url.searchParams.has("min_rate") ? Number(url.searchParams.get("min_rate")) : undefined;
+      const out: Record<string, ReturnType<StoreRoot["db"]["classifyPendingProposals"]>> = {};
+      for (const p of projects) {
+        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate });
+        if (c.auto.length || c.conflict.length || c.no_signal.length) out[p] = c;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({
+        thresholds: { min_retrieved: minRetrieved ?? null, min_rate: minRate ?? null },
+        // Named so a caller cannot mistake this for an action.
+        dry_run: true,
+        by_project: out,
+      }));
+    }
+
     if (path === "/memory/promotions/accept" && req.method === "POST") {
       const body = await this.body<{ path?: string; rootKey?: string }>(req);
       const rr = promoRoot(String(body.rootKey ?? ""));

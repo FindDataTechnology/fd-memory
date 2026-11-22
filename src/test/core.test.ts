@@ -1229,3 +1229,68 @@ test("injected_rate is a rate, and null rather than 0 when never offered", () =>
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── promotion classification: the three buckets and why they are separate ────
+//
+// Batch 2 of memory-integration-with-product-lines. The rule is "model says yes
+// AND usage backs it", and the interesting part is what happens when the two
+// disagree: that must NOT be auto-resolved, because an auto-promoted wrong page
+// leaks into other roots once sharing opens.
+test("pending proposals split into auto / conflict / no-signal", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-promo");
+    const mk = (slug: string, title: string) => {
+      root.writePage("default", "notes", slug, newPage("note", title, "正文内容足够长以便成为候选", {}));
+      return (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get(`%/${slug}.md`) as { page_id: string }).page_id;
+    };
+    const idUsed = mk("used", "被用过的");
+    const idCold = mk("cold", "从没用过的");
+    const idNever = mk("never", "从未参选的");
+
+    for (const [id, slug] of [[idUsed, "used"], [idCold, "cold"], [idNever, "never"]] as const) {
+      root.db.db.prepare(
+        "INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)",
+      ).run("default", `default/notes/${slug}.md`, "stable", "模型认为可复用", "ai", "2026-11-22T00:00:00Z");
+    }
+    // "used": retrieved twice AND competed in a sizeable pool.
+    root.db.notePagesRetrieved(["default/notes/used.md"]);
+    root.db.notePagesRetrieved(["default/notes/used.md"]);
+    root.db.notePagesInjected([idUsed], 100);
+    // "cold": competed but never retrieved -> conflict (model yes, signal weak).
+    root.db.notePagesInjected([idCold], 5000);
+    // "never": untouched -> no_signal, not a conflict.
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 2 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/used.md"], "两个条件都满足才自动升");
+    assert.deepEqual(c.conflict.map((x) => x.page_rel), ["default/notes/cold.md"], "模型说是但证据不足 -> 交人");
+    assert.deepEqual(c.no_signal.map((x) => x.page_rel), ["default/notes/never.md"], "没有任何证据 -> 不是冲突，只是还没积累");
+    assert.match(c.conflict[0].why, /交人裁决/);
+
+    // A missing threshold promotes NOTHING (0 would mean "everything").
+    const none = root.db.classifyPendingProposals("default", {});
+    assert.equal(none.auto.length, 0, "没给阈值时不得自动提升——阈值是要观察后定的，不是猜的");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("promotePage stamps who caused it, so auto promotions are distinguishable", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-promote");
+    root.writePage("default", "notes", "p", newPage("note", "要提升的", "正文", {}));
+    root.db.db.prepare(
+      "INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)",
+    ).run("default", "default/notes/p.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    root.db.promotePage("default/notes/p.md", "stable", "信号达标", "2026-11-22T01:00:00Z");
+    const page = root.db.db.prepare("SELECT tier FROM pages WHERE path=?").get("default/notes/p.md") as { tier: string };
+    assert.equal(page.tier, "stable");
+    const prop = root.db.db.prepare("SELECT proposed_by, accepted_at FROM tier_proposals WHERE page_rel=?").get("default/notes/p.md") as { proposed_by: string; accepted_at: string | null };
+    assert.match(prop.proposed_by, /^auto:/, "自动提升要能从 proposed_by 前缀认出来，否则和人工接受混为一谈");
+    assert.ok(prop.accepted_at);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

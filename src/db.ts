@@ -1421,6 +1421,103 @@ export class RootDb {
     return Boolean(r?.hit);
   }
 
+  /**
+   * Partition of the pending queue by what the evidence supports (batch 2 of
+   * memory-integration-with-product-lines, tasks 2.1/2.4).
+   *
+   * Three buckets, and the split is the whole design:
+   *
+   *   auto       — the model proposed it AND usage evidence backs it → safe to
+   *                promote without a human. Both halves must hold: the model's
+   *                verdict is made at write time with no hindsight, and usage
+   *                alone cannot tell "often retrieved" from "well keyworded".
+   *   conflict   — the two disagree (proposed but never used, or used a lot but
+   *                never proposed). Deliberately NOT auto-resolved: an
+   *                auto-promoted wrong page leaks into other roots once sharing
+   *                opens, and that costs far more than one page waiting a day.
+   *   no_signal  — proposed, but there is no usage data yet at all. Not a
+   *                conflict; the evidence simply has not accumulated.
+   *
+   * Thresholds come from env and are NOT defaulted to a guess. The right numbers
+   * depend on the real distribution, which only exists after batch 1 has been
+   * running; until then the caller passes what it wants and the default keeps
+   * auto-promotion effectively off (a threshold of 0 would promote everything).
+   */
+  classifyPendingProposals(
+    project: string,
+    opts: { minRetrieved?: number; minInjectedRate?: number; limit?: number } = {},
+  ): {
+    auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }>;
+    conflict: Array<{ page_rel: string; reason: string; why: string }>;
+    no_signal: Array<{ page_rel: string; reason: string }>;
+  } {
+    // No threshold given → auto-promotion is inert, not "promote everything".
+    // A threshold of 0 would match every page, which is the opposite of what
+    // "we have not measured the distribution yet" should mean.
+    const hasRetrieved = typeof opts.minRetrieved === "number" && Number.isFinite(opts.minRetrieved) && opts.minRetrieved >= 1;
+    const minRetrieved = hasRetrieved ? Number(opts.minRetrieved) : Number.POSITIVE_INFINITY;
+    const minRate = Number(opts.minInjectedRate ?? NaN);
+    const rows = this.db
+      .prepare(
+        `SELECT p.page_rel, p.proposed_tier, p.reason,
+                COALESCE(pg.retrieved_n, 0) AS retrieved_n,
+                COALESCE(pg.injected_n, 0) AS injected_n,
+                COALESCE(pg.injected_seen_n, 0) AS injected_seen_n
+         FROM tier_proposals p JOIN pages pg ON pg.path = p.page_rel
+         WHERE p.project=? AND p.accepted_at IS NULL AND p.ignored_at IS NULL AND pg.tier='draft'
+         ORDER BY p.proposed_at DESC LIMIT ?`,
+      )
+      .all(project, Math.max(1, opts.limit ?? 200)) as Array<{
+        page_rel: string; proposed_tier: string; reason: string;
+        retrieved_n: number; injected_n: number; injected_seen_n: number;
+      }>;
+
+    const auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }> = [];
+    const conflict: Array<{ page_rel: string; reason: string; why: string }> = [];
+    const no_signal: Array<{ page_rel: string; reason: string }> = [];
+
+    for (const r of rows) {
+      const rate = r.injected_seen_n > 0 ? r.injected_n / r.injected_seen_n : null;
+      const rateOk = Number.isFinite(minRate) && rate !== null && rate >= minRate;
+      const countOk = r.retrieved_n >= minRetrieved;
+      const hasAnyEvidence = r.retrieved_n > 0 || r.injected_seen_n > 0;
+
+      if (!hasAnyEvidence) {
+        // Not "the model is wrong" — just "nothing has happened yet". Keeping it
+        // in the queue is right; calling it a conflict would be a lie.
+        no_signal.push({ page_rel: r.page_rel, reason: r.reason });
+        continue;
+      }
+      if (countOk || rateOk) {
+        auto.push({
+          page_rel: r.page_rel, proposed_tier: r.proposed_tier, reason: r.reason,
+          why: `模型判为可复用，且使用证据达标（retrieved=${r.retrieved_n}${rate !== null ? `, rate=${rate.toFixed(4)}` : ""}）`,
+        });
+      } else {
+        conflict.push({
+          page_rel: r.page_rel, reason: r.reason,
+          why: `模型判为可复用，但使用证据不足（retrieved=${r.retrieved_n}, seen=${r.injected_seen_n}）—— 交人裁决`,
+        });
+      }
+    }
+    return { auto, conflict, no_signal };
+  }
+
+  /**
+   * Promote a page and record WHY in the proposal row itself.
+   *
+   * `proposed_by` already carries the "who decided" semantics (default 'ai'), so
+   * an auto-promotion writes `auto:<short reason>` there rather than adding a
+   * column — the read face shows a human why this one moved without a human, and
+   * the operator can tell an auto promotion from a manual accept by that prefix.
+   */
+  promotePage(pageRel: string, tier: string, why: string, at: string): void {
+    this.db.prepare("UPDATE pages SET tier=? WHERE path=?").run(tier, pageRel);
+    this.db
+      .prepare("UPDATE tier_proposals SET accepted_at=?, proposed_by=? WHERE page_rel=? AND accepted_at IS NULL AND ignored_at IS NULL")
+      .run(at, `auto:${why.slice(0, 120)}`, pageRel);
+  }
+
   acceptTierProposal(project: string, pageRel: string, at: string): void {
     this.db.prepare("UPDATE tier_proposals SET accepted_at=? WHERE project=? AND page_rel=? AND accepted_at IS NULL AND ignored_at IS NULL").run(at, project, pageRel);
   }
