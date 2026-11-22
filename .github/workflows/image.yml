@@ -1,0 +1,34 @@
+# 共享实现见 FindDataTechnology/fd-ci（openspec: extract-shared-ci-workflow）。
+# 本文件只声明「出什么镜像」，构建逻辑不在这里。
+#
+# 2026-11-23 补：fd-memory 此前**没有任何出片车道** —— 公开仓、有 Dockerfile、
+# 但 CI 只有 ci.yml，所以线上跑的是 11-14 的 sha-4318a44，而 main 之后累积了
+# 111 个提交（含 memory_query FTS 每次必抛、cited_by 从不命中、蒸馏预算闸被
+# undici 300s 掐断三条真修复）。没有这条 workflow，那些修复永远上不了产。
+name: image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # 主服务：hosted cells 的记忆面（/observe /hook /pages/read /pages/write）
+  fd-memory:
+    uses: FindDataTechnology/fd-ci/.github/workflows/image-build.yml@main
+    secrets: inherit
+    with:
+      image: fd-memory
+      namespace: yizuo      # 既有镜像就在 yizuo/fd-memory 下，改命名空间等于让 ArgoCD 找不到
+      dockerfile: Dockerfile
+      context: .
+
+  # 蒸馏 sidecar：自己的 Dockerfile，同一镜像仓家族
+  fd-memory-distiller:
+    uses: FindDataTechnology/fd-ci/.github/workflows/image-build.yml@main
+    secrets: inherit
+    with:
+      image: fd-memory-distiller
+      namespace: yizuo
+      dockerfile: distiller/Dockerfile
+      context: .
