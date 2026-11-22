@@ -131,7 +131,12 @@ export class RootDb {
    * that must run again; otherwise an already-migrated database skips the whole
    * write path on open.
    */
-  static readonly SCHEMA_VERSION = 3;
+    // Bumped to 4 by batch 1 of memory-integration-with-product-lines (usage
+  // signal columns). The `columnsOf()` guards below are idempotent, but the
+  // whole migrate() short-circuits when the stored version is already current —
+  // which it was (3 == 3), so the new ALTERs would never have run on any
+  // existing database. Bumping the number is what actually makes them execute.
+  static readonly SCHEMA_VERSION = 4;
 
   /**
    * The closed domain-key vocabulary (add-domain-memory-schema).

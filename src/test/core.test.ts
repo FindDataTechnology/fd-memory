@@ -1169,3 +1169,43 @@ test("usage stats distinguish never-offered from never-used", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// A stale-version database must gain the new columns on reopen.
+//
+// The trap this pins (2026-11-22, hit for real on the live store): the
+// `columnsOf()` guards are idempotent, so adding an ALTER looks safe — but
+// `migrate()` returns early when the stored version already equals
+// SCHEMA_VERSION, so on every existing database the new ALTER never ran. The
+// columns were simply absent while everything else looked healthy.
+test("reopening an older database adds the usage-signal columns", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-migrate");
+    first.writePage("default", "notes", "m", newPage("note", "迁移前", "正文", {}));
+
+    // Simulate a database written before batch 1: drop the columns and rewind
+    // the version gate. SQLite cannot DROP COLUMN on every build, so rebuild
+    // the table without them.
+    first.db.db.exec(`
+      CREATE TABLE pages_old AS SELECT path, project, type, title, body, updated_at, sources, supersedes FROM pages;
+      DROP TABLE pages;
+      ALTER TABLE pages_old RENAME TO pages;
+      UPDATE schema_meta SET value = '3' WHERE key = 'version';  -- 旧版本号本身：正是「存的是旧号，代码是新号」这个差值驱动迁移
+    `);
+    const before = first.db.db.prepare("PRAGMA table_info(pages)").all() as Array<{ name: string }>;
+    assert.equal(before.some((c) => c.name === "retrieved_n"), false, "前提：老库确实没有该列");
+
+    // Reopen: migrate() must now run and add them.
+    const second = new StoreRoot(data, "u-migrate");
+    const after = second.db.db.prepare("PRAGMA table_info(pages)").all() as Array<{ name: string }>;
+    for (const col of ["retrieved_n", "injected_n", "injected_seen_n"]) {
+      assert.ok(after.some((c) => c.name === col), `reopen 后必须有 ${col}`);
+    }
+    // Existing rows default to 0, not NULL.
+    const row = second.db.db.prepare("SELECT retrieved_n, injected_n FROM pages LIMIT 1").get() as { retrieved_n: number; injected_n: number };
+    assert.equal(row.retrieved_n, 0);
+    assert.equal(row.injected_n, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
