@@ -1294,3 +1294,20 @@ test("promotePage stamps who caused it, so auto promotions are distinguishable",
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+test("high usage without a model proposal never promotes", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-noProposal");
+    root.writePage("default", "notes", "hot", newPage("note", "很热但没被提案", "正文", {}));
+    // Heavy usage, but no row in tier_proposals at all.
+    for (let i = 0; i < 5; i++) root.db.notePagesRetrieved(["default/notes/hot.md"]);
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 1 });
+    assert.equal(c.auto.length, 0, "没有模型提案就没有「两个条件同时成立」，再多使用也不升");
+    const page = root.db.db.prepare("SELECT tier FROM pages WHERE path=?").get("default/notes/hot.md") as { tier: string };
+    assert.equal(page.tier, "draft", "tier 不变");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
