@@ -1589,9 +1589,10 @@ export class Service {
     // A name that happens to resemble another root grants nothing: grants are
     // rows, never inferences.
     //
-    // Read-only. There is no write counterpart, and this route never opens the
-    // target root for writing — `rootForKey` on a foreign key is deliberately
-    // avoided; the owner's database is opened read-only below.
+    // No write counterpart exists, and none is planned: the spec says page
+    // writes never cross roots, so the cheapest way to keep that true is to not
+    // build the path. `rootForKey` on a foreign key is deliberately avoided —
+    // that cache assumes ownership of whatever it opens.
     if (path === "/memory/shared" && req.method === "GET") {
       const readerRoot = namespaceParts(scope.namespace).rootKey;
       const target = String(url.searchParams.get("from") ?? "").trim();
@@ -1606,8 +1607,14 @@ export class Service {
         res.writeHead(400, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "same_root", hint: "use the normal read faces for your own root" }));
       }
-      // Open the TARGET root read-only: a cross-root read must not be able to
-      // write anything, including migration side effects.
+      // Open the TARGET root. NOTE: `RootDb` is not read-only — its constructor
+      // runs migrate(), so opening it can write (schema only). An earlier version
+      // of this comment claimed "read-only"; that was wrong and worth recording,
+      // because the claim was the reassuring part.
+      //
+      // What actually holds the line is that this route never calls a PAGE write
+      // path: the only writes it can cause are migrate() and the audit row below.
+      // Page content is never touched from another root's reader.
       let targetDb: import("./db.js").RootDb;
       try {
         targetDb = new (await import("./db.js")).RootDb(join(this.opts.dataDir, "owners", target, "db", "memory.sqlite"));
@@ -1628,6 +1635,10 @@ export class Service {
       // 3.5: every row names where it came from, so a reader can never mistake a
       // shared page for one of its own.
       const pages = targetDb.sharedPages(limit).map((p) => ({ ...p, source_root: target }));
+      // Audit the read in the OWNER's database (batch 4 task 4.3): "who read my
+      // shared pages, and when" is the owner's question, so the row lives where
+      // the owner looks. Best-effort — a failed audit must not fail the read.
+      targetDb.noteSharedRead(readerRoot, pages.map((p) => p.path), new Date().toISOString());
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ from: target, reader: readerRoot, pages, total: pages.length }));
     }
@@ -1653,6 +1664,22 @@ export class Service {
       const changed = root.db.setShareGrant(reader, body.revoke !== true, new Date().toISOString(), String(body.note ?? ""));
       res.writeHead(200, { "content-type": "application/json" });
       return void res.end(JSON.stringify({ root: ownRoot, reader, action: body.revoke === true ? "revoke" : "grant", changed }));
+    }
+
+    // ── /memory/shared/reads (batch 4 task 4.3, owner side).
+    //
+    // "Which other roots read my shared pages, and when." Only the owner can ask
+    // — the caller's own root is the one being read from, so no `from` param.
+    if (path === "/memory/shared/reads" && req.method === "GET") {
+      const ownRoot = namespaceParts(scope.namespace).rootKey;
+      if (!ownRoot.startsWith("u-")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "owner_root_only" }));
+      }
+      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? 100) || 100));
+      const reads = this.rootForKey(ownRoot).db.shareReads(limit);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ root: ownRoot, reads, total: reads.length }));
     }
 
     if (path === "/memory/promotions/classify" && req.method === "GET") {

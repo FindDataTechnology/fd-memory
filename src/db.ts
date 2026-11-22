@@ -144,7 +144,9 @@ export class RootDb {
   // CREATE TABLE IF NOT EXISTS inside migrate() is not a trigger either; if the
   // stored version already matches, the whole block is skipped and the table is
   // simply absent while everything else looks healthy.
-  static readonly SCHEMA_VERSION = 6;
+  // 7 — batch 4 adds the share_reads audit table. Every schema change needs
+  // this bump; the idempotent guards inside migrate() are not triggers.
+  static readonly SCHEMA_VERSION = 7;
 
   /**
    * The closed domain-key vocabulary (add-domain-memory-schema).
@@ -489,6 +491,16 @@ export class RootDb {
       CREATE TABLE IF NOT EXISTS share_grants (
         reader_root TEXT PRIMARY KEY, granted_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
       );
+      -- Who read what, for cross-root reads (batch 4 task 4.3).
+      --
+      -- Separate from oversight_reads, which records the OWNER poking at their
+      -- own data. This one answers a different question and would be misread in
+      -- that table: which other roots read my shared pages, and when. It lives
+      -- in the owner's database because that is where the owner will look for it.
+      CREATE TABLE IF NOT EXISTS share_reads (
+        ts TEXT NOT NULL, reader_root TEXT NOT NULL, page_rel TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS share_reads_ts ON share_reads(ts);
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
         handoff_cursor TEXT NOT NULL DEFAULT '', note_cursor TEXT NOT NULL DEFAULT '',
@@ -1562,8 +1574,7 @@ export class RootDb {
   }
 
   /** Roots allowed to read this root's shared pages. */
-  shareGrants(): Array<{ reader_root: string; granted_at: string; note: string }> {
-    return this.db.prepare("SELECT reader_root, granted_at, note FROM share_grants ORDER BY granted_at DESC").all() as Array<{
+  shareGrants(): Array<{ reader_root: string; granted_at: string; note: string }> {    return this.db.prepare("SELECT reader_root, granted_at, note FROM share_grants ORDER BY granted_at DESC").all() as Array<{
       reader_root: string; granted_at: string; note: string;
     }>;
   }
@@ -1571,6 +1582,37 @@ export class RootDb {
   /** Does `readerRoot` hold a grant from this root? */
   hasShareGrant(readerRoot: string): boolean {
     return this.db.prepare("SELECT 1 AS hit FROM share_grants WHERE reader_root=?").get(String(readerRoot ?? "")) !== undefined;
+  }
+
+  /**
+   * Record that `readerRoot` read these pages (batch 4 task 4.3).
+   *
+   * Best-effort: an audit row is a companion record and must never fail the read
+   * it describes — a person looking at their notes should not get an error
+   * because the audit insert hiccuped.
+   */
+  noteSharedRead(readerRoot: string, pageRels: string[], at: string): void {
+    if (pageRels.length === 0) return;
+    try {
+      const stmt = this.db.prepare("INSERT INTO share_reads (ts, reader_root, page_rel) VALUES (?,?,?)");
+      this.db.exec("BEGIN");
+      try {
+        for (const rel of pageRels) stmt.run(at, readerRoot, rel);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* advisory */
+    }
+  }
+
+  /** The owner's view: who read my shared pages, most recent first. */
+  shareReads(limit = 100): Array<{ ts: string; reader_root: string; page_rel: string }> {
+    return this.db
+      .prepare("SELECT ts, reader_root, page_rel FROM share_reads ORDER BY ts DESC LIMIT ?")
+      .all(Math.max(1, limit)) as Array<{ ts: string; reader_root: string; page_rel: string }>;
   }
 
   /**

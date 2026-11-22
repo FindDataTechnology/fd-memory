@@ -1432,3 +1432,48 @@ test("reopening an older database creates newly-added tables", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// Cross-root reads must be auditable by the owner (batch 4 task 4.3).
+//
+// "Who read my shared pages" is the owner's question, so the row lives in the
+// OWNER's database — not a global log, not the reader's. Separate from
+// oversight_reads, which records the owner looking at their own data.
+test("a cross-root read leaves an audit row in the owner's database", () => {
+  const data = tmpData();
+  try {
+    const owner = new StoreRoot(data, "u-audited");
+    owner.writePage("default", "notes", "p", newPage("note", "共享页", "正文", {}));
+    owner.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/p.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    owner.db.promotePage("default/notes/p.md", "stable", "测试", "2026-11-22T01:00:00Z");
+    owner.db.setPageShareable("default/notes/p.md", true, "2026-11-22T02:00:00Z");
+
+    assert.deepEqual(owner.db.shareReads(), [], "读之前没有记录");
+
+    owner.db.noteSharedRead("d-alice-pack", ["default/notes/p.md"], "2026-11-22T03:00:00Z");
+    const reads = owner.db.shareReads();
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0].reader_root, "d-alice-pack");
+    assert.equal(reads[0].page_rel, "default/notes/p.md");
+    assert.equal(reads[0].ts, "2026-11-22T03:00:00Z");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("the share_reads table appears on a database that predates it", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-shareReads");
+    first.db.db.exec("DROP TABLE IF EXISTS share_reads; UPDATE schema_meta SET value='6' WHERE key='version';");
+    const before = first.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_reads'").all() as Array<{ name: string }>;
+    assert.equal(before.length, 0, "前提：老库没有该表");
+
+    const second = new StoreRoot(data, "u-shareReads");
+    const after = second.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_reads'").all() as Array<{ name: string }>;
+    assert.equal(after.length, 1, "reopen 后必须建出该表");
+    assert.deepEqual(second.db.shareReads(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
