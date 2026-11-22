@@ -1311,3 +1311,49 @@ test("high usage without a model proposal never promotes", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// ── cross-root sharing: only a settled, published page is visible ───────────
+//
+// Batch 3 task 3.4 of memory-integration-with-product-lines. Three states, and
+// only the third is shareable:
+//
+//   draft                       never
+//   stable, never published     no  <- this is the one worth pinning
+//   stable, published           yes
+//
+// The middle case is why "stable" and "published" are separate columns: a
+// conclusion can be settled and still be nobody else's business.
+test("only a settled AND published page is shareable", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-share");
+    const mk = (slug: string) => {
+      root.writePage("default", "notes", slug, newPage("note", `页 ${slug}`, "正文", {}));
+      return `default/notes/${slug}.md`;
+    };
+    const draft = mk("draft");
+    const stableUnshared = mk("stableUnshared");
+    const stableShared = mk("stableShared");
+
+    // Settle two of them through the real promotion path.
+    for (const rel of [stableUnshared, stableShared]) {
+      root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", rel, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+      root.db.promotePage(rel, "stable", "测试", "2026-11-22T01:00:00Z");
+    }
+
+    // Publishing a draft is refused — that is the boundary the spec protects.
+    assert.equal(root.db.setPageShareable(draft, true, "2026-11-22T02:00:00Z"), false, "草稿不得被发布");
+    assert.equal(root.db.setPageShareable(stableShared, true, "2026-11-22T02:00:00Z"), true);
+    assert.equal(root.db.setPageShareable(stableShared, true, "2026-11-22T02:00:00Z"), false, "已发布的不重复写");
+
+    const shared = root.db.sharedPages().map((p) => p.path);
+    assert.deepEqual(shared, [stableShared], "只有「稳定 + 已发布」那条可见；稳定的但没发布的那条不出现");
+
+    // Unpublish closes it again.
+    assert.equal(root.db.setPageShareable(stableShared, false, "2026-11-22T03:00:00Z"), true);
+    assert.deepEqual(root.db.sharedPages(), [], "取消发布后回到不可见");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

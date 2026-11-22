@@ -136,7 +136,10 @@ export class RootDb {
   // whole migrate() short-circuits when the stored version is already current —
   // which it was (3 == 3), so the new ALTERs would never have run on any
   // existing database. Bumping the number is what actually makes them execute.
-  static readonly SCHEMA_VERSION = 4;
+  // 5 — batch 3 adds shared_at (cross-root sharing marker) and the usage
+  // columns that came with it. Bump for the same reason as 3->4: the idempotent
+  // column guards are not triggers; the version number is what makes them run.
+  static readonly SCHEMA_VERSION = 5;
 
   /**
    * The closed domain-key vocabulary (add-domain-memory-schema).
@@ -546,6 +549,21 @@ export class RootDb {
     }
     if (!pageCols.has("injected_seen_n")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN injected_seen_n INTEGER NOT NULL DEFAULT 0");
+    }
+    // Cross-root sharing marker (batch 3 task 3.2 of
+    // memory-integration-with-product-lines).
+    //
+    // Default 0 = not shared, which keeps today's behaviour byte-identical: the
+    // spec has always said "no cross-root read/write without explicit
+    // authorization", so the column starts closed and only a person's explicit
+    // act opens it.
+    //
+    // A separate column rather than reusing `tier='stable'`: "published" and
+    // "shareable outward" are different decisions. A conclusion can be settled
+    // (stable) and still be nobody else's business — personal, embarrassing, or
+    // simply irrelevant to any deployment.
+    if (!pageCols.has("shared_at")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN shared_at TEXT");
     }
     // Structured metadata (add-agent-memory-foundation): one JSON column —
     // the markdown frontmatter is the truth, this is the filterable mirror.
@@ -1501,6 +1519,46 @@ export class RootDb {
       }
     }
     return { auto, conflict, no_signal };
+  }
+
+  /**
+   * Mark (or unmark) a page as shareable outward (batch 3 task 3.2).
+   *
+   * Refuses unless the page is settled (`stable`/`canonical`): sharing a draft
+   * is exactly what the isolation rule protects against, and letting a caller
+   * pass one would collapse a two-step decision (settle → publish) into one
+   * accident.
+   *
+   * Returns whether anything actually changed, so a caller can say "already
+   * shareable" instead of reporting a write that never happened.
+   */
+  setPageShareable(pageRel: string, shareable: boolean, at: string): boolean {
+    if (shareable) {
+      const row = this.db.prepare("SELECT tier FROM pages WHERE path=?").get(pageRel) as { tier?: string } | undefined;
+      if (!row) return false;
+      if (row.tier !== "stable" && row.tier !== "canonical") return false;
+      const res = this.db.prepare("UPDATE pages SET shared_at=? WHERE path=? AND shared_at IS NULL").run(at, pageRel);
+      return Number(res.changes ?? 0) > 0;
+    }
+    const res = this.db.prepare("UPDATE pages SET shared_at=NULL WHERE path=? AND shared_at IS NOT NULL").run(pageRel);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  /**
+   * The shareable slice of this root (batch 3 task 3.3).
+   *
+   * BOTH conditions, always: settled tier AND published. A stable page nobody
+   * published is not shareable — that separation is the reason the two are
+   * different columns rather than one flag.
+   */
+  sharedPages(limit = 200): Array<{ path: string; title: string; tier: string; shared_at: string; type: string }> {
+    return this.db
+      .prepare(
+        `SELECT path, title, tier, shared_at, type FROM pages
+         WHERE shared_at IS NOT NULL AND tier IN ('stable','canonical')
+         ORDER BY shared_at DESC LIMIT ?`,
+      )
+      .all(Math.max(1, limit)) as Array<{ path: string; title: string; tier: string; shared_at: string; type: string }>;
   }
 
   /**
