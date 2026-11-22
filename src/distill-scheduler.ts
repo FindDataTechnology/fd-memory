@@ -109,7 +109,41 @@ const DEFAULT_MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1
 // 180s —— 调用方比被调方先放弃 120 秒。实测 28 个 /distill 里 6 个超时（21%），
 // 而 distiller 侧记的是 TimeoutError：它还没到自己的 300s 就被我们掐了。
 // 现改为 distiller 600s / here 660s，保持注释承诺的 60 秒余量。
+//
+// ★ 2026-11-22 订正：上面那句「here 660s」其实**从未生效过**。
+// AbortSignal.timeout(660_000) 不是唯一的截止条件 —— Node 内置 fetch 的实现
+// (undici) 另有自己的 **bodyTimeout / headersTimeout 默认 300 s**，到点直接
+// 断开连接。实测症状是 sidecar 侧抛 `BrokenPipeError: [Errno 32] Broken pipe`
+// （它算完了、写响应时才发现对端没了），而我们这一侧报 `fetch failed`。
+// 于是调 MAX_ITEMS（120→40）、调 DISTILL_LLM_DEADLINE_S（600→300）都无效：
+// 真正掐断的是 undici 的 300 s，与批大小、与 distiller 的 deadline 都无关。
+// 修法：给长请求显式挂一个 bodyTimeout 与这里一致的 dispatcher。
 const DEFAULT_SIDECAR_TIMEOUT_MS = 660_000;
+
+/**
+ * The dispatcher that actually enforces DEFAULT_SIDECAR_TIMEOUT_MS.
+ *
+ * Without it the AbortSignal above is decoration: undici's own 300 s body
+ * timeout fires first and surfaces as a bare `fetch failed`. Lazily created so
+ * importing this module never touches the network stack.
+ */
+let sidecarDispatcher: import("undici").Dispatcher | null = null;
+async function dispatcherForSidecar(): Promise<import("undici").Dispatcher | undefined> {
+  if (sidecarDispatcher) return sidecarDispatcher;
+  try {
+    const { Agent } = await import("undici");
+    sidecarDispatcher = new Agent({
+      bodyTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
+      headersTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
+      connectTimeout: 10_000,
+    });
+    return sidecarDispatcher;
+  } catch {
+    // undici 不可用（极老的 Node）时退回默认 dispatcher —— 至少不要因此抛错，
+    // 代价是回到 300 s 上限，行为与修复前一致。
+    return undefined;
+  }
+}
 
 // Root-family gate. This used to be the whole decision: pack roots always
 // distilled, person roots distilled unless FD_MEMORY_DISTILL_U=0 — which made the
@@ -653,12 +687,18 @@ export class DistillScheduler {
           const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
           let res: Response;
           try {
+            // `dispatcher` is what actually holds the connection open for the
+            // full budget — see the DEFAULT_SIDECAR_TIMEOUT_MS note. Only when
+            // the caller injected its own fetchImpl (tests) is it omitted, so a
+            // fake transport never needs to know about undici.
+            const dispatcher = this.opts.fetchImpl ? undefined : await dispatcherForSidecar();
             res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
               method: "POST",
               headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
               body: JSON.stringify({ scope: `${rootKey}/${project}`, cursor: { obs: state?.obs_cursor ?? 0, handoff: state?.handoff_cursor ?? "" }, items, candidates }),
               signal: controller.signal,
-            });
+              ...(dispatcher ? { dispatcher } : {}),
+            } as RequestInit);
           } finally {
             clearTimeout(timer);
           }
