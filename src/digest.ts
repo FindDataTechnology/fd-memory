@@ -127,7 +127,16 @@ export function renderDigest(opts: {
     // L0 observations (add-yongyi-complete-solution) share the note floor:
     // both are short raw-evidence lines, not distilled L2.
     const NOTE_SHARE_TOKENS = 400;
-    const l1 = items.filter((i) => i.layer !== "L2");
+    // Note-first within the non-L2 bucket (2026-11-16): L0 observations are
+    // auto-captured `tool_call Bash: kubectl …` lines. They outnumber notes
+    // and often outrank them on raw similarity, so before this the digest a
+    // session receives at startup was mostly tool chatter — the exact failure
+    // mode the layered model exists to avoid. Notes are conclusions; they lead.
+    const noteFirst = (a: { layer: string; kind: string }, b: { layer: string; kind: string }) => {
+      const rank = (x: { layer: string; kind: string }) => (x.layer === "L0" || x.kind === "observation" ? 1 : 0);
+      return rank(a) - rank(b);
+    };
+    const l1 = items.filter((i) => i.layer !== "L2").sort(noteFirst);
     const rest = items.filter((i) => i.layer === "L2");
     const cap = l1.length ? budget - Math.min(NOTE_SHARE_TOKENS, Math.floor(budget / 3)) : budget;
     const pushItems = (list: typeof items, capTokens: number): number => {

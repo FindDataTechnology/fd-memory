@@ -4,24 +4,25 @@
 // namespace), /healthz, /admin/* (token ops, root-scoped). Auth on every
 // route except /healthz; auth failures are structured JSON.
 
-import { readdirSync, existsSync } from "node:fs";
+import { readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { TokenStore, Scope, namespaceParts } from "./auth.js";
 import { StoreRoot, normalizeMetadata } from "./store.js";
-import { PageFilter } from "./db.js";
+import { PageFilter, RootDb } from "./db.js";
 import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { parseObserveEvent, landObserveEvent, observeRateGuard } from "./observe.js";
 import { handlePortal } from "./portal-server.js";
 import { buildTools, writeNotePage } from "./mcp.js";
 import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
+import { startStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
-import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
+import { noteDigestRung, noteEmbedSample, noteVectorEvent, notePromotion, noteMetaFilter, noteInjectionLatency, metricsSnapshot, recentEmbedP90, recentEmbedTimeoutFloor, sampleVectorsScale } from "./metrics.js";
 import { renderDigest, DigestItem } from "./digest.js";
 import { newPage } from "./okf.js";
-import { PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
+import { POLICY_SUBKEYS, PROCESS_KEYS, deploymentDefaults, normalizePolicy, normalizePolicyPartial, resolvePolicy, unexecuted } from "./policy.js";
 
 export interface ServiceOptions {
   dataDir: string;
@@ -37,7 +38,16 @@ export class Service {
   readonly ingest: CaptureIngest;
   readonly distill: DistillScheduler;
   private keepwarm: { stop: () => void } | null = null;
+  private stallWatchdog: StallWatchdog | null = null;
   private roots = new Map<string, StoreRoot>();
+  // Injection-face cache (2026-11-20). `/memory/index` reads ~6,500 rows and
+  // sorts them on EVERY session start; measured 148–757ms end to end, all of
+  // it synchronous on the event loop. Several sessions starting together
+  // serialise those scans, which is part of what makes the face feel slow on
+  // a busy box. Keyed by (rootKey, project, limit) with `MAX(rowid)` as the
+  // version, so a write invalidates it precisely — a TTL would let a fresh
+  // memory stay invisible for up to one interval, which the spec forbids.
+  private indexCache = new Map<string, { version: number; body: string }>();
 
   constructor(readonly opts: ServiceOptions) {
     this.tokens = new TokenStore(opts.dataDir + "/tokens.db", opts.pepper);
@@ -115,7 +125,25 @@ export class Service {
       });
     });
     const host = this.opts.host ?? "127.0.0.1";
+    // Explicit server timeouts (2026-11-19). Node's defaults are
+    // requestTimeout=300s and headersTimeout=60s, which is far too patient for a
+    // service that has periodic multi-second stalls: a client that gave up after
+    // 25s left its request queued on the server for up to five minutes, and the
+    // pile of those is part of why later requests got slower still.
+    //
+    // 30s request / 15s headers is generous for the real latency profile
+    // (healthz 1ms, /observe ~40ms healthy, worst observed landing 1.7s) while
+    // cutting the tail a stuck client can create. keepAliveTimeout stays at the
+    // Node default (5s) — it is already conservative.
+    server.requestTimeout = Number(process.env.FD_MEMORY_REQUEST_TIMEOUT_MS ?? 30_000) || 30_000;
+    server.headersTimeout = Number(process.env.FD_MEMORY_HEADERS_TIMEOUT_MS ?? 15_000) || 15_000;
+    server.keepAliveTimeout = 5_000;
     server.listen(this.opts.port, host);
+    this.stallWatchdog = startStallWatchdog();
+    // Background distill work must name itself too, or a stall inside drain()
+    // keeps reporting whichever HTTP route arrived last (2026-11-18: that is
+    // exactly how `POST /observe` looked like the culprit).
+    this.distill.setPhaseNamer((p) => this.stallWatchdog?.note(p));
     this.distill.start();
     this.keepwarm = startEmbedKeepwarm({ env: process.env });
     console.log(`[fd-memory] listening on ${host}:${this.opts.port} data=${this.opts.dataDir}`);
@@ -191,10 +219,23 @@ export class Service {
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const url = new URL(req.url ?? "/", "http://local");
     const path = url.pathname;
+    // Tell the stall watchdog what we are about to do (2026-11-18). Updated
+    // before any work, so if a synchronous callback blocks the loop the report
+    // can name the route instead of only saying "something blocked".
+    this.stallWatchdog?.note(`${req.method ?? "?"} ${path}`);
 
     if (path === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ status: "ok", service: "fd-memory" }));
+      // `stalls` is the event-loop watchdog's counter (2026-11-18). A probe
+      // that times out learns nothing on its own — this tells it whether the
+      // process has been blocking its loop, so "my request took 15s" can be
+      // distinguished from "the process stalled 15s" without reading logs.
+      // Omitted entirely when the watchdog is absent, so the response body is
+      // byte-identical to before for any caller that does not expect it.
+      const stalls = this.stallWatchdog?.stalls();
+      return void res.end(JSON.stringify(
+        stalls === undefined ? { status: "ok", service: "fd-memory" } : { status: "ok", service: "fd-memory", stalls },
+      ));
     }
 
     // Portal (add-yongyi-complete-solution): static assets carry zero data, and
@@ -353,6 +394,21 @@ export class Service {
       // steered landing project — an idempotency key remains root-global, and
       // the first delivery's page is what every replay gets back.
       const out = landObserveEvent(root, landingProject, parsed.event, { principal: `${scope.kind}:${scope.tokenId}`, scope: grantNs }, nsProject);
+      // 蒸馏触发（2026-11-17 修断链）：/observe 是 harness hook 的唯一入口，
+      // 但它此前只落库、从不通知调度器 —— 蒸馏只能靠 fallbackScan 每 10 分钟
+      // 兜底，预算一紧（remaining < FALLBACK_BUDGET_RESERVE）就彻底停摆，
+      // 实测停 7 小时才发现。
+      //
+      // 为什么要从 title 认事件而不是从 type：hook 把 stop/session-start 都归一
+      // 成 type='turn_outcome'（EVENT_TYPES 的映射），类型层面分不开。但 title
+      // 保留了原始事件名（`stop · finddata` / `session-start · finddata`），
+      // 而 notifyCapture 要的正是「会话边界」这个语义。判 title 前缀既准确
+      // 又不用改 hook 协议。
+      //
+      // duplicate 不触发：同一条事件重放不该再排队，否则重试会把队列灌满。
+      if (!out.duplicate && /^(?:stop|session-end) ·/.test(parsed.event.title)) {
+        this.distill.notifyCapture(namespaceParts(scope.namespace).rootKey, landingProject, [{ event: "stop" }]);
+      }
       res.writeHead(202, { "content-type": "application/json" });
       return void res.end(JSON.stringify(out.duplicate
         ? { page: out.page, duplicate: true }
@@ -633,7 +689,15 @@ export class Service {
       if (fp.filter) noteMetaFilter();
       const filterProjects = recallProjects;
       const allowedPaths = fp.filter ? dRoot.db.filteredPagePaths(filterProjects, fp.filter) : null;
-      const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${c.kind === "fact" ? "facts" : "experiences"}/${c.id}.md`;
+      // Candidate id → wiki path. The kind→directory map must cover EVERY kind
+      // hybridCandidates can return (digest.ts declares `kind: fact |
+      // experience | note | observation`), not just the two L2 ones: notes live
+      // under `notes/`, and mapping them to `experiences/` made every note miss
+      // the allowed-paths set, so a `meta=` filter silently emptied the digest
+      // of notes that DID match. Found 2026-11-18 via the meta-filter test,
+      // which had been red since the filter landed.
+      const kindDir = (kind: string) => (kind === "fact" ? "facts" : kind === "note" ? "notes" : kind === "observation" ? "observations" : kind === "handoff" ? "handoffs" : kind === "reference" ? "references" : "experiences");
+      const relOf = (c: { id: string; kind: string }, proj: string) => `${proj}/${kindDir(c.kind)}/${c.id}.md`;
       const filteredCandidates = allowedPaths
         ? candidates.filter((c) => allowedPaths.has(relOf(c, project)) || allowedPaths.has(relOf(c, "shared")))
         : candidates;
@@ -993,6 +1057,456 @@ export class Service {
       return void res.end(JSON.stringify({ items, offset, limit }));
     }
 
+    // ── /memory/index (cross-harness memory index, 2026-11-16): a bounded
+    // list of DISTILLED conclusions gathered from every AI harness's own
+    // memory files (ZCode `memories/**/memory/*.md`, Claude Code
+    // `projects/*/memory/*.md`). Each entry is one description — the topic
+    // file's body stays at its source path, never copied here.
+    //
+    // Why this exists: session-start injection must be small and must say
+    // something worth reading. The digest face was pulling in L0 tool chatter
+    // (`tool_call Bash: kubectl …`); these pages come from files an agent
+    // already distilled, so a line IS the lesson.
+    //
+    // Ordering: feedback/user first (discipline and preference — the two
+    // classes worth paying for on every turn), then the rest, newest source
+    // first within each group. `limit` is clamped hard because this rides the
+    // system prompt of every session.
+    if (path === "/memory/index" && req.method === "GET") {
+      // Wall-clock for the whole read face (slim-injection-query-and-expose-latency).
+      // Recorded on EVERY exit path via the helper below, so a cached hit, a
+      // timeout-slow call and a full recompute all land in the same series.
+      const injStartedAt = process.hrtime.bigint();
+      const injDone = () => noteInjectionLatency(Number(process.hrtime.bigint() - injStartedAt) / 1e6);
+      let iRoot: StoreRoot;
+      if (scope.kind === "person") {
+        iRoot = this.rootFor(scope);
+      } else {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "person_token_required" }));
+      }
+      const projRaw = url.searchParams.get("project");
+      const iProject = String(projRaw ?? "default").replace(/[/\\]+/g, "-").slice(0, 128) || "default";
+      const want = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 100) || 100));
+
+      // 两类条目进注入，而过去只有第一类（2026-11-16 修）：
+      //   · memory-index —— 各 harness 自己 memory 文件的 description，是「别人
+      //     已经提炼过的结论」；
+      //   · note / fact —— 本服务 eval 分支**自己蒸馏出来的**结论。它们此前
+      //     永远进不了注入：distill 在跑、页也在写，但 memory-index 只由
+      //     sync.ts 扫描 harness 文件产生，两条链路不互通。结果是「记忆越
+      //     蒸馏越深，会话越看不见」，恰恰反了 —— 蒸馏产物是最该被复用的那层。
+      // note 的 title 本身就是一句话结论（例：「规则按行业过滤只认出银行：
+      // insurance/securities 共 12 条规则永不命中」），body 才是展开，所以
+      // description 取 title。
+      //
+      // Cache probe (2026-11-20): see indexCache. Bounded to 200 entries
+      // because the key includes `limit` and a pathological caller could
+      // otherwise grow this without end; the realistic key count is a handful.
+      //
+      // The declared key joins the key (2026-11-22) because the answer now
+      // carries it. Skipping this would pin the FIRST answer: declare a key on
+      // a root that had none and every session keeps reading the cached
+      // no-declaration body until some page happens to be written — a stale
+      // answer that looks like the declaration was ignored.
+      const declaredKeyNow = iRoot.db.declaredDomainKey(iProject);
+      const cacheKey = `${iRoot.rootDir}\u0000${iProject}\u0000${want}\u0000${declaredKeyNow ?? ""}`;
+      const cached = this.indexCache.get(cacheKey);
+      if (cached) {
+        const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
+        if (ver === cached.version) {
+          res.writeHead(200, { "content-type": "application/json" });
+          injDone();
+          return void res.end(cached.body);
+        }
+      }
+      // Two queries, not one (2026-11-21). The single query read `body` for
+      // every candidate, but injection renders `body` ONLY for memory-index —
+      // note/fact render their title. Measured: 9,237 notes carry 5 MB of body
+      // that was read and immediately discarded. Dropping it took the same
+      // query from 76 ms to 20 ms, because the cost here is page IO, not CPU.
+      //
+      // The two result sets are CONCATENATED before any post-processing so the
+      // dedup / ordering / quota / domain-folding steps below cannot tell which
+      // query a row came from — computing them per-group would break dedup at
+      // the group boundary and double-count quota.
+      const INJ_TAIL = `
+           FROM pages
+           WHERE project = ?
+             AND json_extract(metadata,'$.forgotten_at') IS NULL
+             -- Superseded pages leave the injection face (2026-11-20). The
+             -- superseded_edges table has been written since
+             -- optimize-yongyi-read-surfaces, but NO read face consumed it —
+             -- only a self-check audit did. So a page could be explicitly
+             -- retired and still be injected every session. Filtering here
+             -- makes the write side's intent actually take effect.
+             AND NOT EXISTS (
+               SELECT 1 FROM superseded_edges e
+                WHERE e.superseded_id = COALESCE(page_id, path)
+                  AND e.project = pages.project
+             )`;
+      const domainCoalesce = RootDb.DOMAIN_KEYS.map(({ key }) => `json_extract(metadata, '$."${key}"')`).join(", ");
+
+      // memory-index: the only type whose rendered text IS its body.
+      const indexRows = iRoot.db.db
+        .prepare(
+          `SELECT CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.harness'),'?')
+                       ELSE 'yongyi' END AS harness,
+                  CASE WHEN type = 'memory-index'
+                       THEN json_extract(metadata,'$.memory_type')
+                       ELSE type END AS memory_type,
+                  COALESCE(json_extract(metadata,'$.source_path'), path) AS source_path,
+                  CASE WHEN type = 'memory-index'
+                       THEN COALESCE(json_extract(metadata,'$.source_mtime'), 0)
+                       ELSE COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) END AS mtime,
+                  body AS description,
+                  json_extract(metadata,'$.memory_name') AS memory_name,
+                  COALESCE(page_id, path) AS pid,
+                  COALESCE(${domainCoalesce}) AS domain_value
+           ${INJ_TAIL}
+             AND type = 'memory-index'`,
+        )
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string; domain_value: string | null }>;
+
+      // note / fact: rendered text is their TITLE, so body is never selected.
+      const noteRows = iRoot.db.db
+        .prepare(
+          `SELECT 'yongyi' AS harness,
+                  type AS memory_type,
+                  path AS source_path,
+                  COALESCE(CAST(strftime('%s', updated_at) AS INTEGER), 0) AS mtime,
+                  title AS description,
+                  json_extract(metadata,'$.memory_name') AS memory_name,
+                  COALESCE(page_id, path) AS pid,
+                  COALESCE(${domainCoalesce}) AS domain_value
+           ${INJ_TAIL}
+             AND type IN ('note','fact')`,
+        )
+        .all(iProject) as Array<{ harness: string; memory_type: string; source_path: string; mtime: number; description: string; memory_name: string | null; pid: string; domain_value: string | null }>;
+
+      const rows = [...indexRows, ...noteRows];
+
+      // Cross-harness dedup by semantic identity (2026-11-20).
+      //
+      // Why: two harnesses writing the same conclusion produce two pages at
+      // different paths but with the same `memory_name` (claude-code's
+      // `paas/memory/x.md` and zcode's `bff3/memory/x.md`). Measured on the
+      // live index: 523 same-name groups inside 2,846 memory-index pages —
+      // 18.4% of the budget was spent showing the same conclusions twice.
+      //
+      // "Same name ⇒ same conclusion, keep the newest" was validated against
+      // the real data before adopting it: of those 523 groups, 515 had
+      // byte-identical bodies and the 8 that differed were the SAME conclusion
+      // at two points in time (a 10-22 "fixed" note and its 10-23 "archived"
+      // successor). Keeping the newest is right in both cases; requiring equal
+      // bodies would have surfaced both versions and left the reader to guess
+      // which was current.
+      //
+      // Pages WITHOUT a memory_name are never merged — notes, facts, and
+      // hand-written pages have no semantic id, and merging them by body text
+      // would risk collapsing genuinely distinct conclusions. Duplicates are
+      // recoverable by a human; a wrongly-merged memory is gone.
+      const byName = new Map<string, { row: (typeof rows)[number]; harnesses: Set<string> }>();
+      const unknownName: typeof rows = [];
+      for (const r of rows) {
+        const name = r.memory_name ?? "";
+        if (!name) { unknownName.push(r); continue; }
+        const cur = byName.get(name);
+        if (!cur) {
+          byName.set(name, { row: r, harnesses: new Set([r.harness]) });
+        } else {
+          cur.harnesses.add(r.harness);
+          if (r.mtime > cur.row.mtime) cur.row = r;
+        }
+      }
+      // Only add the field when a group actually has >1 source: an extra key on
+      // every entry would be noise for the 2,323 singles.
+      const deduped = [
+        ...[...byName.values()].map((v) => (
+          v.harnesses.size > 1
+            ? { ...v.row, harnesses: [...v.harnesses].sort() as string[] }
+            : { ...v.row }
+        )),
+        ...unknownName.map((r) => ({ ...r })),
+      ];
+
+      // 三级优先（2026-11-16 晚）：
+      //   0 = note / fact —— 本服务自己蒸馏出来的结论。它们是「从本机所有
+      //       harness 的流水里提炼过的」那一层，复用价值最高：一条顶得上
+      //       一堆原始记录。原先它们排在 feedback 之后，实测 100 个槽位里
+      //       只挤进 2 条，等于 hello 世界。
+      //   1 = feedback / user —— 各 harness 亲手写的纪律与偏好。
+      //   2 = 其余（project / reference）。
+      // 顺序不是「谁更新」，而是「谁更浓缩」：注入是拿去立刻用的，不是归档。
+      const ranked = deduped
+        .map((r) => {
+          const priority =
+            r.memory_type === "note" || r.memory_type === "fact" ? 0
+            : r.memory_type === "feedback" || r.memory_type === "user" ? 1
+            : 2;
+          return { ...r, priority };
+        })
+        .sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
+
+      // Harness quota (2026-11-16, measured defect): the flat "feedback first,
+      // then newest" sort returned 100/100 zcode entries and ZERO from
+      // claude-code — 2 727 entries available, one harness invisible. zcode
+      // writes far more feedback files and rewrites them more often, so it
+      // wins both sort keys and starves every other harness. That makes the
+      // face the opposite of its own name: a cross-harness index that shows
+      // one harness is just that harness's own notes read back to it.
+      //
+      // Each harness gets a share of the budget proportional to how much it
+      // actually holds, floor 1 so a small harness is still represented. Not
+      // equal-per-harness: at 40:10 that would re-show the same 10 claude-code
+      // entries on every single injection while hiding 30 of zcode's — a stale
+      // loop, not variety. Recency still decides WITHIN a harness (each bucket
+      // keeps its own newest-first order); it just no longer decides ACROSS
+      // them, which is what let one harness take the whole budget.
+      const total = ranked.length;
+      const picked: typeof ranked = [];
+      const leftovers: typeof ranked[] = [];
+      // 蒸馏产物先取（2026-11-17 实测缺口）：note/fact 来自本服务自己的蒸馏，
+      // 只有 70 条左右，按持有量比例分到 100 条预算里不到 3 条 —— 实测 20 条
+      // fact 一条都没进注入，而它们恰恰是「从这台机器全部流水里提炼过的」
+      // 那层，复用价值最高。所以先按 priority=0 给足，剩下的再按 harness 分。
+      // 蒸馏产物先取，但只给到预算的一半（2026-11-17 调）：
+      // note/fact 是本服务自己蒸馏的，复用价值最高；但实测全给时占 71%，
+      // 把各 harness 亲手写的纪律挤到 29% —— 那些是「这个项目/工具特有的
+      // 怎么做」，同样不该被淹。一半对一半是保守起点。
+      const distilled = ranked.filter((r) => r.priority === 0);
+      const rest = ranked.filter((r) => r.priority !== 0);
+      const distilledCap = Math.max(1, Math.floor(want / 2));
+      picked.push(...distilled.slice(0, Math.min(distilledCap, want)));
+      const buckets = [...new Map<string, typeof ranked>(
+        rest.reduce((m, r) => {
+          const k = String(r.harness ?? "unknown");
+          const list = m.get(k);
+          if (list) list.push(r); else m.set(k, [r]);
+          return m;
+        }, new Map<string, typeof ranked>()),
+      ).entries()]
+        .sort((a, b) => b[1].length - a[1].length)
+        .map(([, list]) => list);
+      const remaining = Math.max(0, want - picked.length);
+      const restTotal = rest.length || 1;
+      // Per-harness floor for DISCIPLINE entries (2026-11-20).
+      //
+      // Measured defect: of 671 feedback pages, 599 (89%) are zcode and 72
+      // claude-code. Proportional allocation therefore gave zcode ~45 of the
+      // 50 feedback slots, so claude-code's discipline — lessons that say how
+      // THIS tool should be driven — got ~5 slots and often none at all once
+      // the leftovers pass ran. The face is supposed to be cross-harness; a
+      // harness whose rules never appear is just reading its own notes back.
+      //
+      // Fix: before the proportional pass, give every harness that HAS
+      // feedback at least `floor(remaining / n_harness)` of those slots. The
+      // proportional pass then settles the remainder, so a large holder still
+      // gets more in absolute terms — it just cannot monopolise.
+      const feedbackHarnesses = new Set(
+        rest.filter((r) => r.memory_type === "feedback" || r.memory_type === "user")
+          .map((r) => String(r.harness ?? "unknown")),
+      );
+      const FLOOR_FRACTION = Number(process.env.FD_MEMORY_FEEDBACK_FLOOR_FRACTION ?? "0.5");
+      const floorShare = feedbackHarnesses.size > 1
+        ? Math.max(1, Math.floor((remaining * FLOOR_FRACTION) / feedbackHarnesses.size))
+        : 0;
+      if (floorShare > 0) {
+        const takenPer = new Map<string, number>();
+        for (const list of buckets) {
+          if (picked.length >= want) break;
+          const h = String(list[0]?.harness ?? "unknown");
+          if (!feedbackHarnesses.has(h)) continue;
+          let took = 0;
+          for (const r of list) {
+            if (took >= floorShare || picked.length >= want) break;
+            if (r.memory_type !== "feedback" && r.memory_type !== "user") continue;
+            picked.push(r);
+            took++;
+          }
+          takenPer.set(h, took);
+        }
+        // Consumed entries must not be offered again by the proportional pass.
+        for (let i = buckets.length - 1; i >= 0; i--) {
+          const h = String(buckets[i][0]?.harness ?? "unknown");
+          const took = takenPer.get(h) ?? 0;
+          if (took > 0) buckets[i] = buckets[i].filter((r) => !picked.includes(r));
+        }
+      }
+      const remaining2 = Math.max(0, want - picked.length);
+      for (const list of buckets) {
+        if (picked.length >= want) break;
+        const quota = Math.max(1, Math.round((remaining2 * list.length) / restTotal));
+        const take = Math.min(quota, list.length);
+        picked.push(...list.slice(0, take));
+        if (list.length > take) leftovers.push(list.slice(take));
+      }
+      void remaining;
+      // Proportional rounding can leave the budget under-spent (ceil vs floor).
+      // Settle from the leftovers, largest bucket first, stopping at the
+      // budget. No second trim after this: the final sort is stable by
+      // (priority, mtime), and clipping at the end would let the largest
+      // harness's older entries evict a small harness's guaranteed floor —
+      // which is exactly the starvation this whole block exists to prevent.
+      for (const list of leftovers) {
+        for (const r of list) {
+          if (picked.length >= want) break;
+          picked.push(r);
+        }
+        if (picked.length >= want) break;
+      }
+      picked.sort((a, b) => a.priority - b.priority || b.mtime - a.mtime);
+
+      // `harnesses` is present only when a dedup group had >1 source, so a
+      // client can tell "two harnesses independently landed on this" from "one
+      // wrote it". Additive: clients that ignore it see the old shape.
+      const items = picked.map((r) => {
+        const base = {
+          harness: r.harness,
+          memory_type: r.memory_type,
+          description: r.description,
+          source_path: r.source_path,
+        };
+        const hs = (r as { harnesses?: string[] }).harnesses;
+        return hs && hs.length > 1 ? { ...base, harnesses: hs } : base;
+      });
+
+      // Domain grouping (add-domain-memory-schema task 5.x).
+      //
+      // Ten reviews of the same instrument and ten reviews of ten different
+      // instruments cost the same number of injection lines, but only the first
+      // case cannot be read as "what do we have on this thing" — the copies are
+      // scattered and each one alone says little.
+      //
+      // Deliberately ADDITIVE: this runs only over picks that actually carry a
+      // domain value, and when none do the array is returned untouched (same
+      // order, same objects). Today that is every page, so the output stays
+      // byte-identical until the vocabulary starts being used — which is what
+      // task 5.3 pins.
+      //
+      // A group is reported as ONE item that names the count and shows the
+      // newest member's text, so no information is lost, only deduplicated from
+      // the budget's point of view.
+      const domainOf = new Map<string, Array<{ idx: number; r: (typeof picked)[number] }>>();
+      picked.forEach((r, idx) => {
+        const v = (r as { domain_value?: string | null }).domain_value;
+        if (!v) return;
+        const list = domainOf.get(v);
+        if (list) list.push({ idx, r }); else domainOf.set(v, [{ idx, r }]);
+      });
+      const grouped = new Set<string>();
+      for (const [v, list] of domainOf) if (list.length > 1) grouped.add(v);
+      // NOTE the condition: this runs when ANY pick carries a domain value, not
+      // only when something was folded. Gating it on `grouped.size > 0` meant a
+      // library whose pages all have DISTINCT domain values — i.e. the normal
+      // case once the vocabulary is adopted — took the untouched path and lost
+      // the field entirely, making "filed under X" indistinguishable from "no
+      // domain at all". Measured on the live database: three pages carried
+      // instruments and the response reported zero.
+      const anyDomain = domainOf.size > 0;
+      let outItems: Array<Record<string, unknown>> = items;
+      if (anyDomain) {
+        const emitted = new Set<string>();
+        outItems = [];
+        picked.forEach((r, idx) => {
+          const v = (r as { domain_value?: string | null }).domain_value;
+          if (!v) { outItems.push(items[idx] as Record<string, unknown>); return; }
+          if (!grouped.has(v)) {
+            // Single page for this value: not folded, but it still carries the
+            // value — that is what lets a reader (and the lookup path) tell
+            // "filed under 000001" from "no domain at all".
+            outItems.push({ ...(items[idx] as Record<string, unknown>), domain_value: v });
+            return;
+          }
+          if (emitted.has(v)) return; // already folded into the group entry
+          emitted.add(v);
+          const members = domainOf.get(v)!;
+          outItems.push({
+            ...(items[members[0].idx] as Record<string, unknown>),
+            domain_value: v,
+            domain_count: members.length,
+            // Named so a reader knows the rest exist rather than believing this
+            // is the only memory on the subject.
+            domain_note: `该领域下另有 ${members.length - 1} 条记忆，未逐条展开`,
+          });
+        });
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      // Cache the SERIALISED body, keyed on the write version (2026-11-20).
+      // `MAX(rowid)` is O(1) and moves on every insert, which is exactly the
+      // set of events that can change this answer (a new page, a distillation,
+      // a supersede edge all write through `pages`). Using the rowid rather
+      // than a TTL is deliberate: the spec requires a freshly written memory to
+      // be visible to the very next session, and a TTL cannot promise that.
+      //
+      // The declared domain key is part of the response, not of the entry list
+      // (2026-11-22). Without it the write-side hint is the ONLY channel: an
+      // agent learns "you forgot instrument" only AFTER it has already written
+      // a memory without one, every single time. The declaration is a standing
+      // convention for the team — it belongs on the read face where the agent
+      // can see it BEFORE writing, not as a correction afterwards.
+      //
+      // Additive and absent-by-default: no declaration → no `schema` key at all,
+      // so the response is byte-identical to before for every root that has not
+      // adopted the vocabulary (the same discipline task 5.3 pins for domain
+      // grouping).
+      const declaredKey = declaredKeyNow;
+      const schemaBlock = declaredKey
+        ? { key_by: declaredKey, domain: RootDb.domainOfKey(declaredKey) }
+        : undefined;
+      // Count what the BUDGET admitted (`picked`), not what the renderer emitted
+      // (`outItems`): domain folding collapses several picks into one entry, so
+      // the two differ exactly when a reader most needs the honest number. An
+      // item folded away is still visible — it is named in its group's
+      // `domain_note` — so counting it as omitted would overstate the loss.
+      const omitted = Math.max(0, ranked.length - picked.length);
+      const more = omitted > 0
+        ? {
+            beyond_budget: omitted,
+            note: `另有 ${omitted} 条记忆未进入本次注入（预算内只展示最相关/最新的 ${picked.length} 条）。用 memory_query 按词检索，或 memory_overview 看分布。`,
+          }
+        : undefined;
+      // Usage signal, injection half (batch 1 of memory-integration-with-product-lines).
+      //
+      // Records, per picked page: times injected, and the size of the candidate
+      // pool it competed in. The denominator is what makes the signal comparable
+      // across time — injection admits 50 of 10,049 candidates (0.5%), so
+      // "was injected" alone is mostly "was lucky". A page written today and one
+      // written last month are only comparable by their selection rate.
+      //
+      // Best-effort: the counters are advisory and must never fail an injection.
+      try {
+        iRoot.db.notePagesInjected(picked.map((r) => String((r as { pid?: string }).pid ?? "")), ranked.length);
+      } catch { /* advisory */ }
+      const bodyOut = JSON.stringify({
+        project: iProject,
+        total: ranked.length,
+        entries: outItems,
+        ...(schemaBlock ? { schema: schemaBlock } : {}),
+        ...(more ? { more } : {}),
+      });
+      const ver = Number((iRoot.db.db.prepare("SELECT COALESCE(MAX(rowid),0) AS v FROM pages").get() as { v: number }).v);
+      this.indexCache.set(cacheKey, { version: ver, body: bodyOut });
+      // Bounded eviction (2026-11-21). The comment above the probe has claimed
+      // "bounded to 200 entries" since the cache was added, but there was no
+      // eviction code at all — the claim was in a comment and nowhere else.
+      // The key includes the caller-chosen `limit`, so one project can produce
+      // 200 keys on its own; several roots × projects and this grows without
+      // bound, each entry holding a serialised 100-entry response.
+      //
+      // Oldest-first (Map preserves insertion order) is enough: a key nobody
+      // re-requests is exactly the one worth dropping, and a hot key is
+      // re-inserted each time it is recomputed.
+      while (this.indexCache.size > 200) {
+        const oldest = this.indexCache.keys().next().value;
+        if (oldest === undefined) break;
+        this.indexCache.delete(oldest);
+      }
+      injDone();
+      return void res.end(bodyOut);
+    }
+
     // ── /memory/promotions (add-tier-promotion-candidates D2): the 待确认
     // face. AI promotion judgements NEVER change a page directly — they land
     // here as proposals; a human accepts (tier flips, origin becomes human)
@@ -1045,6 +1559,217 @@ export class Service {
         truncated: all.length > proposals.length,
         total_partitions: projects.length,
       }));
+    }
+
+    // Dry-run classification of the pending queue (batch 2 task 2.4 of
+    // memory-integration-with-product-lines).
+    //
+    // READ-ONLY on purpose: this answers "if auto-promotion ran with these
+    // thresholds, what would it do?" without doing it. The first real run has to
+    // be inspected by a person, because the only thing this can get wrong is
+    // promoting a wrong page into the layer that will later be shared across
+    // roots — and that is not recoverable by looking at a count.
+    //
+    // Thresholds come from the query string and are passed through verbatim:
+    // the correct values depend on a distribution that only exists after batch 1
+    // has been collecting, so hard-coding a default here would be a guess
+    // pretending to be a policy.
+    // ── /memory/shared (batch 3 tasks 3.3/3.5 of
+    // memory-integration-with-product-lines).
+    //
+    // The ONLY cross-root read path in this service. Everything else resolves a
+    // single root from the caller's namespace and never looks further.
+    //
+    // Three conditions, all required, and each is checked in a different place
+    // on purpose:
+    //   1. the caller holds a grant FROM the root it is reading (per-target-root
+    //      table — the owner's statement about their own data)
+    //   2. the page is published (`shared_at` set)
+    //   3. the page is settled (`stable`/`canonical`)
+    // A name that happens to resemble another root grants nothing: grants are
+    // rows, never inferences.
+    //
+    // No write counterpart exists, and none is planned: the spec says page
+    // writes never cross roots, so the cheapest way to keep that true is to not
+    // build the path. `rootForKey` on a foreign key is deliberately avoided —
+    // that cache assumes ownership of whatever it opens.
+    if (path === "/memory/shared" && req.method === "GET") {
+      const readerRoot = namespaceParts(scope.namespace).rootKey;
+      const target = String(url.searchParams.get("from") ?? "").trim();
+      if (!target) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "from_required", hint: "name the root whose shared pages you want, e.g. from=u-alice" }));
+      }
+      if (target === readerRoot) {
+        // Reading your own root is not this face's job — the ordinary read paths
+        // already cover it, and answering here would blur "shared out" with
+        // "mine".
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "same_root", hint: "use the normal read faces for your own root" }));
+      }
+      // Open the TARGET root. NOTE: `RootDb` is not read-only — its constructor
+      // runs migrate(), so opening it can write (schema only). An earlier version
+      // of this comment claimed "read-only"; that was wrong and worth recording,
+      // because the claim was the reassuring part.
+      //
+      // What actually holds the line is that this route never calls a PAGE write
+      // path: the only writes it can cause are migrate() and the audit row below.
+      // Page content is never touched from another root's reader.
+      let targetDb: import("./db.js").RootDb;
+      try {
+        targetDb = new (await import("./db.js")).RootDb(join(this.opts.dataDir, "owners", target, "db", "memory.sqlite"));
+      } catch {
+        res.writeHead(404, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "root_not_found", root: target }));
+      }
+      if (!targetDb.hasShareGrant(readerRoot)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "no_grant",
+          reader: readerRoot,
+          root: target,
+          hint: "the owner of that root must run the publish action; a similar-looking name is not a grant",
+        }));
+      }
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get("limit") ?? 50) || 50));
+      // 3.5: every row names where it came from, so a reader can never mistake a
+      // shared page for one of its own.
+      const pages = targetDb.sharedPages(limit).map((p) => ({ ...p, source_root: target }));
+      // Audit the read in the OWNER's database (batch 4 task 4.3): "who read my
+      // shared pages, and when" is the owner's question, so the row lives where
+      // the owner looks. Best-effort — a failed audit must not fail the read.
+      targetDb.noteSharedRead(readerRoot, pages.map((p) => p.path), new Date().toISOString());
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ from: target, reader: readerRoot, pages, total: pages.length }));
+    }
+
+    // ── /memory/shared/grant (batch 3: the owner's side of the grant).
+    //
+    // Only the root's own owner can grant: the caller's namespace must BE the
+    // root being granted from, otherwise anyone could hand out someone else's
+    // pages.
+    if (path === "/memory/shared/grant" && req.method === "POST") {
+      const body = await this.body<{ reader?: string; revoke?: boolean; note?: string; rootKey?: string }>(req);
+      const ownRoot = namespaceParts(scope.namespace).rootKey;
+      if (!ownRoot.startsWith("u-")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "owner_root_only", hint: "grants live in a person root; deployment tokens cannot issue them" }));
+      }
+      const reader = String(body.reader ?? "").trim();
+      if (!reader) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "reader_required" }));
+      }
+      const root = this.rootForKey(ownRoot);
+      const changed = root.db.setShareGrant(reader, body.revoke !== true, new Date().toISOString(), String(body.note ?? ""));
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ root: ownRoot, reader, action: body.revoke === true ? "revoke" : "grant", changed }));
+    }
+
+    // ── /memory/shared/reads (batch 4 task 4.3, owner side).
+    //
+    // "Which other roots read my shared pages, and when." Only the owner can ask
+    // — the caller's own root is the one being read from, so no `from` param.
+    if (path === "/memory/shared/reads" && req.method === "GET") {
+      const ownRoot = namespaceParts(scope.namespace).rootKey;
+      if (!ownRoot.startsWith("u-")) {
+        res.writeHead(403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "owner_root_only" }));
+      }
+      const limit = Math.max(1, Math.min(500, Number(url.searchParams.get("limit") ?? 100) || 100));
+      const reads = this.rootForKey(ownRoot).db.shareReads(limit);
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ root: ownRoot, reads, total: reads.length }));
+    }
+
+    if (path === "/memory/promotions/classify" && req.method === "GET") {
+      const rr = promoRoot();
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const projectFilter = url.searchParams.get("scope");
+      const projects = projectFilter ? [projectFilter] : root.db.distinctProjects();
+      const minRetrieved = url.searchParams.has("min_retrieved") ? Number(url.searchParams.get("min_retrieved")) : undefined;
+      const minRate = url.searchParams.has("min_rate") ? Number(url.searchParams.get("min_rate")) : undefined;
+      const minCited = url.searchParams.has("min_cited") ? Number(url.searchParams.get("min_cited")) : undefined;
+      const out: Record<string, ReturnType<StoreRoot["db"]["classifyPendingProposals"]>> = {};
+      for (const p of projects) {
+        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate, minCited });
+        if (c.auto.length || c.conflict.length || c.no_signal.length) out[p] = c;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({
+        thresholds: { min_retrieved: minRetrieved ?? null, min_rate: minRate ?? null, min_cited: minCited ?? null },
+        // Named so a caller cannot mistake this for an action.
+        dry_run: true,
+        by_project: out,
+      }));
+    }
+
+    // ── /memory/promotions/apply (batch 2 task 2.2's missing caller).
+    //
+    // The classifier existed but nothing executed it: `promotePage` had no
+    // caller on any production path, so auto-promotion was a method nobody ran.
+    //
+    // Deliberately awkward to call:
+    //   · at least ONE threshold must be present — an empty call promotes
+    //     nothing by design, and saying so is better than silently doing nothing
+    //   · `confirm: true` is required, so a curl typo cannot promote pages
+    //   · `dry_run: true` returns the plan without touching anything
+    //
+    // Conflicts are never applied. They are reported and left in the queue —
+    // that rule lives in the classifier and this route must not second-guess it.
+    if (path === "/memory/promotions/apply" && req.method === "POST") {
+      const body = await this.body<{
+        scope?: string; min_retrieved?: number; min_rate?: number; min_cited?: number;
+        dry_run?: boolean; confirm?: boolean; rootKey?: string;
+      }>(req);
+      const rr = promoRoot(String(body.rootKey ?? ""));
+      const root = rr.root;
+      if (!root) {
+        res.writeHead(rr.status ?? 403, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: rr.err ?? "forbidden" }));
+      }
+      const minCited = typeof body.min_cited === "number" ? body.min_cited : undefined;
+      const minRetrieved = typeof body.min_retrieved === "number" ? body.min_retrieved : undefined;
+      const minRate = typeof body.min_rate === "number" ? body.min_rate : undefined;
+      if (minCited === undefined && minRetrieved === undefined && minRate === undefined) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "threshold_required",
+          hint: "pass at least one of min_cited / min_retrieved / min_rate; an empty call promotes nothing by design",
+        }));
+      }
+      const projects = body.scope ? [String(body.scope)] : root.db.distinctProjects();
+      const plan: Array<{ project: string; page_rel: string; why: string }> = [];
+      for (const p of projects) {
+        const c = root.db.classifyPendingProposals(p, { minRetrieved, minInjectedRate: minRate, minCited });
+        for (const a of c.auto) plan.push({ project: p, page_rel: a.page_rel, why: a.why });
+      }
+      if (body.dry_run === true) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ dry_run: true, would_promote: plan.length, plan }));
+      }
+      if (body.confirm !== true) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({
+          error: "confirm_required",
+          hint: "pass confirm:true to actually promote; use dry_run:true to preview",
+          would_promote: plan.length,
+        }));
+      }
+      const at = new Date().toISOString();
+      let promoted = 0;
+      for (const item of plan) {
+        try {
+          root.db.promotePage(item.page_rel, "stable", item.why, at);
+          promoted += 1;
+        } catch { /* one bad row must not abort the batch */ }
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return void res.end(JSON.stringify({ promoted, planned: plan.length, at }));
     }
 
     if (path === "/memory/promotions/accept" && req.method === "POST") {
@@ -1214,7 +1939,7 @@ export class Service {
           const { errors } = normalizePolicyPartial(doc, "process");
           for (const e of errors) {
             const short = e.key.includes(".") ? e.key.slice(e.key.lastIndexOf(".") + 1) : e.key;
-            if ((PROCESS_KEYS as readonly string[]).includes(short)) {
+            if ((POLICY_SUBKEYS as readonly string[]).includes(short)) {
               const row = rows[short as keyof typeof rows];
               // First (most specific) level wins the marker: that is where a fix
               // belongs.
@@ -1239,20 +1964,28 @@ export class Service {
       }
 
       if (req.method === "PUT" || req.method === "POST") {
-        const body = await this.body<{ process?: unknown; scope?: unknown }>(req);
+        const body = await this.body<{ process?: unknown; schema?: unknown; scope?: unknown }>(req);
         // `scope` names WHICH level the write applies to; default = this project.
         const target = String(body.scope ?? url.searchParams.get("scope") ?? "project");
         if (target !== "project" && target !== "root") {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({ error: "scope_must_be_project_or_root" }));
         }
-        const normalized = normalizePolicy(body.process, "process");
+        // The document is flat (`{distill, key_by}`) — that is the shape the pack
+        // compiler already emits and the shape `getMemoryPolicy` stores. A caller
+        // that groups by axis (`{process:{...}, schema:{...}}`) is merged into the
+        // same flat shape so both spellings land one row, not two.
+        const flat = {
+          ...(body.process && typeof body.process === "object" && !Array.isArray(body.process) ? body.process : {}),
+          ...(body.schema && typeof body.schema === "object" && !Array.isArray(body.schema) ? body.schema : {}),
+        };
+        const normalized = normalizePolicy(flat, "process");
         if (!normalized.ok) {
           res.writeHead(400, { "content-type": "application/json" });
           return void res.end(JSON.stringify({
             error: "policy_invalid",
             errors: normalized.errors,
-            known_keys: PROCESS_KEYS,
+            known_keys: POLICY_SUBKEYS,
           }));
         }
         const key = target === "root" ? "root" : project;
@@ -1322,10 +2055,31 @@ export class Service {
       }));
     }
 
-    const session = this.sessions.get(sid);
+    // Session resumption after a restart (2026-11-20).
+    //
+    // The map above is process memory, so a restart empties it while every
+    // connected client still holds its `mcp-session-id`. The old code answered
+    // those with a hard 400 "session not initialized" — which meant a routine
+    // `launchctl kickstart` permanently broke every live MCP client until each
+    // one happened to re-`initialize`. Hit in production: a restart to pick up
+    // an unrelated change left a user's session unable to write memory at all,
+    // and nothing in the error hinted that restarting was the cause.
+    //
+    // Rebuilding is the correct behaviour, because the session is a CACHE and
+    // never an authorization gate: `route()` has already verified the token on
+    // THIS request, and the comment above says so ("token re-verified on every
+    // request; sessions just cache the resolved root"). Refusing here added no
+    // security — it only let a stale id deny a fully-authenticated caller.
+    //
+    // Grants are still read fresh per call, and the resolved root comes from
+    // this request's own scope, so a resumed session can never reach a root its
+    // current token does not cover.
+    let session = this.sessions.get(sid);
     if (!session) {
-      res.writeHead(400, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id ?? null, error: { code: -32000, message: "session not initialized" } }));
+      session = { scope, root: this.rootFor(scope) };
+      // Re-key under the id the client is already using, so its subsequent
+      // requests hit the cache instead of repeating this path.
+      if (sid) this.sessions.set(sid, session);
     }
 
     if (msg.method === "notifications/initialized" || msg.method?.startsWith("notifications/")) {
@@ -1494,8 +2248,24 @@ export class Service {
       // Vector scale is sampled AT READ TIME: a cached number would report
       // the state of the last reader, not the store (harden-memory-surfaces).
       sampleVectorsScale(this.vectorCountsByRoot());
+      // Domain fill rates, per root (add-domain-memory-schema). Computed at read
+      // time like the vector scale: a stale rate would tell an operator that a
+      // domain is being used when nobody has written one since the last restart.
+      // Per-root because each owner has its own database — an aggregate across
+      // owners would average away the team that never adopted the vocabulary.
+      const domainFill: Array<{ root: string; rates: Array<{ key: string; domain: string; filled: number; total: number; rate: number }> }> = [];
+      for (const key of new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()])) {
+        try { domainFill.push({ root: key, rates: this.rootForKey(key).db.domainFillRates() }); } catch { /* unreadable root */ }
+      }
+      // Usage-signal distribution, per root (batch 1 of
+      // memory-integration-with-product-lines). Read-time like domain_fill: a
+      // cached number would describe the last reader, not the store.
+      const usageSignal: Array<{ root: string; stats: ReturnType<StoreRoot["db"]["usageSignalStats"]> }> = [];
+      for (const key of new Set<string>([...this.roots.keys(), ...this.discoverOwnerRoots()])) {
+        try { usageSignal.push({ root: key, stats: this.rootForKey(key).db.usageSignalStats() }); } catch { /* unreadable root */ }
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify(metricsSnapshot()));
+      return void res.end(JSON.stringify({ ...metricsSnapshot(), domain_fill: domainFill, usage_signal: usageSignal }));
     }
 
     if (path === "/admin/reindex") {
@@ -1510,8 +2280,18 @@ export class Service {
         res.writeHead(500, { "content-type": "application/json" });
         return void res.end(JSON.stringify({ error: "supersede_edge_audit_failed", reindexed: count, audit }));
       }
+      // Domain-index audit (add-domain-memory-schema): the spec forbids "key in
+      // the vocabulary, index missing", and until now nothing checked it — the
+      // migration creates them unconditionally, so the two can only drift via a
+      // stale dist or a half-run migration, and drift is exactly the case with
+      // no symptom other than recall quietly scanning.
+      const dIdx = root.db.domainIndexAudit();
+      if (!dIdx.ok) {
+        res.writeHead(500, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ error: "domain_index_audit_failed", reindexed: count, audit: dIdx }));
+      }
       res.writeHead(200, { "content-type": "application/json" });
-      return void res.end(JSON.stringify({ reindexed: count, supersede_edges: audit.edges }));
+      return void res.end(JSON.stringify({ reindexed: count, supersede_edges: audit.edges, domain_indexes: dIdx.expected.length }));
     }
 
     // Rebuild EVERY vector of one root under the sidecar's CURRENT model

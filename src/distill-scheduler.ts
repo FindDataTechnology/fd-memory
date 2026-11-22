@@ -65,7 +65,21 @@ const FALLBACK_BUDGET_RESERVE = 100_000;
 // The extractor's completion ceiling, mirrored from distiller/engine.py
 // (CodingMemoryExtractor(max_tokens=6000)). Only used to DETECT truncation; the
 // value itself is the engine's, so the two must move together.
-const EXTRACT_MAX_TOKENS = Number(process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 6000) || 6000;
+// Extractor 的 completion 上限。两侧必须一致：distiller/engine.py 用它设
+// CodingMemoryExtractor(max_tokens=…)，这里用它 DETECT 截断。不一致会出现
+// 「明明截断了却判不出」或反过来「没截断却判截断」。
+//
+// 2026-11-17 调高 6000 → 16000：note 类内容比 handoff 长得多，实测 31 条
+// note 分块后仍有多批撞穿 6000，被整批跳过、cursor 不动 —— 表面上「预算
+// 充足却不推进」。天花板是自设护栏，撞上就抬高，不是等它。
+export const EXTRACT_MAX_TOKENS =
+  Number(process.env.MEMORY_EXTRACT_MAX_TOKENS ?? process.env.FD_MEMORY_EXTRACT_MAX_TOKENS ?? 16000) || 16000;
+// Notes-per-distill-call. Exported so tests assert against the knob instead of a
+// literal: it was 2, lowered to 1 on 2026-11-17 (a bigger chunk risked the 300s
+// sidecar deadline, and a timed-out batch loses its content), and two tests kept
+// asserting "4 notes distill as 2-item chunks" — green logic, red test, no
+// defect. Anything that pins a tunable's VALUE in a test will rot the same way.
+export const distillChunk = (): number => Math.max(1, Number(process.env.FD_MEMORY_DISTILL_CHUNK ?? 1) || 1);
 const EXTRACT_TRUNCATED_MAX_GAPS = Math.max(1, Number(process.env.FD_MEMORY_EXTRACT_TRUNCATED_MAX_GAPS ?? 3) || 3);
 // Step 2 of fix-distill-extract-truncation. Measured 2/2 runs at exactly the
 // 6,000 ceiling with 120 items → 4 pages, so a truncated batch is not a rare
@@ -89,12 +103,65 @@ const DEFAULT_MAX_ITEMS = 120; // ~40k-token worst-case prompt (production day-1
 // The /distill request budget on THIS side. The distiller answers before its own
 // DISTILL_LLM_DEADLINE_S, which must stay below this — otherwise the caller
 // aborts first and we are back to "the other side cut us off and we recorded
-// nothing". Measured 2026-11-13: one engine call takes 47-97 s with a 474-char
-// extraction prompt and the tail goes past 150 s (a 2-item u-root chunk died at
-// distill_deadline_exceeded), so the pair was raised to 300 s (distiller) /
-// 330 s (here) AFTER the call budget was pinned to one call per request — with
-// several calls per request a longer deadline would just hold the thread longer.
-const DEFAULT_SIDECAR_TIMEOUT_MS = 180_000;
+// nothing".
+//
+// 2026-11-17 修一个真实错配：注释一直写 330s(here)/300s(distiller)，但代码是
+// 180s —— 调用方比被调方先放弃 120 秒。实测 28 个 /distill 里 6 个超时（21%），
+// 而 distiller 侧记的是 TimeoutError：它还没到自己的 300s 就被我们掐了。
+// 现改为 distiller 600s / here 660s，保持注释承诺的 60 秒余量。
+//
+// ★ 2026-11-22 订正：上面那句「here 660s」其实**从未生效过**。
+// AbortSignal.timeout(660_000) 不是唯一的截止条件 —— Node 内置 fetch 的实现
+// (undici) 另有自己的 **bodyTimeout / headersTimeout 默认 300 s**，到点直接
+// 断开连接。实测症状是 sidecar 侧抛 `BrokenPipeError: [Errno 32] Broken pipe`
+// （它算完了、写响应时才发现对端没了），而我们这一侧报 `fetch failed`。
+// 于是调 MAX_ITEMS（120→40）、调 DISTILL_LLM_DEADLINE_S（600→300）都无效：
+// 真正掐断的是 undici 的 300 s，与批大小、与 distiller 的 deadline 都无关。
+// 修法：给长请求显式挂一个 bodyTimeout 与这里一致的 dispatcher。
+const DEFAULT_SIDECAR_TIMEOUT_MS = 660_000;
+
+/**
+ * The dispatcher that actually enforces DEFAULT_SIDECAR_TIMEOUT_MS.
+ *
+ * Without it the AbortSignal above is decoration: undici's own 300 s body
+ * timeout fires first and surfaces as a bare `fetch failed`. Lazily created so
+ * importing this module never touches the network stack.
+ *
+ * Typed structurally on purpose — `undici` is a *transitive* dependency here
+ * (Node ships it, but this package does not declare it), so importing its types
+ * compiles locally and fails on a clean `npm ci` in CI with
+ * `TS2307: Cannot find module 'undici'`. All we need is an opaque object to
+ * hand back to fetch, so the declaration describes exactly that.
+ */
+interface SidecarDispatcher {
+  readonly __brand?: "undici-dispatcher";
+}
+let sidecarDispatcher: SidecarDispatcher | null = null;
+async function dispatcherForSidecar(): Promise<SidecarDispatcher | undefined> {
+  if (sidecarDispatcher) return sidecarDispatcher;
+  try {
+    // Resolved at RUNTIME only. `await import("undici")` still makes TypeScript
+    // resolve the specifier at compile time and fail on a clean `npm ci`
+    // (TS2307) — the package is shipped by Node, never declared here. A dynamic
+    // specifier built at runtime is opaque to the type checker, which is
+    // exactly what we want: no dependency, no compile-time promise.
+    const specifier = "undici";
+    const mod = (await import(/* @vite-ignore */ specifier)) as {
+      Agent: new (opts: { bodyTimeout: number; headersTimeout: number; connectTimeout: number }) => SidecarDispatcher;
+    };
+    const { Agent } = mod;
+    sidecarDispatcher = new Agent({
+      bodyTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
+      headersTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
+      connectTimeout: 10_000,
+    });
+    return sidecarDispatcher;
+  } catch {
+    // undici 不可用（极老的 Node）时退回默认 dispatcher —— 至少不要因此抛错，
+    // 代价是回到 300 s 上限，行为与修复前一致。
+    return undefined;
+  }
+}
 
 // Root-family gate. This used to be the whole decision: pack roots always
 // distilled, person roots distilled unless FD_MEMORY_DISTILL_U=0 — which made the
@@ -238,14 +305,28 @@ export class DistillScheduler {
     this.timer = null;
   }
 
+  /**
+   * Lets the service tell the stall watchdog what background work is running
+   * (2026-11-18). Without it the watchdog only knows the last HTTP route, and a
+   * stall that lands in a `drain()` tick keeps reporting the route that happened
+   * to arrive last — which is how `POST /observe` looked like the culprit when
+   * the blocking work was actually downstream of it.
+   */
+  setPhaseNamer(note: (phase: string) => void): void {
+    this.notePhase = note;
+  }
+  private notePhase: (phase: string) => void = () => {};
+
   async drain(): Promise<void> {
     if (!this.enabled()) return;
+    this.notePhase("distill:drain+fallbackScan");
     this.fallbackScan();
     const due = [...this.pending.values()].filter(
       (p) => !this.inflight.has(DistillScheduler.key(p.rootKey, p.project)) && this.now() - p.since >= debounceFor(p.rootKey),
     );
     const batch = due.slice(0, 2); // cross-project concurrency ≤2
     await Promise.allSettled(batch.map((p) => this.distillOne(p.rootKey, p.project)));
+    this.notePhase("distill:idle");
   }
 
   // v2.2 candidate selection: vector cosine top-8 first (query embedded via
@@ -259,10 +340,31 @@ export class DistillScheduler {
   }
 
   private async embedTexts(texts: string[]): Promise<{ vectors: number[][]; model: string; tokens: number }> {
+    // Vector lane kill switch (unify-harness-delivery 1.3, 2026-11-18).
+    //
+    // The gateway this deployment points at serves 81 models and ZERO of them
+    // are embedding models — `Qwen/Qwen3-Embedding-8B` (the default) answers
+    // 404 model_not_found, as do text-embedding-3-small / bge-m3 / the 0.6B
+    // Qwen. Every digest therefore paid a round-trip to learn "no", then fell
+    // back to keyword recall with a note that reads like an outage. Turning the
+    // lane OFF by configuration makes keyword recall the declared mode instead
+    // of a per-turn failure to explain.
+    //
+    // Set FD_MEMORY_EMBED=off (or 0/false) when the lane has no serving model.
+    // Unset/on keeps the current behaviour — this changes nothing where a real
+    // embedding model exists.
+    if (embedDisabled(this.opts.env ?? process.env)) {
+      if (!this.embedDisabledLogged) {
+        this.embedDisabledLogged = true;
+        this.log.warn("[vector] embed lane disabled (FD_MEMORY_EMBED=off) — recall runs keyword-only by configuration, not by failure");
+      }
+      return { vectors: [], model: "", tokens: 0 };
+    }
     const out = await sidecarEmbed(this.opts.env ?? process.env, texts, this.opts.fetchImpl ?? fetch, this.url());
     this.checkModelConsistency(out.model);
     return out;
   }
+  private embedDisabledLogged = false;
 
   // First-embed self-check (2026-10-28): the sidecar's CURRENT model is only
   // knowable from a response. The moment the process learns it, compare it
@@ -486,6 +588,7 @@ export class DistillScheduler {
 
   private async distillOne(rootKey: string, project: string): Promise<void> {
     const key = DistillScheduler.key(rootKey, project);
+    this.notePhase(`distill:${rootKey}/${project}`);
     // One run per OWNER at a time (optimize-yongyi-read-surfaces 7.3). The
     // daily budget is per root, and the ledger can only be read before a call,
     // so two projects of the same owner starting together would both read
@@ -505,7 +608,19 @@ export class DistillScheduler {
       const state = root.db.getDistillState(project);
       if (state && state.next_attempt_at > this.now()) return;
       const maxItems = this.maxItems();
-      const obs = root.db.observationsAfter(project, state?.obs_cursor ?? 0, maxItems) as unknown as (ObservationRow & { rid: number })[];
+      // u/ 根不吃 observations（2026-11-17 修空转）：代码注释一直写着「person
+      // root 的原材料是 note，observations 在那儿根本不存在」，但实测这个 root
+      // 有 3,542 条 —— 历史导入（import:zcode / import:summary）留下的，而
+      // obs_cursor 从没推进过（一直是 0）。于是每次 stop 事件触发的蒸馏都从 0
+      // 重取那批流水、调一次 LLM、产出 0 page：五小时内 9 次纯空转，白烧预算
+      // 还占着 sidecar。
+      //
+      // 判据用 root 家族而不是「obs_cursor 是不是 0」：后者会把「真的还没消费
+      // 过 observation 的 d/ 根」也误伤。u/ 根只走 note + handoff。
+      const isPersonRoot = rootKey.startsWith("u-");
+      const obs = isPersonRoot
+        ? []
+        : (root.db.observationsAfter(project, state?.obs_cursor ?? 0, maxItems) as unknown as (ObservationRow & { rid: number })[]);
       let handoffs: HandoffRow[] = [];
       try {
         handoffs = root.db
@@ -564,7 +679,12 @@ export class DistillScheduler {
         // silently DROPS unknown events (probe: "note-write" batches → 0 LLM
         // calls, no error). Handoffs and notes are chunked per-stream so cursors
         // advance cleanly; the daily budget is billed once for the whole run.
-        const CHUNK = 2;
+        // CHUNK 可配置（2026-11-17）：2 是早期「2 条/批、800 字摘要」下测出的
+        // 安全值，但 note 类正文远长于 handoff，实测 28 个 /distill 请求里 6 个
+        // 撞 300s sidecar deadline（21%）——超时那批内容直接丢失，cursor 虽推进
+        // 但有损。降到 1 让每批更快更稳；代价是调用数翻倍（26 批 → 51 批），
+        // 在 500 万日预算下不构成问题。
+        const CHUNK = distillChunk();
         const CAP = 800;
         const cap = (s: string) => String(s ?? "").replace(/\s+/g, " ").slice(0, CAP);
         let spentTotal = 0;
@@ -585,12 +705,18 @@ export class DistillScheduler {
           const timer = setTimeout(() => controller.abort(), this.sidecarTimeoutMs());
           let res: Response;
           try {
+            // `dispatcher` is what actually holds the connection open for the
+            // full budget — see the DEFAULT_SIDECAR_TIMEOUT_MS note. Only when
+            // the caller injected its own fetchImpl (tests) is it omitted, so a
+            // fake transport never needs to know about undici.
+            const dispatcher = this.opts.fetchImpl ? undefined : await dispatcherForSidecar();
             res = await (this.opts.fetchImpl ?? fetch)(`${this.url()}/distill`, {
               method: "POST",
               headers: { "content-type": "application/json", authorization: `Bearer ${this.opts.env?.DISTILLER_SHARED_TOKEN ?? ""}` },
               body: JSON.stringify({ scope: `${rootKey}/${project}`, cursor: { obs: state?.obs_cursor ?? 0, handoff: state?.handoff_cursor ?? "" }, items, candidates }),
               signal: controller.signal,
-            });
+              ...(dispatcher ? { dispatcher } : {}),
+            } as RequestInit);
           } finally {
             clearTimeout(timer);
           }
@@ -650,6 +776,10 @@ export class DistillScheduler {
         // A chunk that hits the cap stops the run cleanly: cursors keep the work
         // that already landed, and the gap is recorded for the next day.
         let truncationStalled = false;
+        // Set when a chunk hits the daily budget. That stop records its own
+        // `last_error` and must survive — clearing it below would turn a real
+        // "we ran out of budget" into a clean-looking state.
+        let budgetStopped = false;
         // Read from opts.env, not process.env: the scheduler's configuration
         // surface is opts.env everywhere else (dailyLimit, gates), and a knob
         // that only honours process.env is untestable and silently divergent.
@@ -667,6 +797,7 @@ export class DistillScheduler {
                 root.db.upsertDistillState(project, { last_error: "daily_budget_exhausted", gaps: (state?.gaps ?? 0) + 1, next_attempt_at: tomorrowMs(this.now()) });
                 this.opts.tokens.distillBudgetStopAdd(rootKey, day);
                 this.log.warn(`[distill] ${key}: daily budget hit mid-run (${this.opts.tokens.distillBudgetUsed(rootKey, day).tokens}/${this.dailyLimit()}) — stopping, cursors kept`);
+                budgetStopped = true;
                 return;
               }
               throw e;
@@ -693,6 +824,23 @@ export class DistillScheduler {
         }));
         // The ledger was already fed per call (7.3); only the run-level metrics
         // report the total here.
+        //
+        // Clear the failure state once a run actually completes (2026-11-22).
+        // The chunked path wrote `note_cursor` per batch and nothing else, so a
+        // root that had EVER failed kept `last_error` set forever — the read face
+        // showed "fetch failed" while 320 pages were being produced that same
+        // half hour. The single-extract path below has always cleared it; this
+        // one had no equivalent, which is why only u- roots (the chunked ones)
+        // looked stuck.
+        //
+        // NOT unconditional: a run that stopped early — daily budget exhausted,
+        // or a truncation stall that held the cursor — is not a success, and the
+        // reason it stopped must survive for the next reader. Only a run that
+        // reached this line having cleared every chunk counts as complete.
+        const earlyStop = budgetStopped || truncatedRuns > 0;
+        if (!earlyStop) {
+          root.db.upsertDistillState(project, { last_error: null, next_attempt_at: 0, last_tokens: spentTotal });
+        }
         noteDistill(true, wrote, spentTotal, undefined, { items: handoffs.length + notes.length, calls: chunksIssued });
         noteDistillStages(stageCalls);
         noteDistillTruncation(truncatedRuns > 0);
@@ -892,6 +1040,16 @@ export class DistillScheduler {
   }
 }
 
+// Vector lane kill switch (unify-harness-delivery 1.3). Truthy unless the
+// operator explicitly disables it — an unset env must keep today's behaviour.
+export function embedDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = String(env.FD_MEMORY_EMBED ?? "").trim().toLowerCase();
+  return v === "off" || v === "0" || v === "false" || v === "no";
+}
+// (evaluated per call via embedDisabled(); a module-level constant froze the
+// value at import time, which made the switch untestable and — more to the
+// point — invisible to any seam that was added after it.)
+
 // Standalone sidecar /embed call (extracted from the scheduler by
 // add-cluster-digest-injection — the /digest platform-seam face shares the
 // exact same wire): POST texts, 30s abort, structured failure.
@@ -967,6 +1125,15 @@ export async function hybridCandidates(opts: {
     ? [...new Set(opts.projects)]
     : project === "shared" ? [project] : [project, "shared"];
   const keyword = distillCandidates(root, projects, queryFor);
+  // Vector lane kill switch (2026-11-18). `EMBED_DISABLED` was only honoured
+  // inside the scheduler, so every /digest and /memory read still reached for
+  // the embed lane and ate a 404 round-trip before falling back to keywords —
+  // the env var looked set and did nothing on the read path. Measured: the
+  // gateway has no embedding model at all ("Qwen/Qwen3-Embedding-8B … not
+  // supported by any configured account"), so the call can never succeed here.
+  // Gate INSIDE hybridCandidates, not at each call site: it is the one seam
+  // every read path goes through, so a new caller cannot silently re-open it.
+  if (embedDisabled()) return keyword;
   // An empty query has no vector to compute (2026-10-29): the sidecar rejects
   // blank input with 400 texts_required, and the caller turned that into
   // "vector lane unavailable — keyword-only recall" — an input-validation
@@ -990,13 +1157,17 @@ export async function hybridCandidates(opts: {
       }
     }
     const scored: Array<DistillCandidate & { score: number }> = [];
-    const superseded = root.db.supersededIds();
+    // Per-project retirement (2026-11-20): a page_id is a basename, so the
+    // same id can be retired in one partition and alive in another. The old
+    // union set let alpha's correction hide beta's live page.
+    const supersededBy = new Map<string, Set<string>>();
+    for (const p of projects) supersededBy.set(p, root.db.supersededIds(p));
     for (const v of root.db.allPageVectors(q.model)) {
       if (v.vector.length !== qv.length) continue;
       const rel = v.page_rel;
       const baseId = rel.split("/").pop()?.replace(/\.md$/, "") ?? "";
-      if (superseded.has(baseId)) continue; // retired by a newer distillation
       const projectOfRel = rel.split("/")[0];
+      if (supersededBy.get(projectOfRel)?.has(baseId)) continue; // retired by a newer distillation in THIS partition
       if (!projects.includes(projectOfRel)) continue;
       let c = byRel.get(rel);
       if (!c) {

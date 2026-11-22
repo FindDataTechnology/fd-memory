@@ -6,9 +6,22 @@
 // and observations carry the project they landed in.
 
 import { DatabaseSync } from "node:sqlite";
-import { readdirSync, statSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readdirSync, statSync, mkdirSync, readFileSync } from "node:fs";
+import { join, dirname, sep } from "node:path";
+import { createHash } from "node:crypto";
 import { readPageFile } from "./okf.js";
+import { DOMAIN_KEY_VOCABULARY } from "./policy.js";
+
+/**
+ * Identity of one observation as it appears in the append-only log.
+ *
+ * Retract markers name rows by this digest instead of by rowid: rowids are
+ * rebuild artifacts, and the whole point of a marker is that it keeps working
+ * after the index has been thrown away and replayed.
+ */
+export function observationDigest(sessionId: string, summary: string): string {
+  return createHash("sha256").update(`${sessionId}\u0000${summary}`).digest("hex").slice(0, 16);
+}
 
 export interface ObservationRow {
   session_id: string;
@@ -100,7 +113,7 @@ function metadataFilterSql(filter: PageFilter | undefined, column: string): { cl
   return { clause, args };
 }
 
-function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null, projectColumn: string, timeColumn: string, typeColumn?: string): { clause: string; args: SqlArg[] } {
+export function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null, projectColumn: string, timeColumn: string, typeColumn?: string): { clause: string; args: SqlArg[] } {
   let clause = projectFilterSql(projects, projectColumn).clause;
   const args: SqlArg[] = projectFilterSql(projects, projectColumn).args;
   if (filter?.since) { clause += ` AND ${timeColumn} >= ?`; args.push(filter.since); }
@@ -113,9 +126,275 @@ function pageFilterSql(filter: PageFilter | undefined, projects: string[] | null
 export class RootDb {
   readonly db: DatabaseSync;
 
+  /**
+   * Schema version this build expects. Bump it whenever migrate() adds a step
+   * that must run again; otherwise an already-migrated database skips the whole
+   * write path on open.
+   */
+    // Bumped to 4 by batch 1 of memory-integration-with-product-lines (usage
+  // signal columns). The `columnsOf()` guards below are idempotent, but the
+  // whole migrate() short-circuits when the stored version is already current —
+  // which it was (3 == 3), so the new ALTERs would never have run on any
+  // existing database. Bumping the number is what actually makes them execute.
+  // 5 — batch 3 adds shared_at (cross-root sharing marker) and the usage
+  // columns that came with it. Bump for the same reason as 3->4: the idempotent
+  // column guards are not triggers; the version number is what makes them run.
+  // 6 — batch 3 added the share_grants TABLE (the 3->4 and 4->5 bumps covered
+  // column additions). Same trap twice in one night: an idempotent
+  // CREATE TABLE IF NOT EXISTS inside migrate() is not a trigger either; if the
+  // stored version already matches, the whole block is skipped and the table is
+  // simply absent while everything else looks healthy.
+  // 7 — batch 4 adds the share_reads audit table. Every schema change needs
+  // this bump; the idempotent guards inside migrate() are not triggers.
+  static readonly SCHEMA_VERSION = 7;
+
+  /**
+   * The closed domain-key vocabulary (add-domain-memory-schema).
+   *
+   * What this is for: the four memory axes answer "where is it stored / how much
+   * does it recall / whose word counts / how is it distilled". None of them
+   * answers "what does THIS domain record, and how is it grouped". An investing
+   * team wants to gather a review per instrument; a legal team per party. With
+   * only the four axes, both teams get identical behaviour and can express the
+   * distinction only in free text — and free-text classification was already
+   * rejected for `type` (20+ invented lanes, one carrying a whole sentence).
+   *
+   * Why CLOSED, and why a key can only be added by shipping a release: every key
+   * carries an expression index (see migrate()). A distributed artifact that can
+   * introduce a key is an artifact that can change the shape of a database it
+   * does not own. Same rule as `store.home` accepting only fleet/member/person
+   * and refusing every address form.
+   *
+   * Keys are chosen from domains that already have real packs with a settled
+   * write pattern. hotel/flower have pack directories but unmeasured volumes, so
+   * they are deliberately absent — adding one later is its own release, which is
+   * a reversible step.
+   */
+  static readonly DOMAIN_KEYS: ReadonlyArray<{ key: string; domain: string }> = [
+    { key: "instrument", domain: "invest" },
+    { key: "party", domain: "lex" },
+    { key: "case_no", domain: "lex" },
+    { key: "supplier", domain: "erp" },
+    { key: "sku", domain: "erp" },
+  ];
+
+  /**
+   * The two halves of the domain vocabulary must not drift: `policy.ts` validates
+   * a declaration against its copy without importing SQLite, and this table
+   * decides which keys are actually indexed. A key accepted by one and unknown to
+   * the other would be a declaration that resolves and never participates in
+   * recall — the failure mode this whole change exists to remove.
+   *
+   * Checked at module load, not in a test, because both halves are frozen data
+   * and the cost is one comparison per process.
+   */
+  static {
+    const indexed = RootDb.DOMAIN_KEYS.map((d) => d.key).sort();
+    const declarable = [...DOMAIN_KEY_VOCABULARY].sort();
+    if (JSON.stringify(indexed) !== JSON.stringify(declarable)) {
+      throw new Error(
+        `domain vocabulary drift: db.ts indexes ${JSON.stringify(indexed)} but policy.ts accepts ${JSON.stringify(declarable)}`,
+      );
+    }
+  }
+
+  /** Is this metadata key a domain key? Unknown keys are ordinary metadata. */
+  static isDomainKey(key: string): boolean {
+    return RootDb.DOMAIN_KEYS.some((d) => d.key === key);
+  }
+
+  /** The domain a key belongs to, or null when the key is not in the vocabulary. */
+  static domainOfKey(key: string): string | null {
+    return RootDb.DOMAIN_KEYS.find((d) => d.key === key)?.domain ?? null;
+  }
+
+  /**
+   * Index name for a domain key, in one place because three callers need to
+   * agree on it: the migration that creates it, the test that asserts the query
+   * plan uses it, and any diagnostic that checks it exists.
+   */
+  domainIndexName(key: string): string {
+    return `pages_domain_${key.replace(/[^a-z0-9_]/gi, "_")}`;
+  }
+
+  /**
+   * Which domain does this metadata belong to, and which of that domain's keys
+   * is it missing? (add-domain-memory-schema)
+   *
+   * The service does not know which domain a session is in — nothing in the
+   * request says "this is the investing team". So the hint is driven by what the
+   * caller DID send: the moment metadata carries any key from a domain, that is
+   * evidence of intent, and the useful thing to say is which companion keys of
+   * the same domain are absent.
+   *
+   * Ordering matters: DOMAIN_KEYS lists `party` before `case_no`, so a legal
+   * page that carries both is matched on `party` and told only that `case_no`
+   * is missing — one hint at a time, not a list of everything it could also
+   * have carried.
+   *
+   * Returns null when no domain key is present at all: an ordinary note has no
+   * domain and must not be nagged about one.
+   */
+  /**
+   * Which domain keys actually carry this value? (add-domain-memory-schema)
+   *
+   * Why a reverse lookup and not "remember the key name": the whole point of a
+   * domain vocabulary is that a reader asks "what do we have on this thing", not
+   * "what is the metadata key for instruments". Forcing the caller to know that
+   * it is spelled `instrument` (and not `ticker`/`symbol`/`code`) rebuilds the
+   * free-text taxonomy problem one level down.
+   *
+   * Returns one entry per vocabulary key that has at least one row with this
+   * exact value, so a value that happens to be both a party and a case number
+   * reports both instead of silently picking one.
+   *
+   * Counts come from the same expression indexes the recall uses, so this is a
+   * cheap probe, not a scan.
+   */
+  domainKeysForValue(value: string, projects: string[] | null): Array<{ key: string; domain: string; count: number }> {
+    const out: Array<{ key: string; domain: string; count: number }> = [];
+    // projectFilterSql returns a clause that BEGINS with " AND " (it is built to
+    // be appended to "WHERE 1=1"), and an empty string when unscoped. Anchoring
+    // on `WHERE 1=1` keeps both cases valid — appending it to a bare `WHERE`
+    // produced `WHERE  AND ...`, which is a syntax error, not an empty result.
+    const proj = projectFilterSql(projects, "project");
+    for (const { key, domain } of RootDb.DOMAIN_KEYS) {
+      const path = `'$."${key.replace(/"/g, '""')}"'`;
+      const row = this.db
+        .prepare(`SELECT COUNT(*) AS n FROM pages WHERE 1=1${proj.clause} AND json_extract(metadata, ${path}) = ?`)
+        .get(...(proj.args as never[]), bindable(value)) as { n: number } | undefined;
+      const n = Number(row?.n ?? 0);
+      if (n > 0) out.push({ key, domain, count: n });
+    }
+    return out;
+  }
+
+  /**
+   * How often is each domain key actually filled in? (add-domain-memory-schema)
+   *
+   * Why this exists: the write-side hint is a REPORT, not a gate — the storage
+   * layer never undoes a write for a missing metadata key. A hint nobody can see
+   * is indistinguishable from no schema at all, so the missing half is made
+   * measurable here instead of being left to good intentions.
+   *
+   * Denominator is PER DOMAIN, not the whole table. A domain at 100% and another
+   * at 0%, averaged together, reads as "50%, not great" — which hides both the
+   * team that has adopted it and the one that has never used it. Those are
+   * different problems and must not collapse into one number.
+   */
+  domainFillRates(): Array<{ key: string; domain: string; project: string; filled: number; total: number; rate: number }> {
+    // Grouped by (project, domain), not domain alone (2026-11-21).
+    //
+    // The denominator is "rows carrying ANY key of this domain", which keeps an
+    // unrelated note from dragging `case_no` toward 0% forever. But that same
+    // definition makes a project that uses NO domain key contribute nothing at
+    // all — measured: a project with 100 memories and zero vocabulary coverage
+    // plus a project with 2 memories and full coverage reported 100%, i.e. "the
+    // vocabulary is doing great" while the busiest project had adopted none of
+    // it. That is the exact confusion the spec forbids between domains, one
+    // level over.
+    //
+    // Per project, the honest total is "every page in that project", because the
+    // question being asked is "of this project's memories, how many carry the
+    // key" — not "of the ones that already carry a key, how many carry this
+    // one". The zero-adoption project therefore reports 0/N rather than
+    // vanishing.
+    const out: Array<{ key: string; domain: string; project: string; filled: number; total: number; rate: number }> = [];
+    const domains = [...new Set(RootDb.DOMAIN_KEYS.map((d) => d.domain))];
+    const projects = (this.db.prepare("SELECT DISTINCT project FROM pages").all() as Array<{ project: string }>)
+      .map((r) => r.project);
+    for (const project of projects) {
+      const projTotal = Number((this.db.prepare("SELECT COUNT(*) AS n FROM pages WHERE project=?").get(project) as { n: number }).n);
+      for (const domain of domains) {
+        for (const { key } of RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain)) {
+          const path = `'$."${key.replace(/"/g, '""')}"'`;
+          const filled = Number((this.db
+            .prepare(`SELECT COUNT(*) AS n FROM pages WHERE project=? AND json_extract(metadata, ${path}) IS NOT NULL`)
+            .get(project) as { n: number }).n);
+          out.push({ key, domain, project, filled, total: projTotal, rate: projTotal > 0 ? filled / projTotal : 0 });
+        }
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The domain key this project's chain actually declares, or null.
+   *
+   * This is the consumer that makes `schema.key_by` an EXECUTED sub-key rather
+   * than a declared-and-ignored one: the write face asks here instead of inferring
+   * the domain from whatever metadata the caller happened to send. Resolved
+   * through the same project → root chain the process axis uses, so a pack-level
+   * declaration reaches its members without every member restating it.
+   */
+  declaredDomainKey(project: string): string | null {
+    const level = this.getMemoryPolicy(project);
+    const root = this.getMemoryPolicy("root");
+    const value = level.key_by ?? root.key_by;
+    if (typeof value !== "string" || !RootDb.isDomainKey(value)) return null;
+    return value;
+  }
+
+  domainHintFor(meta: Record<string, unknown> | null | undefined, declaredKey?: string | null): { domain: string; present: string[]; missing: string[] } | null {
+    // A declared `schema.key_by` says which key this root files under, so the
+    // hint stops guessing from whatever the caller happened to include
+    // (add-memory-schema-axis). Without a declaration the previous behaviour
+    // stands exactly: infer the domain from the first vocabulary key present.
+    if (declaredKey) {
+      const domain = RootDb.domainOfKey(declaredKey);
+      if (domain) {
+        const present = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain && meta && d.key in meta).map((d) => d.key);
+        const missing = RootDb.DOMAIN_KEYS.filter((d) => d.domain === domain && !present.includes(d.key)).map((d) => d.key);
+        return { domain, present, missing };
+      }
+      // An unrecognised declaration (a hand-edited row, an older vocabulary) must
+      // not be silently treated as "no declaration": that would make the hint
+      // describe a different domain than the one in force. Fall through to the
+      // inference path and let the read face name the bad value.
+    }
+    if (!meta) return null;
+    const present: string[] = [];
+    for (const { key } of RootDb.DOMAIN_KEYS) if (key in meta) present.push(key);
+    if (present.length === 0) return null;
+    // Attribute the page to the domain of the FIRST vocabulary key it carries —
+    // vocabulary order, not metadata key order, so the answer does not depend on
+    // how the caller happened to order its JSON.
+    const domain = RootDb.domainOfKey(present[0])!;
+    const missing = RootDb.DOMAIN_KEYS
+      .filter((d) => d.domain === domain && !present.includes(d.key))
+      .map((d) => d.key);
+    return { domain, present, missing };
+  }
+
   constructor(readonly dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
+    // busy_timeout FIRST, before any statement that could need a write lock.
+    // Measured 2026-11-15: with 30 independent processes opening this database
+    // simultaneously, migrate() failed with SQLITE_BUSY and StoreRoot
+    // construction threw — so the session could not even start. The default
+    // (and node:sqlite's) timeout is far too short for multi-process use.
+    this.db.exec("PRAGMA busy_timeout = 15000");
+    // WAL + NORMAL（2026-11-18 事故）：默认是 journal_mode=delete +
+    // synchronous=FULL，每次写事务都要建/删 journal 文件并等磁盘物理落盘。
+    // 库涨到 87MB 后，蒸馏写 page 时这个同步提交能把 Node 的事件循环彻底堵死
+    // —— 实测 healthz 连续超时、进程 CPU 0.5%/RSS 16MB 不忙，sample 停在
+    // sqlite3_step→vdbeCommit→pager_end_transaction→pcache1Truncate。
+    //
+    // WAL 把写从主库解耦（读不阻塞写、写不阻塞读），NORMAL 只保证 WAL 落盘
+    // 而不再每次 fsync 主库——对「单机、进程崩溃可能丢最后几个事务但不会损坏
+    // 库」这个场景是正确取舍。WAL 不能用于网络文件系统；本库固定在本机
+    // Application Support 下，符合前提。
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA synchronous = NORMAL");
+    // NOT setting cache_size/mmap_size here (2026-11-18, tried and reverted).
+    // Hypothesis was that SQLite's default 2MB page cache explained the
+    // "first healthz after a while takes 24s, then 38ms" shape. Measured it:
+    // running the same FTS query with and without `cache_size=-16000` +
+    // `mmap_size=128MB` gave 0.01–0.03s both ways — no difference outside the
+    // noise. The cold read is the OS evicting pages (30% free memory, the
+    // 2961M compressor was active), not SQLite's buffer pool. Left here as a
+    // recorded negative result so the next person does not try it again.
     this.migrate();
   }
 
@@ -124,7 +403,23 @@ export class RootDb {
     return new Set(rows.map((r) => r.name));
   }
 
+  /**
+   * Run the schema migration at most once per database version.
+   *
+   * Why the version gate: migrate() used to run on EVERY construction, issuing
+   * a pile of CREATE TABLE / DELETE statements. That is a write transaction on
+   * open, which is fine for one process and fatal for thirty — every session
+   * start competed for the write lock. The schema only needs building once, so
+   * we record that in a tiny metadata table and skip the rest on subsequent
+   * opens.
+   */
   private migrate(): void {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+    const row = this.db
+      .prepare("SELECT value FROM schema_meta WHERE key = 'version'")
+      .get() as { value?: string } | undefined;
+    if (row?.value && Number(row.value) >= RootDb.SCHEMA_VERSION) return;
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS pages (
         path TEXT PRIMARY KEY, project TEXT, type TEXT, title TEXT, body TEXT, updated_at TEXT,
@@ -162,8 +457,17 @@ export class RootDb {
       -- page, so "is this page still alive" is an index probe instead of a
       -- JSON parse of every page on every read. Derived data: rebuilt by
       -- reindex, droppable, never the truth (the truth stays in frontmatter).
+      --
+      -- Composite key (2026-11-20). superseded_id is a page_id = the file
+      -- basename, which is only unique WITHIN a project. With it as the sole
+      -- PRIMARY KEY, the same basename in two projects collided and the second
+      -- edge silently replaced the first — measured: a page superseded in
+      -- project beta ended up un-retired because project alpha had already
+      -- claimed that id. The read face filters by project, so the orphaned
+      -- project never matched an edge and kept injecting the retired page.
       CREATE TABLE IF NOT EXISTS superseded_edges (
-        superseded_id TEXT PRIMARY KEY, by_path TEXT NOT NULL, project TEXT
+        superseded_id TEXT NOT NULL, by_path TEXT NOT NULL, project TEXT NOT NULL,
+        PRIMARY KEY (superseded_id, project)
       );
       CREATE INDEX IF NOT EXISTS superseded_edges_by ON superseded_edges(by_path);
       CREATE TABLE IF NOT EXISTS tier_proposals (
@@ -173,6 +477,30 @@ export class RootDb {
         accepted_at TEXT, ignored_at TEXT,
         PRIMARY KEY (project, page_rel)
       );
+      -- Cross-root read grants (batch 3 task 3.1/3.3 of
+      -- memory-integration-with-product-lines).
+      --
+      -- Lives in the TARGET root's own database, not in a global table: the grant
+      -- "root X may read my shared pages" is a statement the owner of this root
+      -- makes about their own data. A global table would let one root's row be
+      -- read as another's permission.
+      --
+      -- Explicit by construction. There is no way to derive a grant from a name,
+      -- a path, or any string: d-u-chengsishi containing chengsishi is a
+      -- coincidence of naming, not a permission.
+      CREATE TABLE IF NOT EXISTS share_grants (
+        reader_root TEXT PRIMARY KEY, granted_at TEXT NOT NULL, note TEXT NOT NULL DEFAULT ''
+      );
+      -- Who read what, for cross-root reads (batch 4 task 4.3).
+      --
+      -- Separate from oversight_reads, which records the OWNER poking at their
+      -- own data. This one answers a different question and would be misread in
+      -- that table: which other roots read my shared pages, and when. It lives
+      -- in the owner's database because that is where the owner will look for it.
+      CREATE TABLE IF NOT EXISTS share_reads (
+        ts TEXT NOT NULL, reader_root TEXT NOT NULL, page_rel TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS share_reads_ts ON share_reads(ts);
       CREATE TABLE IF NOT EXISTS distill_state (
         project TEXT PRIMARY KEY, obs_cursor INTEGER NOT NULL DEFAULT 0,
         handoff_cursor TEXT NOT NULL DEFAULT '', note_cursor TEXT NOT NULL DEFAULT '',
@@ -232,6 +560,42 @@ export class RootDb {
     if (!pageCols.has("source_ref")) {
       this.db.exec("ALTER TABLE pages ADD COLUMN source_ref TEXT");
     }
+    // Usage signals (memory-integration-with-product-lines, batch 1).
+    //
+    // Two counters and one denominator, on purpose:
+    //   retrieved_n        — how many times memory_query RETURNED this page to a
+    //                        caller. Matching in SQL does not count; use does.
+    //   injected_n         — how many times the injection face picked it.
+    //   injected_seen_n    — how many candidates that batch had in total.
+    //
+    // The last column exists because injection sees 50 of 10,049 candidates
+    // (measured 2026-11-22, 0.5%). Without the denominator, "was injected" is
+    // just "was lucky", and a page written today would outrank a page written
+    // three months ago purely by arriving into a smaller pool.
+    if (!pageCols.has("retrieved_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN retrieved_n INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!pageCols.has("injected_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN injected_n INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!pageCols.has("injected_seen_n")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN injected_seen_n INTEGER NOT NULL DEFAULT 0");
+    }
+    // Cross-root sharing marker (batch 3 task 3.2 of
+    // memory-integration-with-product-lines).
+    //
+    // Default 0 = not shared, which keeps today's behaviour byte-identical: the
+    // spec has always said "no cross-root read/write without explicit
+    // authorization", so the column starts closed and only a person's explicit
+    // act opens it.
+    //
+    // A separate column rather than reusing `tier='stable'`: "published" and
+    // "shareable outward" are different decisions. A conclusion can be settled
+    // (stable) and still be nobody else's business — personal, embarrassing, or
+    // simply irrelevant to any deployment.
+    if (!pageCols.has("shared_at")) {
+      this.db.exec("ALTER TABLE pages ADD COLUMN shared_at TEXT");
+    }
     // Structured metadata (add-agent-memory-foundation): one JSON column —
     // the markdown frontmatter is the truth, this is the filterable mirror.
     // Expression indexes cover the two high-frequency keys; other keys stay
@@ -264,15 +628,97 @@ export class RootDb {
       this.db.exec("ALTER TABLE pages ADD COLUMN page_id TEXT");
       this.db.exec("CREATE INDEX IF NOT EXISTS pages_page_id ON pages(page_id)");
     }
+    // Read-face covering index (2026-11-18). Every hot read is
+    // `WHERE project=? AND type=? ORDER BY updated_at DESC LIMIT n`
+    // (recentNotes/queryNotes/referenceFor/notesAfter). Without an index that
+    // is `SCAN pages` + `USE TEMP B-TREE FOR ORDER BY` over ~20k rows whose
+    // body column totals ~8MB — measured cold 0.29s vs 0.01s with the index,
+    // and the scan runs synchronously on the server's event loop, so it is
+    // exactly the `Statement::All → readDbPage → pread` stall that made
+    // /healthz time out for minutes (sample, 2026-11-18). The row counts make
+    // the waste obvious: `note` is 55 rows, `observation` is 17,948 — the old
+    // plan earned its 55 by reading all 20,733.
+    // IF NOT EXISTS unconditionally (not inside a column-added branch): the
+    // database this matters for already has every column, so a migration
+    // gated on "column missing" would never run there.
+    this.db.exec("CREATE INDEX IF NOT EXISTS pages_proj_type_updated ON pages(project, type, updated_at DESC)");
     const nullIds = this.db.prepare("SELECT path FROM pages WHERE page_id IS NULL").all() as Array<{ path: string }>;
     if (nullIds.length > 0) {
       const upd = this.db.prepare("UPDATE pages SET page_id=? WHERE path=?");
       for (const row of nullIds) upd.run(this.idOfPath(row.path), row.path);
     }
+    // Supersede edge table must key on (id, project), not id alone (2026-11-20).
+    // `CREATE TABLE IF NOT EXISTS` cannot change an existing table, and this
+    // database already has the single-column version — so migrate explicitly.
+    // Detected by inspecting the primary key rather than by schema version, so
+    // it also repairs a database whose version marker is already current.
+    const edgePk = this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='superseded_edges'").get() as { sql?: string } | undefined;
+    if (edgePk?.sql && /superseded_id\s+TEXT\s+PRIMARY KEY/i.test(edgePk.sql)) {
+      this.db.exec("ALTER TABLE superseded_edges RENAME TO superseded_edges_old");
+      this.db.exec(`CREATE TABLE superseded_edges (
+        superseded_id TEXT NOT NULL, by_path TEXT NOT NULL, project TEXT NOT NULL,
+        PRIMARY KEY (superseded_id, project)
+      )`);
+      this.db.exec(`INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project)
+                    SELECT superseded_id, by_path, COALESCE(project, 'default') FROM superseded_edges_old`);
+      this.db.exec("DROP TABLE superseded_edges_old");
+      this.db.exec("CREATE INDEX IF NOT EXISTS superseded_edges_by ON superseded_edges(by_path)");
+      this.rebuildSupersedeEdges();
+    }
     // Edge backfill runs only when the table is empty but pages already carry
     // supersede lists — a one-time catch-up for roots that predate the table.
     const edgeCount = this.db.prepare("SELECT COUNT(*) AS n FROM superseded_edges").get() as { n: number };
     if (Number(edgeCount.n) === 0) this.rebuildSupersedeEdges();
+
+    // Domain-key indexes (add-domain-memory-schema).
+    //
+    // UNCONDITIONAL on purpose. The two older metadata indexes above sit inside
+    // `if (!pageCols.has("metadata"))`, which means they never run on any
+    // database that already has the column — every live one. They exist here
+    // only because some earlier path happened to create them; a fresh open of an
+    // already-migrated root silently skips that block. Index creation for the
+    // domain vocabulary must not inherit that shape: if a key is in the
+    // vocabulary, its index has to exist, and "the column was added long ago" is
+    // not a reason to skip.
+    //
+    // Measured basis (see design D1): with an expression index the same
+    // metadata-equality recall is 0.00ms and plans as `SEARCH ... USING INDEX`;
+    // without one it is 31.3ms median / 127.3ms p95 because every row in the
+    // project pays a json_extract. 1,112ms to build one on 67k rows, so five
+    // keys is ~6s, once.
+    for (const { key } of RootDb.DOMAIN_KEYS) {
+      // The key comes from the constant above, never from input — but quote it
+      // the way SQLite expects so a future key with an unusual character cannot
+      // turn into a syntax error at migration time.
+      //
+      // COMPOSITE (project, <expr>), not (<expr>) alone. Every real recall is
+      // scoped to a project — a bare key index is never chosen while `project=?`
+      // is present, and the planner falls back to pages_proj_type_updated and
+      // pays a json_extract per row. Measured on a probe table: `(expr)` alone
+      // with `project=?` plans as `SEARCH ... USING INDEX pages_proj_type_updated
+      // (project=?)`, i.e. the new index was built and completely ignored. This
+      // mirrors pages_proj_type_updated, which also leads with project.
+      const path = `'$."${key.replace(/"/g, '""')}"'`;
+      this.db.exec(`CREATE INDEX IF NOT EXISTS ${this.domainIndexName(key)} ON pages(project, json_extract(metadata, ${path}))`);
+    }
+    // Give the planner statistics for the indexes above (add-domain-memory-schema).
+    //
+    // Measured: without stats, a domain index on a key that is still mostly NULL
+    // is simply not chosen — the planner prefers pages_proj_type_updated (or a
+    // plain scan) and pays a json_extract per candidate row. `INDEXED BY` proves
+    // the index CAN serve the shape, so this is a costing problem, not a
+    // definition problem. ANALYZE is what lets the planner cost it correctly
+    // once real values start landing.
+    //
+    // Best-effort: a failure here degrades recall speed, never correctness, and
+    // must not abort a migration that already created the indexes.
+    try { this.db.exec("ANALYZE"); } catch { /* stats are an optimisation */ }
+
+    // Record the version so the next open skips this whole write path. Done
+    // last: a half-finished migration must not be marked complete.
+    this.db
+      .prepare("INSERT INTO schema_meta (key, value) VALUES ('version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(String(RootDb.SCHEMA_VERSION));
   }
 
   // A page id is the file basename without the extension — the vocabulary
@@ -314,6 +760,29 @@ export class RootDb {
     return { pages_with_supersedes: rows.length, distinct_targets: targets.size, edges, ok: edges === targets.size };
   }
 
+  /**
+   * Every vocabulary key must have its index (add-domain-memory-schema).
+   *
+   * The spec forbids the intermediate state "key is in the vocabulary, index is
+   * not" — but the migration creates indexes unconditionally, so nothing
+   * actually CHECKS that the two stayed in step. A future key added to
+   * DOMAIN_KEYS without the migration running (a stale dist, a hand-edited
+   * database, a migration that threw halfway) would leave a key that recalls
+   * by full scan and nothing would say so.
+   *
+   * Returns the keys whose index is missing, so a caller can fail loudly the way
+   * supersedeEdgeAudit does, rather than serving a silently-slow read face.
+   */
+  domainIndexAudit(): { expected: string[]; missing: string[]; ok: boolean } {
+    const expected = RootDb.DOMAIN_KEYS.map((d) => this.domainIndexName(d.key));
+    const present = new Set(
+      (this.db.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>)
+        .map((r) => r.name),
+    );
+    const missing = expected.filter((n) => !present.has(n));
+    return { expected, missing, ok: missing.length === 0 };
+  }
+
   close(): void {
     this.db.close();
   }
@@ -327,6 +796,11 @@ export class RootDb {
     const tier = meta?.tier ?? "draft";
     const sourceRef = meta?.source_ref ?? null;
     const metadata = meta?.metadata && Object.keys(meta.metadata).length > 0 ? JSON.stringify(meta.metadata) : null;
+    // Read this BEFORE the upsert below: after it, `pages` always holds the
+    // path and the "was this an overwrite?" question is unanswerable. Drives
+    // whether the FTS row has to be retired first (see the FTS block at the
+    // end of this method).
+    const existedBefore = this.db.prepare("SELECT 1 FROM pages WHERE path=?").get(relPath) !== undefined;
     this.db.prepare(
       `INSERT INTO pages (path, project, type, title, body, updated_at, sources, supersedes, tags, tier, source_ref, metadata, page_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(path) DO UPDATE SET project=excluded.project, type=excluded.type,
@@ -340,7 +814,38 @@ export class RootDb {
     this.db.prepare("DELETE FROM superseded_edges WHERE by_path=?").run(relPath);
     const insEdge = this.db.prepare("INSERT OR IGNORE INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)");
     for (const id of (meta?.supersedes ?? [])) if (id) insEdge.run(String(id), relPath, project);
-    this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
+    // FTS row replacement (2026-11-19). This used to be an unconditional
+    // `DELETE FROM pages_fts WHERE path=?`. `path` is an fts5 UNINDEXED column,
+    // so that DELETE compiles to `SCAN pages_fts VIRTUAL TABLE INDEX 0:` — a
+    // full scan of every indexed row, on EVERY page write, whether or not the
+    // path was ever there. Measured on the live 48k-row index: 18–22ms median,
+    // p95 over 100ms, versus 0.2ms for the INSERT it guards. Since 88% of write
+    // volume is observations whose slug is `randomUUID().slice(0,8)` (physically
+    // unrepeatable), the scan almost never found anything to delete.
+    //
+    // Fix: read the pre-upsert existence from `pages` (a real PRIMARY KEY
+    // lookup, 0.002ms) and only pay for the DELETE when this path was already
+    // indexed. The probe must happen BEFORE the pages upsert above, because
+    // after it the row always exists.
+    //
+    // Measured on a copy of the live DB: 22.36ms -> 0.06ms median, p95
+    // 108.5ms -> 0.45ms. Deliberately NOT the rowid trick: `pages` and
+    // `pages_fts` are independent rowid sequences — only 2,906 of 48k rows
+    // share both rowid AND path, so deleting by rowid would target the wrong
+    // document.
+    //
+    // Known ceiling: this trades a full scan for a PK lookup, which is only
+    // sound while `pages` is the authority for "is this path indexed?" — an
+    // FTS row with no matching `pages` row would now survive and gain a
+    // sibling instead of being replaced. That state is unreachable by
+    // construction (every writer touches `pages` first, and both
+    // deletePageIndex and reindexFromWiki drop FTS alongside pages) and
+    // measured 0 rows on the live index. If it ever appears, the fix is to
+    // convert pages_fts to an external-content table over `pages` and use
+    // FTS5's 'delete' command with the OLD row values — that is O(log n) and
+    // authoritative. Upgrading to that here would mean a schema migration for
+    // a case that cannot currently occur.
+    if (existedBefore) this.db.prepare("DELETE FROM pages_fts WHERE path=?").run(relPath);
     this.db.prepare("INSERT INTO pages_fts (title, body, path, project, updated_at) VALUES (?,?,?,?,?)")
       .run(title ?? "", body ?? "", relPath, project, new Date().toISOString());
   }
@@ -355,6 +860,63 @@ export class RootDb {
     this.db.prepare("DELETE FROM superseded_edges WHERE superseded_id=?").run(id);
   }
 
+  /**
+   * Pages written by an importer, keyed by the provenance label the importer
+   * stamped into frontmatter metadata (`import:<harness>`).
+   *
+   * Why the label and not a directory: every import lands in the ordinary
+   * `notes/` tree alongside captured pages, so there is no directory to
+   * enumerate. The label is the only thing that survives into the index.
+   */
+  pagesByMetadataSource(labels: string[]): Array<{ path: string; project: string }> {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return this.db
+      .prepare(`SELECT path, project FROM pages WHERE json_extract(metadata,'$.source') IN (${ph})`)
+      .all(...labels) as unknown as Array<{ path: string; project: string }>;
+  }
+
+  /**
+   * Drop observation rows written by the given agent labels.
+   *
+   * This is the INDEX half of a retract; the append-only log keeps the rows and
+   * that is deliberate — `replayObservationsFromLog` honours the retract marker
+   * written *before* this runs, so a rebuild reproduces the same visible set
+   * instead of resurrecting what the user asked to withdraw.
+   */
+  deleteObservationsByAgent(labels: string[], project?: string): number {
+    if (labels.length === 0) return 0;
+    const ph = labels.map(() => "?").join(",");
+    const r = project
+      ? this.db.prepare(`DELETE FROM observations WHERE agent IN (${ph}) AND project=?`).run(...labels, project)
+      : this.db.prepare(`DELETE FROM observations WHERE agent IN (${ph})`).run(...labels);
+    return Number(r.changes ?? 0);
+  }
+
+  /** Projects that still hold observations from these import labels. */
+  projectsForAgentLabels(labels: string[]): string[] {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return (this.db
+      .prepare(`SELECT DISTINCT project FROM observations WHERE agent IN (${ph})`)
+      .all(...labels) as unknown as Array<{ project: string }>).map((r) => r.project);
+  }
+
+  /**
+   * The rows a retract is about to withdraw, by agent label and project.
+   *
+   * Returns idENTITY (session_id + summary), never rowid: the marker the retract
+   * writes has to keep working after this index is thrown away, and rowids are
+   * rebuild artifacts.
+   */
+  observationsForAgentLabels(labels: string[], project: string): ObservationRow[] {
+    if (labels.length === 0) return [];
+    const ph = labels.map(() => "?").join(",");
+    return this.db
+      .prepare(`SELECT session_id, agent, event, tool, summary, created_at, project FROM observations WHERE agent IN (${ph}) AND project=? ORDER BY id`)
+      .all(...labels, project) as unknown as ObservationRow[];
+  }
+
   searchPages(query: string, limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; snippet: string; project: string; type: string; sources: string; metadata?: string | null; _total?: number }> {
     const pf = projectFilterSql(projects, "p.project");
     // mf is the FULL page predicate (project + time + type + metadata) built
@@ -367,17 +929,44 @@ export class RootDb {
     const hasPageOnlyFilter = Boolean(filter && (filter.metadata || filter.since || filter.until || filter.types?.length));
     const fts = (() => {
       try {
+        // `snippet()` and a window function cannot appear in the same statement:
+        // SQLite rejects it with "unable to use function snippet in the requested
+        // context". Measured 2026-11-22 — the combination threw on EVERY query,
+        // `catch` swallowed it, and searchPages silently fell through to the LIKE
+        // branch. Result: `memory_query` never used the FTS index at all and every
+        // search cost ~2s (a full scan of 89k pages' bodies) while still returning
+        // plausible answers, so nothing looked broken.
+        //
+        // `_total` therefore comes from its own statement below. Two queries is
+        // cheaper than one broken one: the count reuses the same MATCH and needs
+        // no snippet.
         return this.db
           .prepare(
-            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snip, COUNT(*) OVER () AS _total
+            `SELECT p.path AS path, p.title AS title, p.project AS project, p.type AS type, p.sources AS sources, p.metadata AS metadata, snippet(pages_fts, 1, '[', ']', '…', 12) AS snippet
              FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
              WHERE pages_fts MATCH ?${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY rank LIMIT ?`,
           )
-          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>;
+          .all(this.ftsQuery(query), ...mf.args, limit) as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }>;
       } catch {
         return [];
       }
     })();
+    // True match count for the FTS leg (the window-function trick is unavailable
+    // alongside `snippet`, see above). Only computed when the FTS leg produced
+    // rows — otherwise the LIKE fallback owns the count.
+    let ftsTotal = 0;
+    if (fts.length > 0) {
+      try {
+        ftsTotal = Number((this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM pages_fts f JOIN pages p ON p.rowid = f.rowid
+             WHERE pages_fts MATCH ?${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)}`,
+          )
+          .get(this.ftsQuery(query), ...mf.args) as { c: number }).c);
+      } catch {
+        ftsTotal = fts.length;
+      }
+    }
     let rows: Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string }> = fts;
     if (rows.length === 0) {
       // trigram needs >=3 chars; fall back to LIKE for shorter queries
@@ -391,10 +980,17 @@ export class RootDb {
           .all(query, `%${query}%`, `%${query}%`, ...pfq.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
       );
     }
-    const pagesTotal = rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
+    // FTS rows carry no `_total` (see the comment above the query); the LIKE
+    // fallback still uses the window function, which is legal there because it
+    // has no `snippet()` in the projection.
+    const pagesTotal = fts.length > 0
+      ? ftsTotal
+      : rows.length ? Number((rows[0] as { _total?: number })._total ?? rows.length) : 0;
     if (hasPageOnlyFilter) {
       if (meta) meta.total = pagesTotal;
-      return rows.slice(0, limit);
+      const out = rows.slice(0, limit);
+      this.notePagesRetrieved(out.map((r) => String((r as { path: string }).path)));
+      return out;
     }
     // observations join the search face (spec: manager-captured observations
     // are searchable) — LIKE scan at v1 scale, FTS promotion later. The
@@ -411,7 +1007,25 @@ export class RootDb {
         .all(query, `%${query}%`, `%${query}%`, ...pfo.args) as unknown as Array<{ path: string; title: string; project: string; type: string; sources: string; metadata: string | null; snippet: string; _total: number }>
     );
     if (meta) meta.total = pagesTotal + (obs.length ? Number(obs[0]._total ?? obs.length) : 0);
-    return [...rows, ...obs].slice(0, limit);
+
+    // 真结论优先于工具流水（2026-11-16 实测）：观测页是 hook 自动抓的
+    // `tool_call Bash: kubectl …`，它们数量多、正文短、词频高，在纯相关度
+    // 排序下会盖过 note（提炼过的结论）。调用方问「权限」要的是「读权限
+    // MUST NOT 覆盖写与拍板」这类判据，不是某次 kubectl 的输出。
+    //
+    // 排序规则：note 页在前（保持各自内部的相关度次序），observation 在后。
+    // 不做成硬过滤——观测仍是合法证据，只是不该排第一。
+    const isNote = (t: string) => t !== "observation";
+    const pageNotes = rows.filter((r) => isNote(r.type));
+    const pageObs = rows.filter((r) => !isNote(r.type));
+    const out = [...pageNotes, ...pageObs, ...obs].slice(0, limit);
+    // Count only what actually survived the merge+slice AND lives in `pages`.
+    // The observation leg is a synthesized path (`project/session/event`) with no
+    // row in `pages`, so bumping it would silently do nothing — and counting the
+    // whole `rows` before the slice would credit pages the caller never saw.
+    const pagePaths = new Set(rows.map((r) => String((r as { path: string }).path)));
+    this.notePagesRetrieved(out.map((r) => String((r as { path: string }).path)).filter((p) => pagePaths.has(p)));
+    return out;
   }
 
   // Alive predicate (optimize-yongyi-read-surfaces 3.3): one definition of
@@ -426,7 +1040,106 @@ export class RootDb {
     return `"${q.replace(/"/g, '""')}"`;
   }
 
-  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
+  /**
+   * Record that these pages were actually handed to a caller (batch 1 of
+   * memory-integration-with-product-lines).
+   *
+   * "Returned", not "matched": a row the SQL touched but the caller never saw is
+   * not a use. Callers pass the final result array, which is exactly the set the
+   * caller received.
+   *
+   * Best-effort and never throws — a counter is a companion record; it must not
+   * be able to fail the search it describes.
+   */
+  notePagesRetrieved(paths: string[]): void {
+    if (paths.length === 0) return;
+    try {
+      const stmt = this.db.prepare("UPDATE pages SET retrieved_n = retrieved_n + 1 WHERE path = ?");
+      this.db.exec("BEGIN");
+      try {
+        for (const p of paths) stmt.run(p);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* usage counters are advisory; a failed bump must not break the read */
+    }
+  }
+
+  /**
+   * Injection half of the usage signal (batch 1 of
+   * memory-integration-with-product-lines).
+   *
+   * Keyed by `page_id`, not `path`, because that is what the injection query
+   * already selects (`COALESCE(page_id, path)`) and injection rows do not carry
+   * a stable path. Both columns live on `pages`, so the UPDATE is equally cheap.
+   *
+   * `poolSize` is the candidate count that batch competed in. The per-page
+   * counters only become comparable across time when the denominator is stored
+   * alongside them — see the schema comment.
+   *
+   * Best-effort: never throws.
+   */
+  notePagesInjected(pageIds: string[], poolSize: number): void {
+    const ids = pageIds.filter(Boolean);
+    if (ids.length === 0) return;
+    try {
+      const stmt = this.db.prepare(
+        "UPDATE pages SET injected_n = injected_n + 1, injected_seen_n = injected_seen_n + ? WHERE page_id = ?",
+      );
+      this.db.exec("BEGIN");
+      try {
+        for (const id of ids) stmt.run(poolSize, id);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* advisory */
+    }
+  }
+
+  /**
+   * Usage-signal distribution for the operator (batch 1 tasks 1.4/1.5).
+   *
+   * Reports both halves separately on purpose. Retrieval is sparse and
+   * unbiased; injection is dense and biased by the 0.5% budget. Reading only
+   * one of them would answer a different question than the operator is asking:
+   *   retrieved_n >= 1   — "how much of the store has ever been used"
+   *   injected_rate      — "of the times it competed, how often was it picked"
+   *
+   * `injected_rate` is null (not 0) when the page never competed — 0/0 is
+   * "never offered", which is a different fact from "offered and always lost".
+   */
+  usageSignalStats(): {
+    total: number;
+    retrieved_at_least_once: number;
+    injected_at_least_once: number;
+    never_touched: number;
+    top_retrieved: Array<{ path: string; retrieved_n: number; injected_rate: number | null }>;
+  } {
+    const total = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages").get() as { c: number }).c);
+    const retrieved = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n > 0").get() as { c: number }).c);
+    const injected = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE injected_n > 0").get() as { c: number }).c);
+    const untouched = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n = 0 AND injected_n = 0").get() as { c: number }).c);
+    const rows = this.db
+      .prepare("SELECT path, retrieved_n, injected_n, injected_seen_n FROM pages WHERE retrieved_n > 0 OR injected_n > 0 ORDER BY retrieved_n DESC, injected_n DESC LIMIT 10")
+      .all() as Array<{ path: string; retrieved_n: number; injected_n: number; injected_seen_n: number }>;
+    const top = rows.map((r) => ({
+      path: r.path,
+      retrieved_n: r.retrieved_n,
+      // Selection RATE, not count: injection admits 50 of ~10k candidates, so a
+      // raw count mostly measures how many batches the page happened to be in.
+      // null when it never competed — 0/0 is "never offered", not "always lost".
+      injected_rate: r.injected_seen_n > 0 ? Number((r.injected_n / r.injected_seen_n).toFixed(4)) : null,
+    }));
+    return { total, retrieved_at_least_once: retrieved, injected_at_least_once: injected, never_touched: untouched, top_retrieved: top };
+  }
+
+  /** Recent pages (see searchPages for the retrieval-counter contract). */  recentPages(limit = 20, projects: string[] | null = null, filter?: PageFilter, meta?: { total?: number }, opts?: { includeSuperseded?: boolean }): Array<{ path: string; title: string; updated_at: string; project: string; type: string; sources: string; supersedes: string; tags: string; tier: string; source_ref: string | null; metadata: string | null; _total?: number }> {
     const mf = pageFilterSql(filter, projects, "f.project", "f.updated_at", "p.type");
     const rows = this.db
       .prepare(`SELECT f.path, f.title, f.updated_at, f.project, p.type, p.sources, p.supersedes, p.tags, p.tier, p.source_ref, p.metadata, COUNT(*) OVER () AS _total FROM pages_fts f JOIN pages p ON p.path = f.path WHERE 1=1${mf.clause}${RootDb.aliveSql("p.", opts?.includeSuperseded)} ORDER BY f.updated_at DESC LIMIT ?`)
@@ -501,7 +1214,16 @@ export class RootDb {
   openHandoffs(projects: string[] | null = null): HandoffRow[] {
     const pf = projectFilterSql(projects, "project");
     return this.db
-      .prepare(`SELECT * FROM handoffs WHERE state='open'${pf.clause} ORDER BY created_at`)
+      // Tie-break on `rowid`, NOT on `id`: handoff ids are randomUUID(), so
+      // ordering by id would make the result deterministic without making it
+      // newest-first — it would just always be wrong in the same way. `rowid`
+      // is SQLite's insertion counter, which is exactly "later is newer".
+      // The tie is real: `created_at` is millisecond ISO text, so anyone opening
+      // several handoffs in one tick (a fleet round, a batch import, a 30-iteration
+      // loop in a test) gets rows whose only declared ordering key is equal, and
+      // SQLite may then return them in any order. Observed 2026-11-18 as a
+      // ~1-in-6 flake in `mcp tools: handoff list is capped, newest-first`.
+      .prepare(`SELECT * FROM handoffs WHERE state='open'${pf.clause} ORDER BY created_at, rowid`)
       .all(...pf.args) as unknown as HandoffRow[];
   }
 
@@ -629,10 +1351,20 @@ export class RootDb {
   // superseded candidates via distillCandidates' active set, but the full-scan
   // vector lane reads page_vectors directly — without this set it resurrects
   // pages a newer distillation already retired.
-  supersededIds(): Set<string> {
+  supersededIds(project?: string): Set<string> {
     // Reads the edge table (optimize-yongyi-read-surfaces 3.4): the old shape
     // parsed every page's supersedes JSON on every call, once per digest.
-    const rows = this.db.prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    //
+    // Project-scoped (2026-11-20). `superseded_id` is a page_id = a basename,
+    // so the SAME id can be retired in one project and perfectly alive in
+    // another. Returning every id in the table made one project's correction
+    // silently delete another project's live conclusion from digest recall —
+    // measured: alpha retiring `old-1` made beta's untouched `old-1` report as
+    // superseded. Callers that span partitions (multi-project recall) pass no
+    // project and keep the union; single-project callers must pass one.
+    const rows = project
+      ? this.db.prepare("SELECT superseded_id FROM superseded_edges WHERE project=?").all(project) as Array<{ superseded_id: string }>
+      : this.db.prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
     const ids = new Set<string>();
     for (const r of rows) if (r.superseded_id) ids.add(r.superseded_id);
     return ids;
@@ -736,6 +1468,265 @@ export class RootDb {
       .prepare("SELECT 1 AS hit FROM tier_proposals WHERE project=? AND page_rel=? AND ignored_at IS NOT NULL AND ignored_at>?")
       .get(project, pageRel, sinceIso) as { hit?: number } | undefined;
     return Boolean(r?.hit);
+  }
+
+  /**
+   * Partition of the pending queue by what the evidence supports (batch 2 of
+   * memory-integration-with-product-lines, tasks 2.1/2.4).
+   *
+   * Three buckets, and the split is the whole design:
+   *
+   *   auto       — the model proposed it AND usage evidence backs it → safe to
+   *                promote without a human. Both halves must hold: the model's
+   *                verdict is made at write time with no hindsight, and usage
+   *                alone cannot tell "often retrieved" from "well keyworded".
+   *   conflict   — the two disagree (proposed but never used, or used a lot but
+   *                never proposed). Deliberately NOT auto-resolved: an
+   *                auto-promoted wrong page leaks into other roots once sharing
+   *                opens, and that costs far more than one page waiting a day.
+   *   no_signal  — proposed, but there is no usage data yet at all. Not a
+   *                conflict; the evidence simply has not accumulated.
+   *
+   * Thresholds come from env and are NOT defaulted to a guess. The right numbers
+   * depend on the real distribution, which only exists after batch 1 has been
+   * running; until then the caller passes what it wants and the default keeps
+   * auto-promotion effectively off (a threshold of 0 would promote everything).
+   */
+  classifyPendingProposals(
+    project: string,
+    opts: { minRetrieved?: number; minInjectedRate?: number; minCited?: number; excludeProcessNotes?: boolean; limit?: number } = {},
+  ): {
+    auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }>;
+    conflict: Array<{ page_rel: string; reason: string; why: string }>;
+    no_signal: Array<{ page_rel: string; reason: string }>;
+  } {
+    // No threshold given → auto-promotion is inert, not "promote everything".
+    // A threshold of 0 would match every page, which is the opposite of what
+    // "we have not measured the distribution yet" should mean.
+    const hasRetrieved = typeof opts.minRetrieved === "number" && Number.isFinite(opts.minRetrieved) && opts.minRetrieved >= 1;
+    const minRetrieved = hasRetrieved ? Number(opts.minRetrieved) : Number.POSITIVE_INFINITY;
+    const minRate = Number(opts.minInjectedRate ?? NaN);
+    // Citation count threshold. Omitted -> Infinity (inert), same discipline as
+    // the other thresholds: "we have not measured the distribution yet" must
+    // mean "promote nothing", never "promote everything".
+    const hasCited = typeof opts.minCited === "number" && Number.isFinite(opts.minCited) && opts.minCited >= 1;
+    const minCited = hasCited ? Number(opts.minCited) : Number.POSITIVE_INFINITY;
+    const rows = this.db
+      .prepare(
+        `SELECT p.page_rel, p.proposed_tier, p.reason, pg.title AS page_title,
+                COALESCE(pg.retrieved_n, 0) AS retrieved_n,
+                COALESCE(pg.injected_n, 0) AS injected_n,
+                COALESCE(pg.injected_seen_n, 0) AS injected_seen_n,
+                -- Downstream signals (2026-11-22). These already exist in the
+                -- data and are the only ones with real spread: how many other
+                -- pages cite this one, and whether a newer page superseded it.
+                -- sources entries look like "session:<path>" (measured
+                -- 2026-11-22). Matching them against page_id never fired: a
+                -- first version compared j.value = page_id and the answer was 0
+                -- for every page while 891 pages actually carry citations. Strip
+                -- the prefix and match on path.
+                (SELECT COUNT(*) FROM pages src
+                  WHERE src.sources IS NOT NULL AND json_valid(src.sources)
+                    AND EXISTS (SELECT 1 FROM json_each(src.sources) j
+                                 WHERE j.value = 'session:' || pg.path
+                                    OR j.value = pg.path
+                                    OR j.value = 'session:' || pg.page_id
+                                    OR j.value = pg.page_id)) AS cited_by,
+                CASE WHEN EXISTS (SELECT 1 FROM superseded_edges e
+                                   WHERE e.superseded_id = pg.page_id) THEN 1 ELSE 0 END AS superseded
+         FROM tier_proposals p JOIN pages pg ON pg.path = p.page_rel
+         WHERE p.project=? AND p.accepted_at IS NULL AND p.ignored_at IS NULL AND pg.tier='draft'
+         ORDER BY p.proposed_at DESC LIMIT ?`,
+      )
+      .all(project, Math.max(1, opts.limit ?? 200)) as Array<{
+        page_rel: string; proposed_tier: string; reason: string; page_title: string;
+        retrieved_n: number; injected_n: number; injected_seen_n: number;
+        cited_by: number; superseded: number;
+      }>;
+
+    const auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }> = [];
+    const conflict: Array<{ page_rel: string; reason: string; why: string }> = [];
+    const no_signal: Array<{ page_rel: string; reason: string }> = [];
+
+    for (const r of rows) {
+      // Process records are not conclusions (measured 2026-11-22): a task's
+      // execution, handoff and evidence all cite the same pages, so process
+      // notes accumulate citations without being reusable knowledge — 16 of the
+      // 51 pages cited >=3 times start with '['.
+      //
+      // OFF BY DEFAULT: what the shared face should contain is a product
+      // decision, not a correctness rule. Callers opt in.
+      if (opts.excludeProcessNotes && String(r.page_title ?? "").trimStart().startsWith("[")) {
+        no_signal.push({ page_rel: r.page_rel, reason: r.reason });
+        continue;
+      }
+
+      // Downstream signals are the primary evidence (2026-11-22, measured).
+      //
+      // The two "usage" counters turned out to be unusable as automatic
+      // criteria: retrieval is 700:5 and almost never happens, and injection is
+      // deterministic (98 pages shared the exact same 7/78654), so it measures
+      // "is on the fixed shortlist", not "was useful".
+      //
+      // Citation and supersede DO vary across pages — cited_by spreads 3..9 in
+      // the live data — and they answer the actual question: did anyone build on
+      // this, and did a newer conclusion replace it.
+      const rate = r.injected_seen_n > 0 ? r.injected_n / r.injected_seen_n : null;
+      const rateOk = Number.isFinite(minRate) && rate !== null && rate >= minRate;
+      const countOk = r.retrieved_n >= minRetrieved;
+      const hasUsage = r.retrieved_n > 0 || r.injected_seen_n > 0;
+
+      // Superseded is the strongest single signal there is: someone wrote a page
+      // specifically to replace this one. It vetoes promotion regardless of
+      // everything else.
+      if (r.superseded === 1) {
+        conflict.push({
+          page_rel: r.page_rel, reason: r.reason,
+          why: `已被更新的页取代（superseded）—— 不该提升，模型判断与事实相反`,
+        });
+        continue;
+      }
+
+      const citedOk = Number.isFinite(minCited) && r.cited_by >= Number(minCited);
+      if (citedOk || countOk || rateOk) {
+        auto.push({
+          page_rel: r.page_rel, proposed_tier: r.proposed_tier, reason: r.reason,
+          why: `模型判为可复用，且有证据（cited_by=${r.cited_by}${countOk ? `, retrieved=${r.retrieved_n}` : ""}${rateOk ? `, rate=${rate.toFixed(4)}` : ""}）`,
+        });
+        continue;
+      }
+
+      if (!hasUsage && r.cited_by === 0) {
+        // Nothing has happened at all: no citation, no read, no injection.
+        // Not a conflict — just no evidence yet.
+        no_signal.push({ page_rel: r.page_rel, reason: r.reason });
+        continue;
+      }
+
+      conflict.push({
+        page_rel: r.page_rel, reason: r.reason,
+        why: `模型判为可复用，但无支持证据（cited_by=${r.cited_by}, retrieved=${r.retrieved_n}, seen=${r.injected_seen_n}）—— 交人裁决`,
+      });
+    }
+    return { auto, conflict, no_signal };
+  }
+
+  /**
+   * Grant (or revoke) another root's right to READ this root's shared pages
+   * (batch 3 tasks 3.1/3.3).
+   *
+   * Read-only grants: there is no write counterpart anywhere in this module.
+   * The spec says writes never cross roots, and the cheapest way to keep that
+   * true is to not build a path for it.
+   */
+  setShareGrant(readerRoot: string, granted: boolean, at: string, note = ""): boolean {
+    const id = String(readerRoot ?? "").trim();
+    if (!id) return false;
+    if (granted) {
+      const res = this.db
+        .prepare("INSERT OR IGNORE INTO share_grants (reader_root, granted_at, note) VALUES (?,?,?)")
+        .run(id, at, note.slice(0, 200));
+      return Number(res.changes ?? 0) > 0;
+    }
+    const res = this.db.prepare("DELETE FROM share_grants WHERE reader_root=?").run(id);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  /** Roots allowed to read this root's shared pages. */
+  shareGrants(): Array<{ reader_root: string; granted_at: string; note: string }> {    return this.db.prepare("SELECT reader_root, granted_at, note FROM share_grants ORDER BY granted_at DESC").all() as Array<{
+      reader_root: string; granted_at: string; note: string;
+    }>;
+  }
+
+  /** Does `readerRoot` hold a grant from this root? */
+  hasShareGrant(readerRoot: string): boolean {
+    return this.db.prepare("SELECT 1 AS hit FROM share_grants WHERE reader_root=?").get(String(readerRoot ?? "")) !== undefined;
+  }
+
+  /**
+   * Record that `readerRoot` read these pages (batch 4 task 4.3).
+   *
+   * Best-effort: an audit row is a companion record and must never fail the read
+   * it describes — a person looking at their notes should not get an error
+   * because the audit insert hiccuped.
+   */
+  noteSharedRead(readerRoot: string, pageRels: string[], at: string): void {
+    if (pageRels.length === 0) return;
+    try {
+      const stmt = this.db.prepare("INSERT INTO share_reads (ts, reader_root, page_rel) VALUES (?,?,?)");
+      this.db.exec("BEGIN");
+      try {
+        for (const rel of pageRels) stmt.run(at, readerRoot, rel);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    } catch {
+      /* advisory */
+    }
+  }
+
+  /** The owner's view: who read my shared pages, most recent first. */
+  shareReads(limit = 100): Array<{ ts: string; reader_root: string; page_rel: string }> {
+    return this.db
+      .prepare("SELECT ts, reader_root, page_rel FROM share_reads ORDER BY ts DESC LIMIT ?")
+      .all(Math.max(1, limit)) as Array<{ ts: string; reader_root: string; page_rel: string }>;
+  }
+
+  /**
+   * Marker (or unmark) a page as shareable outward (batch 3 task 3.2).
+   *
+   * Refuses unless the page is settled (`stable`/`canonical`): sharing a draft
+   * is exactly what the isolation rule protects against, and letting a caller
+   * pass one would collapse a two-step decision (settle → publish) into one
+   * accident.
+   *
+   * Returns whether anything actually changed, so a caller can say "already
+   * shareable" instead of reporting a write that never happened.
+   */
+  setPageShareable(pageRel: string, shareable: boolean, at: string): boolean {
+    if (shareable) {
+      const row = this.db.prepare("SELECT tier FROM pages WHERE path=?").get(pageRel) as { tier?: string } | undefined;
+      if (!row) return false;
+      if (row.tier !== "stable" && row.tier !== "canonical") return false;
+      const res = this.db.prepare("UPDATE pages SET shared_at=? WHERE path=? AND shared_at IS NULL").run(at, pageRel);
+      return Number(res.changes ?? 0) > 0;
+    }
+    const res = this.db.prepare("UPDATE pages SET shared_at=NULL WHERE path=? AND shared_at IS NOT NULL").run(pageRel);
+    return Number(res.changes ?? 0) > 0;
+  }
+
+  /**
+   * The shareable slice of this root (batch 3 task 3.3).
+   *
+   * BOTH conditions, always: settled tier AND published. A stable page nobody
+   * published is not shareable — that separation is the reason the two are
+   * different columns rather than one flag.
+   */
+  sharedPages(limit = 200): Array<{ path: string; title: string; tier: string; shared_at: string; type: string }> {
+    return this.db
+      .prepare(
+        `SELECT path, title, tier, shared_at, type FROM pages
+         WHERE shared_at IS NOT NULL AND tier IN ('stable','canonical')
+         ORDER BY shared_at DESC LIMIT ?`,
+      )
+      .all(Math.max(1, limit)) as Array<{ path: string; title: string; tier: string; shared_at: string; type: string }>;
+  }
+
+  /**
+   * Promote a page and record WHY in the proposal row itself.
+   *
+   * `proposed_by` already carries the "who decided" semantics (default 'ai'), so
+   * an auto-promotion writes `auto:<short reason>` there rather than adding a
+   * column — the read face shows a human why this one moved without a human, and
+   * the operator can tell an auto promotion from a manual accept by that prefix.
+   */
+  promotePage(pageRel: string, tier: string, why: string, at: string): void {
+    this.db.prepare("UPDATE pages SET tier=? WHERE path=?").run(tier, pageRel);
+    this.db
+      .prepare("UPDATE tier_proposals SET accepted_at=?, proposed_by=? WHERE page_rel=? AND accepted_at IS NULL AND ignored_at IS NULL")
+      .run(at, `auto:${why.slice(0, 120)}`, pageRel);
   }
 
   acceptTierProposal(project: string, pageRel: string, at: string): void {
@@ -951,5 +1942,97 @@ export class RootDb {
     walk(wikiDir);
     if (forgotten > 0) console.log(`[fd-memory] reindex: skipped ${forgotten} forgotten page(s)`);
     return count;
+  }
+
+  // replayObservationsFromLog: rebuild the observations index from the
+  // append-only JSONL truth written by StoreRoot.appendObservation.
+  //
+  // This is the other half of "L0 捕获流 MUST 为 append-only 且可重建索引".
+  // reindexFromWiki only rebuilds `pages`; observations live outside the wiki
+  // page tree, so before this existed there was no way to recover them if the
+  // SQLite file was lost or its index got out of sync.
+  //
+  // Idempotent: clears the table first, then replays every log line in
+  // chronological order so the autoincrement `id` matches the original arrival
+  // order. Deduplication is NOT applied here — the log is the truth, including
+  // duplicate captures that the live path happened to write.
+  replayObservationsFromLog(wikiDir: string): { projects: number; rows: number; retracted: number } {
+    this.db.exec("DELETE FROM observations");
+    let projects = 0;
+    let rows = 0;
+    let retracted = 0;
+
+    // Two passes, both over the same append-only files.
+    //
+    // A retract marker (`_retract: true`, written by StoreRoot.retractObservations)
+    // lists digests of the rows it withdrew. Pass 1 collects how many of each
+    // digest are withdrawn — a COUNT, not a flag, because a deliberate re-import
+    // after the retract appends the same bytes again and must survive the replay.
+    // Each withdrawn row consumes exactly one such allowance.
+    const files: string[] = [];
+    const collect = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) collect(full);
+        else if (entry.endsWith(".jsonl") && full.includes(`${sep}observations${sep}_log${sep}`)) files.push(full);
+      }
+    };
+    collect(wikiDir);
+
+    const withdrawn = new Map<string, number>();
+    for (const file of files) {
+      for (const line of readFileSync(file, "utf8").split("\n")) {
+        const t = line.trim();
+        if (!t || !t.includes("_retract")) continue;
+        try {
+          const rec = JSON.parse(t) as { _retract?: unknown; retracted?: unknown };
+          if (rec._retract !== true || !Array.isArray(rec.retracted)) continue;
+          for (const d of rec.retracted) {
+            const key = String(d);
+            withdrawn.set(key, (withdrawn.get(key) ?? 0) + 1);
+          }
+        } catch {
+          console.warn(`[fd-memory] replay: skipped malformed retract marker in ${file}`);
+        }
+      }
+    }
+
+    for (const file of files) {
+      projects++;
+      const lines = readFileSync(file, "utf8").split("\n");
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        let rec: { session_id?: unknown; agent?: unknown; event?: unknown; tool?: unknown; summary?: unknown; created_at?: unknown; project?: unknown; _retract?: unknown };
+        try {
+          rec = JSON.parse(t) as typeof rec;
+        } catch {
+          console.warn(`[fd-memory] replay: skipped malformed line in ${file}`);
+          continue;
+        }
+        if (rec._retract === true) continue;
+        if (typeof rec.session_id !== "string" || typeof rec.event !== "string") continue;
+        const digest = observationDigest(rec.session_id, String(rec.summary ?? ""));
+        const allowance = withdrawn.get(digest) ?? 0;
+        if (allowance > 0) {
+          withdrawn.set(digest, allowance - 1);
+          retracted++;
+          continue;
+        }
+        this.db
+          .prepare("INSERT INTO observations (session_id, agent, event, tool, summary, created_at, project) VALUES (?,?,?,?,?,?,?)")
+          .run(
+            rec.session_id,
+            String(rec.agent ?? "platform"),
+            rec.event,
+            rec.tool == null ? null : String(rec.tool),
+            String(rec.summary ?? ""),
+            String(rec.created_at ?? new Date().toISOString()),
+            String(rec.project ?? "default"),
+          );
+        rows++;
+      }
+    }
+    return { projects, rows, retracted };
   }
 }

@@ -4,11 +4,12 @@
 
 import { Service } from "./http.js";
 import { TokenStore } from "./auth.js";
-import { runConnect, runDisconnect, runHook } from "./connect/cli.js";
+import { StoreRoot } from "./store.js";
+import { runConnect, runDisconnect, runHook, runObserveReplay } from "./connect/cli.js";
 import { mkdirSync } from "node:fs";
 
 function dataDir(): string {
-  return process.env.FD_MEMORY_DATA ?? process.env.HOME + "/Library/Application Support/fd-memory";
+  return process.env.FD_MEMORY_DATA || process.env.HOME + "/Library/Application Support/fd-memory";
 }
 
 function pepper(): string {
@@ -26,7 +27,13 @@ usage:
   yongyi token revoke --id <id>
   yongyi connect claude-code|zcode|mcp|dify|coze --url U --as user [--project P] [--dir D]
   yongyi disconnect <harness>
-  yongyi hook <harness> <event>      stdin: hook event JSON (capture, fail-drop)
+  yongyi hook <harness> <event>      stdin: hook event JSON (capture; spools locally when the service is down)
+yongyi observe-replay              deliver the local observe spool after an outage
+  yongyi replay --root <rootKey>     rebuild observations index from the append-only log
+  yongyi import claude-code|zcode|summary --root <rootKey> [--project P] [--dry-run] [--batch N] [--profile light|full] [--yes]
+  yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]
+  yongyi index --root <rootKey> [--project P]   sync cross-harness memory index
+  yongyi deliver --root <rootKey> --project P --file <instructionFile> [--off] [--limit N]
 env:
   FD_MEMORY_DATA     data directory (default ~/Library/Application Support/fd-memory)
   FD_MEMORY_PEPPER   token hash pepper (set this in production)
@@ -79,6 +86,221 @@ if (cmd === "serve") {
     console.error("token subcommand: mint|list|revoke");
     process.exit(2);
   }
+} else if (cmd === "replay") {
+  // Rebuild the observations index from the append-only JSONL truth. This is
+  // the recovery path for "the SQLite index was lost / went out of sync" —
+  // the log under <project>/observations/_log/ is the source of record.
+  const rootKey = argValue("--root");
+  if (!rootKey) {
+    console.error("usage: yongyi replay --root <rootKey>");
+    console.error("  rebuilds the observations index from <wiki>/<project>/observations/_log/*.jsonl");
+    process.exit(2);
+  }
+  const root = new StoreRoot(dataDir(), rootKey);
+  const out = root.db.replayObservationsFromLog(root.wikiDir);
+  console.log(JSON.stringify({ rootKey, logFiles: out.projects, rows: out.rows }));
+} else if (cmd === "import") {
+  // Import historical memory from an AI harness's local storage.
+  //   yongyi import claude-code --root <rootKey> [--project P] [--dry-run]
+  //                             [--dir <projectsDir>] [--batch N] [--pause MS]
+  const harness = process.argv[3];
+  if (harness !== "claude-code" && harness !== "zcode" && harness !== "summary") {
+    console.error("usage: yongyi import claude-code|zcode|summary --root <rootKey> [--project P] [--dry-run]");
+    console.error("  summary = harness's distilled memory layer (memories/**.md)");
+    console.error("  (Cursor / Codex extractors are not implemented yet)");
+    process.exit(2);
+  }
+  const rootKey = argValue("--root");
+  if (!rootKey) {
+    console.error(`usage: yongyi import ${harness} --root <rootKey> [--project P] [--dry-run]`);
+    process.exit(2);
+  }
+  const project = argValue("--project") ?? "default";
+  const dryRun = process.argv.includes("--dry-run");
+  // Profile gate (add-harness-memory-import 2.3): `full` is the "不过滤" mode
+  // the spec refuses to run silently — it turns every extracted turn into a
+  // candidate, so on an 84 万-row source it would recreate the lock outage the
+  // whole import design exists to avoid. Unconfirmed, it is refused WITH an
+  // estimate of what it would write; --yes is the explicit confirmation.
+  const profileArg = argValue("--profile") ?? "light";
+  if (profileArg !== "light" && profileArg !== "full") {
+    console.error("--profile must be light (rule-filtered, default) or full (unfiltered, requires --yes)");
+    process.exit(2);
+  }
+  const profile = profileArg as "light" | "full";
+  const yes = process.argv.includes("--yes");
+  const batchSize = Number(argValue("--batch") ?? 200);
+  const batchPauseMs = Number(argValue("--pause") ?? 200);
+  const limitArg = argValue("--limit");
+  const limit = limitArg ? Number(limitArg) : undefined;
+
+  const projectsDir = argValue("--dir") ?? process.env.HOME + "/.claude/projects";
+  const memoryRoot = argValue("--memory-root") ?? process.env.HOME + "/.zcode/cli/memories/projects/finddata-e7fc7cd97a773655/memory";
+  const dbPath = argValue("--db") ?? process.env.HOME + "/.zcode/cli/db/db.sqlite";
+
+  const root = new StoreRoot(dataDir(), rootKey);
+  import("./connect/import/orchestrator.js")
+    .then(async (m) => {
+      const rules = m.rulesForProfile(profile);
+
+      // Full profile without confirmation: refuse with an estimate, computing
+      // it WITHOUT stamping the source ledger (a refusal must leave no state
+      // that changes what the confirmed rerun would do).
+      if (m.fullProfileNeedsConfirmation(profile, yes) && !dryRun) {
+        const est =
+          harness === "summary"
+            ? m.planSummaryImport(root, { memoryRoot, project, stamp: false })
+            : harness === "zcode"
+              ? m.planZcodeImport(root, { dbPath, limit, project, rules, stamp: false })
+              : m.planClaudeImport(root, { projectsDir, project, rules, stamp: false });
+        console.log(
+          JSON.stringify(
+            {
+              refused: "profile full writes every extracted turn — pass --yes to confirm",
+              profile,
+              harness,
+              scanned: est.scanned,
+              filtered: est.filtered,
+              alreadyImported: est.alreadyImported,
+              duplicateContent: est.duplicateContent,
+              estimatedWrites: est.estimatedWrites,
+              hint: "preview with --dry-run, or re-run with --yes to execute",
+            },
+            null,
+            1,
+          ),
+        );
+        console.error(
+          `拒绝：--profile full 不过滤，将全量写入约 ${est.estimatedWrites} 条（扫描 ${est.scanned.turns} 条）。确认执行请显式加 --yes。`,
+        );
+        process.exit(1);
+      }
+
+      const plan =
+        harness === "summary"
+          ? m.planSummaryImport(root, { memoryRoot, project })
+          : harness === "zcode"
+            ? m.planZcodeImport(root, { dbPath, limit, project, rules })
+            : m.planClaudeImport(root, { projectsDir, project, rules });
+
+      if (dryRun) {
+        console.log(JSON.stringify(plan, null, 1));
+        console.log("\n(dry run — nothing written)");
+        return;
+      }
+
+      const res =
+        harness === "summary"
+          ? await m.runSummaryImport(root, project, { memoryRoot, batchSize, batchPauseMs, project })
+          : harness === "zcode"
+            ? await m.runZcodeImport(root, project, { dbPath, limit, batchSize, batchPauseMs, project, rules })
+            : await m.runClaudeImport(root, project, { projectsDir, batchSize, batchPauseMs, project, rules });
+      console.log(
+        JSON.stringify(
+          {
+            harness: res.plan.harness,
+            scanned: res.plan.scanned,
+            filtered: res.plan.filtered,
+            alreadyImported: res.plan.alreadyImported,
+            duplicateContent: res.plan.duplicateContent,
+            written: res.written,
+            degraded: res.degraded,
+            batches: res.batches,
+          },
+          null,
+          1,
+        ),
+      );
+    })
+    .catch((e: unknown) => fail(e));
+} else if (cmd === "import-retract") {
+  // Take back everything one harness imported, and nothing else.
+  //   yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]
+  //
+  // Why a sibling command instead of `import <harness> --retract`: the import
+  // branch resolves a source, a profile and a plan before it writes anything, and
+  // retract has none of those inputs — bolting it on would make every one of them
+  // optional-in-one-direction and ambiguous. The two acts share a write path
+  // (StoreRoot.retractObservations), which is where the sharing belongs.
+  const rk = argValue("--root");
+  const target = argValue("--harness");
+  if (!rk || !target) {
+    console.error("usage: yongyi import-retract --root <rootKey> --harness <claude-code|zcode|summary> [--dry-run]");
+    console.error("  withdraws every page and observation that harness imported; source files are never touched");
+    process.exit(2);
+  }
+  const retractRoot = new StoreRoot(dataDir(), rk);
+  import("./connect/import/retract.js")
+    .then((m) => {
+      const report = m.retractHarness(retractRoot, {
+        harness: target,
+        dryRun: process.argv.includes("--dry-run"),
+      });
+      console.log(JSON.stringify(report, null, 1));
+      if (report.dryRun) console.error("(dry run — nothing written)");
+    })
+    .catch((e: unknown) => fail(e));
+} else if (cmd === "index") {
+  // Sync the cross-harness memory index (see MEMORY-ARCHITECTURE.md).
+  //   yongyi index --root <rootKey> [--project P]
+  // Reads every harness's own memory files (ZCode / Claude Code), stores only
+  // their descriptions here, and leaves the bodies at their source. Incremental
+  // by content hash, so a scheduled run costs ~0.1 s when nothing changed.
+  const rootKey = argValue("--root");
+  if (!rootKey) {
+    console.error("usage: yongyi index --root <rootKey> [--project P]");
+    process.exit(2);
+  }
+  const project = argValue("--project") ?? "default";
+  const root = new StoreRoot(dataDir(), rootKey);
+  import("./connect/index/sync.js")
+    .then((m) => {
+      const r = m.syncIndex(root, project);
+      console.log(
+        JSON.stringify(
+          {
+            scanned: r.scanned.indexed,
+            byHarness: r.scanned.byHarness,
+            written: r.written,
+            unchanged: r.unchanged,
+            removed: r.removed,
+            descriptionTokens: Math.round(r.scanned.descriptionBytes / 3),
+          },
+          null,
+          1,
+        ),
+      );
+    })
+    .catch((e: unknown) => fail(e));
+} else if (cmd === "deliver") {
+  // Put project memories where a harness already looks (managed block in its
+  // instruction file). Never touches the harness's conversation store.
+  //   yongyi deliver --root <rootKey> --project P --file <path> [--off] [--limit N]
+  const rootKey = argValue("--root");
+  const project = argValue("--project");
+  const file = argValue("--file");
+  if (!rootKey || !project || !file) {
+    console.error("usage: yongyi deliver --root <rootKey> --project P --file <instructionFile> [--off] [--limit N] [--max-chars N]");
+    console.error("  writes a managed block into a file the harness already reads");
+    console.error("  (CLAUDE.md / AGENTS.md); never modifies conversation history.");
+    process.exit(2);
+  }
+  const root = new StoreRoot(dataDir(), rootKey);
+  import("./connect/import/deliver.js")
+    .then((m) => {
+      const res = m.deliverToTarget(
+        root,
+        { id: "cli", file, format: "markdown" },
+        {
+          project,
+          off: process.argv.includes("--off"),
+          limit: Number(argValue("--limit") ?? 50),
+          maxChars: Number(argValue("--max-chars") ?? 8000),
+        },
+      );
+      console.log(JSON.stringify(res, null, 1));
+    })
+    .catch((e: unknown) => fail(e));
 } else if (cmd === "connect") {
   runConnect(process.argv.slice(3)).catch((e: unknown) => fail(e));
 } else if (cmd === "disconnect") {
@@ -89,6 +311,8 @@ if (cmd === "serve") {
   }
 } else if (cmd === "hook") {
   runHook(process.argv.slice(3), readStdin).catch((e: unknown) => fail(e));
+} else if (cmd === "observe-replay") {
+  runObserveReplay().catch((e: unknown) => fail(e));
 } else {
   console.error(`unknown command: ${cmd} (see --help)`);
   process.exit(2);

@@ -65,6 +65,42 @@ test("store roots isolate owners physically", () => {
   }
 });
 
+// FTS overwrite semantics (2026-11-19). indexPage used to retire the old FTS
+// row with an unconditional `DELETE ... WHERE path=?`; that predicate is an
+// UNINDEXED fts5 column, so every page write paid a full index scan (22ms) to
+// delete nothing 88% of the time. It is now conditional on a pre-upsert PK
+// lookup. The optimization is only sound if an overwrite STILL replaces the
+// indexed text rather than appending a second row — that is what this pins:
+// a stale term must stop matching, the new term must match, and the row count
+// must not grow.
+test("indexPage overwrite replaces the FTS row instead of duplicating it", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "d-p--a");
+    const countFts = () => (root.db.db.prepare("SELECT COUNT(*) AS n FROM pages_fts").get() as { n: number }).n;
+    const matchCount = (term: string) =>
+      (root.db.db.prepare("SELECT COUNT(*) AS n FROM pages_fts WHERE pages_fts MATCH ?").get(`"${term}"`) as { n: number }).n;
+
+    root.writePage("default", "facts", "f1", newPage("fact", "结算口径", "毛利率按含退口径"));
+    const afterFirst = countFts();
+    // Trigram tokenizer: a query needs >= 3 characters to match anything.
+    assert.equal(matchCount("含退口"), 1, "first write indexes the body");
+
+    // Same path, different text: the overwrite must REPLACE.
+    root.writePage("default", "facts", "f1", newPage("fact", "结算口径", "毛利率按扣退口径"));
+    assert.equal(countFts(), afterFirst, "an overwrite must not append a second FTS row");
+    assert.equal(matchCount("含退口"), 0, "the stale term must stop matching after an overwrite");
+    assert.equal(matchCount("扣退口"), 1, "the new term must match after an overwrite");
+
+    // A fresh path still indexes normally.
+    root.writePage("default", "facts", "f2", newPage("fact", "另一口径", "收入按净额确认"));
+    assert.equal(countFts(), afterFirst + 1, "a new path adds exactly one row");
+    assert.equal(matchCount("净额确"), 1);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
 test("reindex rebuilds derived db without touching wiki truth", () => {
   const data = tmpData();
   try {
@@ -365,7 +401,7 @@ test("mcp tools: handoff claim-once across agents; scope has no namespace param"
     })();
     const names = tools.map((t) => t.name);
     assert.deepEqual(names.sort(), [
-      "memory_handoff_accept", "memory_handoff_begin", "memory_handoff_cancel",
+      "memory_by_domain", "memory_handoff_accept", "memory_handoff_begin", "memory_handoff_cancel",
       "memory_handoff_list", "memory_overview", "memory_query", "memory_read_page", "memory_recent", "memory_write_page",
     ]);
     // no tool schema carries a namespace field — scope cannot be overridden
@@ -403,6 +439,60 @@ test("audit: page writes and handoff ops each leave a write row", () => {
     assert.ok(writes.every((w) => w.principal === `deployment:${a.scope.tokenId}`));
     assert.ok(writes.some((w) => w.page_rel === page.body.path));
   } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("mcp: a session id survives a restart — a live client is never bricked by one", async () => {
+  // 2026-11-20: the session map is process memory, so any `launchctl kickstart`
+  // empties it while connected clients keep their `mcp-session-id`. The old
+  // code answered those with a hard 400 "session not initialized", which meant
+  // a routine restart silently broke every live MCP client until each one
+  // happened to re-initialize — observed in production as a session that could
+  // not write memory and had no clue why.
+  //
+  // The session is a CACHE, not an auth gate: `route()` verifies the token on
+  // every request. So a stale id must be resumed, not refused.
+  const data = tmpData();
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  let server: ReturnType<typeof createServer> | null = null;
+  try {
+    const tok = svc.tokens.mint("deployment", "d/p/a").token;
+    server = createServer((req, res) => {
+      (svc as any).route(req, res).catch((e: unknown) => { res.writeHead(500); res.end(String(e)); });
+    });
+    await new Promise<void>((r) => server!.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(server!.address() as { port: number }).port}`;
+    const call = (sid: string, method: string, params: Record<string, unknown> = {}) =>
+      fetch(base + "/mcp", {
+        method: "POST",
+        headers: { authorization: `Bearer ${tok}`, "content-type": "application/json", "mcp-session-id": sid },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+      });
+
+    const init = await fetch(base + "/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${tok}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    const sid = init.headers.get("mcp-session-id")!;
+    assert.equal((await call(sid, "tools/list")).status, 200, "baseline: the session works before the restart");
+
+    // Simulate the restart exactly: the process's session map is gone, the
+    // client's id is not.
+    (svc as unknown as { sessions: Map<string, unknown> }).sessions.clear();
+
+    const afterRestart = await call(sid, "tools/list");
+    assert.equal(afterRestart.status, 200, "a pre-restart session id must still work");
+    const body = (await afterRestart.json()) as { result?: { tools?: unknown[] }; error?: { message: string } };
+    assert.equal(body.error, undefined, "no -32000 session error after a restart");
+    assert.ok((body.result?.tools?.length ?? 0) > 0, "and it serves real tools, not an empty shell");
+
+    // A tools/call must work too — that is the path memory writes take.
+    const write = await call(sid, "tools/call", { name: "memory_write_page", arguments: { project: "default", type: "note", title: "重启后写入", body: "会话恢复" } });
+    assert.equal(write.status, 200, "writes still land on a resumed session");
+  } finally {
+    await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
   }
 });
@@ -448,7 +538,7 @@ test("http service: auth 401, capture 200, mcp initialize + tools/list round-tri
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
     const tools = (await toolsList.json()).result.tools as unknown as { name: string }[];
-    assert.equal(tools.length, 9); // eight legacy + memory_overview (add-agent-memory-foundation)
+    assert.equal(tools.length, 10); // eight legacy + memory_overview + memory_by_domain
   } finally {
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
     rmSync(data, { recursive: true, force: true });
@@ -963,6 +1053,544 @@ test("supersede edges: rebuilt by reindex, and the audit catches a short table (
     // A table that lost a row must be reported, not served silently.
     root.db.db.prepare("DELETE FROM superseded_edges").run();
     assert.equal(root.db.supersedeEdgeAudit().ok, false, "a short edge table fails the audit");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── the FTS leg must actually run, not silently degrade to LIKE ─────────────
+//
+// 2026-11-22 measured defect: `searchPages`'s FTS statement combined
+// `snippet()` with `COUNT(*) OVER ()`, which SQLite rejects with
+// "unable to use function snippet in the requested context". The `catch`
+// swallowed it, so EVERY search fell through to the LIKE branch — a full scan
+// of 89k pages' bodies, ~2s per query, while still returning plausible rows.
+// Nothing looked broken; it was just 100× slower and ignored the index.
+//
+// The assertion has to hit the REAL code path. A first version of this test
+// hand-wrote the SQL and checked ITS plan — which stayed green even after the
+// bug was re-injected, because it never exercised `searchPages` at all. Instead:
+// make the LIKE branch observably different from the FTS branch, then assert
+// which one produced the answer.
+test("searchPages uses the FTS leg, not the LIKE fallback (3+ char query)", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-fts");
+    // A page whose BODY contains the term but whose TITLE does not. The FTS leg
+    // indexes title+body and will find it; the LIKE fallback searches
+    // (title LIKE ? OR body LIKE ?) and would also find it — so filter by what
+    // each branch returns differently instead: the FTS leg's snippet comes from
+    // `snippet(pages_fts, ...)`, which brackets matches with '[' ']' … '…'.
+    root.writePage("default", "notes", "n0",
+      newPage("note", "部署结论", "这一条正文提到 ArgoCD 的配置", {}));
+
+    const hits = root.db.searchPages("ArgoCD", 20);
+    assert.equal(hits.length, 1, "必须命中那一条");
+
+    // The discriminator: the LIKE branch builds its snippet with substr/instr
+    // and never inserts the '[' … ']' match brackets that `snippet()` adds.
+    assert.match(
+      hits[0].snippet,
+      /\[ArgoCD\]/i,
+      `snippet 应来自 FTS 的 snippet()（带 [] 高亮）；没有说明走了 LIKE 兜底。实际：${JSON.stringify(hits[0].snippet)}`,
+    );
+
+    // And total is still right now that it comes from its own statement.
+    const meta: { total?: number } = {};
+    root.db.searchPages("ArgoCD", 1, null, undefined, meta);
+    assert.equal(meta.total, 1, `total 应报全部命中（独立 COUNT），实际 ${meta.total}`);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── usage signals: "returned" is not "matched" ──────────────────────────────
+//
+// Batch 1 of memory-integration-with-product-lines. Two counters, and the
+// distinction that makes them meaningful: a page counts as USED only when the
+// caller received it, not when the SQL touched it.
+test("searchPages counts only the pages the caller actually received", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-signal");
+    for (let i = 0; i < 5; i++) {
+      root.writePage("default", "notes", `s${i}`, newPage("note", `信号 ${i}`, `正文 ${i}`, {}));
+    }
+    // limit=1: five match, one is returned.
+    const hits = root.db.searchPages("信号", 1);
+    assert.equal(hits.length, 1);
+
+    const counts = root.db.db.prepare("SELECT path, retrieved_n FROM pages ORDER BY path").all() as Array<{ path: string; retrieved_n: number }>;
+    const bumped = counts.filter((c) => c.retrieved_n > 0);
+    assert.equal(bumped.length, 1, "只有被返回的那一条计数；SQL 匹配到但没返回的不算");
+    assert.equal(bumped[0].path, String((hits[0] as { path: string }).path));
+
+    // A page with no hits stays at zero forever.
+    assert.equal(counts.filter((c) => c.retrieved_n === 0).length, 4);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("injection count records the pool size it competed in", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-pool");
+    root.writePage("default", "notes", "a", newPage("note", "池 A", "正文", {}));
+    const pageId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE '%/a.md'").get() as { page_id: string }).page_id;
+
+    // Two injections, pools of 100 and 400 candidates.
+    root.db.notePagesInjected([pageId], 100);
+    root.db.notePagesInjected([pageId], 400);
+
+    const row = root.db.db.prepare("SELECT injected_n, injected_seen_n FROM pages WHERE page_id = ?").get(pageId) as { injected_n: number; injected_seen_n: number };
+    assert.equal(row.injected_n, 2, "选中两次");
+    assert.equal(row.injected_seen_n, 500, "分母累加：100 + 400 —— 没有它，选中次数跨时间不可比");
+
+    const st = root.db.usageSignalStats();
+    assert.equal(st.total, 1);
+    assert.equal(st.injected_at_least_once, 1);
+    assert.equal(st.retrieved_at_least_once, 0, "注入不等于检索，两个信号分开记");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("usage stats distinguish never-offered from never-used", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-untouched");
+    root.writePage("default", "notes", "x", newPage("note", "没被碰过", "正文", {}));
+    const st = root.db.usageSignalStats();
+    assert.equal(st.total, 1);
+    assert.equal(st.never_touched, 1, "0/0 是「从未被提供过」，与「提供过但没中」不同");
+    assert.equal(st.retrieved_at_least_once, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// A stale-version database must gain the new columns on reopen.
+//
+// The trap this pins (2026-11-22, hit for real on the live store): the
+// `columnsOf()` guards are idempotent, so adding an ALTER looks safe — but
+// `migrate()` returns early when the stored version already equals
+// SCHEMA_VERSION, so on every existing database the new ALTER never ran. The
+// columns were simply absent while everything else looked healthy.
+test("reopening an older database adds the usage-signal columns", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-migrate");
+    first.writePage("default", "notes", "m", newPage("note", "迁移前", "正文", {}));
+
+    // Simulate a database written before batch 1: drop the columns and rewind
+    // the version gate. SQLite cannot DROP COLUMN on every build, so rebuild
+    // the table without them.
+    first.db.db.exec(`
+      CREATE TABLE pages_old AS SELECT path, project, type, title, body, updated_at, sources, supersedes FROM pages;
+      DROP TABLE pages;
+      ALTER TABLE pages_old RENAME TO pages;
+      UPDATE schema_meta SET value = '3' WHERE key = 'version';  -- 旧版本号本身：正是「存的是旧号，代码是新号」这个差值驱动迁移
+    `);
+    const before = first.db.db.prepare("PRAGMA table_info(pages)").all() as Array<{ name: string }>;
+    assert.equal(before.some((c) => c.name === "retrieved_n"), false, "前提：老库确实没有该列");
+
+    // Reopen: migrate() must now run and add them.
+    const second = new StoreRoot(data, "u-migrate");
+    const after = second.db.db.prepare("PRAGMA table_info(pages)").all() as Array<{ name: string }>;
+    for (const col of ["retrieved_n", "injected_n", "injected_seen_n"]) {
+      assert.ok(after.some((c) => c.name === col), `reopen 后必须有 ${col}`);
+    }
+    // Existing rows default to 0, not NULL.
+    const row = second.db.db.prepare("SELECT retrieved_n, injected_n FROM pages LIMIT 1").get() as { retrieved_n: number; injected_n: number };
+    assert.equal(row.retrieved_n, 0);
+    assert.equal(row.injected_n, 0);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("injected_rate is a rate, and null rather than 0 when never offered", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-rate");
+    root.writePage("default", "notes", "a", newPage("note", "常被选中", "正文", {}));
+    root.writePage("default", "notes", "b", newPage("note", "从未参选", "正文", {}));
+    const idOf = (slug: string) => (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get(`%/${slug}.md`) as { page_id: string }).page_id;
+
+    // "a" competed twice in a pool of 100 → rate 0.02. "b" never competed.
+    root.db.notePagesInjected([idOf("a")], 100);
+    root.db.notePagesInjected([idOf("a")], 100);
+    const top = root.db.usageSignalStats().top_retrieved;
+    const a = top.find((r) => r.path.endsWith("/a.md"))!;
+    assert.equal(a.injected_rate, 0.01, "选中率 = 2 次 / (100+100) = 200 候选，即 1%");
+    assert.equal(top.some((r) => r.path.endsWith("/b.md")), false, "从未参选的页不出现在 top 里");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── promotion classification: the three buckets and why they are separate ────
+//
+// Batch 2 of memory-integration-with-product-lines. The rule is "model says yes
+// AND usage backs it", and the interesting part is what happens when the two
+// disagree: that must NOT be auto-resolved, because an auto-promoted wrong page
+// leaks into other roots once sharing opens.
+test("pending proposals split into auto / conflict / no-signal", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-promo");
+    const mk = (slug: string, title: string) => {
+      root.writePage("default", "notes", slug, newPage("note", title, "正文内容足够长以便成为候选", {}));
+      return (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get(`%/${slug}.md`) as { page_id: string }).page_id;
+    };
+    const idUsed = mk("used", "被用过的");
+    const idCold = mk("cold", "从没用过的");
+    const idNever = mk("never", "从未参选的");
+
+    for (const [id, slug] of [[idUsed, "used"], [idCold, "cold"], [idNever, "never"]] as const) {
+      root.db.db.prepare(
+        "INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)",
+      ).run("default", `default/notes/${slug}.md`, "stable", "模型认为可复用", "ai", "2026-11-22T00:00:00Z");
+    }
+    // "used": retrieved twice AND competed in a sizeable pool.
+    root.db.notePagesRetrieved(["default/notes/used.md"]);
+    root.db.notePagesRetrieved(["default/notes/used.md"]);
+    root.db.notePagesInjected([idUsed], 100);
+    // "cold": competed but never retrieved -> conflict (model yes, signal weak).
+    root.db.notePagesInjected([idCold], 5000);
+    // "never": untouched -> no_signal, not a conflict.
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 2 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/used.md"], "两个条件都满足才自动升");
+    assert.deepEqual(c.conflict.map((x) => x.page_rel), ["default/notes/cold.md"], "模型说是但证据不足 -> 交人");
+    assert.deepEqual(c.no_signal.map((x) => x.page_rel), ["default/notes/never.md"], "没有任何证据 -> 不是冲突，只是还没积累");
+    assert.match(c.conflict[0].why, /交人裁决/);
+
+    // A missing threshold promotes NOTHING (0 would mean "everything").
+    const none = root.db.classifyPendingProposals("default", {});
+    assert.equal(none.auto.length, 0, "没给阈值时不得自动提升——阈值是要观察后定的，不是猜的");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("promotePage stamps who caused it, so auto promotions are distinguishable", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-promote");
+    root.writePage("default", "notes", "p", newPage("note", "要提升的", "正文", {}));
+    root.db.db.prepare(
+      "INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)",
+    ).run("default", "default/notes/p.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    root.db.promotePage("default/notes/p.md", "stable", "信号达标", "2026-11-22T01:00:00Z");
+    const page = root.db.db.prepare("SELECT tier FROM pages WHERE path=?").get("default/notes/p.md") as { tier: string };
+    assert.equal(page.tier, "stable");
+    const prop = root.db.db.prepare("SELECT proposed_by, accepted_at FROM tier_proposals WHERE page_rel=?").get("default/notes/p.md") as { proposed_by: string; accepted_at: string | null };
+    assert.match(prop.proposed_by, /^auto:/, "自动提升要能从 proposed_by 前缀认出来，否则和人工接受混为一谈");
+    assert.ok(prop.accepted_at);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("high usage without a model proposal never promotes", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-noProposal");
+    root.writePage("default", "notes", "hot", newPage("note", "很热但没被提案", "正文", {}));
+    // Heavy usage, but no row in tier_proposals at all.
+    for (let i = 0; i < 5; i++) root.db.notePagesRetrieved(["default/notes/hot.md"]);
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 1 });
+    assert.equal(c.auto.length, 0, "没有模型提案就没有「两个条件同时成立」，再多使用也不升");
+    const page = root.db.db.prepare("SELECT tier FROM pages WHERE path=?").get("default/notes/hot.md") as { tier: string };
+    assert.equal(page.tier, "draft", "tier 不变");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── cross-root sharing: only a settled, published page is visible ───────────
+//
+// Batch 3 task 3.4 of memory-integration-with-product-lines. Three states, and
+// only the third is shareable:
+//
+//   draft                       never
+//   stable, never published     no  <- this is the one worth pinning
+//   stable, published           yes
+//
+// The middle case is why "stable" and "published" are separate columns: a
+// conclusion can be settled and still be nobody else's business.
+test("only a settled AND published page is shareable", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-share");
+    const mk = (slug: string) => {
+      root.writePage("default", "notes", slug, newPage("note", `页 ${slug}`, "正文", {}));
+      return `default/notes/${slug}.md`;
+    };
+    const draft = mk("draft");
+    const stableUnshared = mk("stableUnshared");
+    const stableShared = mk("stableShared");
+
+    // Settle two of them through the real promotion path.
+    for (const rel of [stableUnshared, stableShared]) {
+      root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", rel, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+      root.db.promotePage(rel, "stable", "测试", "2026-11-22T01:00:00Z");
+    }
+
+    // Publishing a draft is refused — that is the boundary the spec protects.
+    assert.equal(root.db.setPageShareable(draft, true, "2026-11-22T02:00:00Z"), false, "草稿不得被发布");
+    assert.equal(root.db.setPageShareable(stableShared, true, "2026-11-22T02:00:00Z"), true);
+    assert.equal(root.db.setPageShareable(stableShared, true, "2026-11-22T02:00:00Z"), false, "已发布的不重复写");
+
+    const shared = root.db.sharedPages().map((p) => p.path);
+    assert.deepEqual(shared, [stableShared], "只有「稳定 + 已发布」那条可见；稳定的但没发布的那条不出现");
+
+    // Unpublish closes it again.
+    assert.equal(root.db.setPageShareable(stableShared, false, "2026-11-22T03:00:00Z"), true);
+    assert.deepEqual(root.db.sharedPages(), [], "取消发布后回到不可见");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── cross-root read: a grant is a row, never an inference ───────────────────
+//
+// Batch 3 tasks 3.1/3.3/3.5. This is the only path in the service that reads a
+// root other than the caller's, so every condition is pinned separately:
+//   no grant        -> refuse
+//   grant           -> only settled AND published pages
+//   similar name    -> still refuse (naming is not permission)
+//   write side      -> does not exist at all
+test("a grant is required and only exposes settled+published pages", () => {
+  const data = tmpData();
+  try {
+    const owner = new StoreRoot(data, "u-owner");
+    const reader = new StoreRoot(data, "d-alice-pack");
+
+    // Three pages in the owner's root, in the three states that matter.
+    owner.writePage("default", "notes", "draft", newPage("note", "草稿", "正文", {}));
+    owner.writePage("default", "notes", "stableOnly", newPage("note", "稳定未发布", "正文", {}));
+    owner.writePage("default", "notes", "shared", newPage("note", "稳定已发布", "正文", {}));
+    for (const slug of ["stableOnly", "shared"]) {
+      owner.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", `default/notes/${slug}.md`, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+      owner.db.promotePage(`default/notes/${slug}.md`, "stable", "测试", "2026-11-22T01:00:00Z");
+    }
+    owner.db.setPageShareable("default/notes/shared.md", true, "2026-11-22T02:00:00Z");
+    // A draft must be refused even if someone tries to publish it.
+    assert.equal(owner.db.setPageShareable("default/notes/draft.md", true, "2026-11-22T02:00:00Z"), false);
+
+    // 1. No grant -> the reader sees nothing.
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), false, "未授权时不得有任何读权限");
+
+    // 2. A similar-looking name proves nothing.
+    assert.equal(owner.db.hasShareGrant("u-owner2"), false, "名字像不等于授权");
+
+    // 3. Grant, then read: only the published+s settled page appears.
+    assert.equal(owner.db.setShareGrant("d-alice-pack", true, "2026-11-22T03:00:00Z", "试用"), true);
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), true);
+    const visible = owner.db.sharedPages().map((p) => p.path);
+    assert.deepEqual(visible, ["default/notes/shared.md"], "草稿与「稳定但未发布」都不可见");
+
+    // 4. Revoke closes it.
+    assert.equal(owner.db.setShareGrant("d-alice-pack", false, "2026-11-22T04:00:00Z"), true);
+    assert.equal(owner.db.hasShareGrant("d-alice-pack"), false);
+
+    // The reader's own root has its own (empty) grant table — grants are not global.
+    assert.deepEqual(reader.db.shareGrants(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// New TABLES need the version bump too, not just new columns.
+//
+// Hit for real on 2026-11-22 (twice in one night): `migrate()` short-circuits
+// when the stored version matches, so a `CREATE TABLE IF NOT EXISTS` added
+// inside it never runs on an existing database. The idempotent guard makes the
+// statement look harmless; the version number is the only trigger.
+test("reopening an older database creates newly-added tables", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-tables");
+    // Simulate a database written before the share_grants table existed.
+    first.db.db.exec("DROP TABLE IF EXISTS share_grants; UPDATE schema_meta SET value = '5' WHERE key = 'version';");
+    const before = first.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_grants'").all() as Array<{ name: string }>;
+    assert.equal(before.length, 0, "前提：老库确实没有该表");
+
+    const second = new StoreRoot(data, "u-tables");
+    const after = second.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_grants'").all() as Array<{ name: string }>;
+    assert.equal(after.length, 1, "reopen 后必须建出新表");
+    // And it must be usable, not just present.
+    assert.deepEqual(second.db.shareGrants(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// Cross-root reads must be auditable by the owner (batch 4 task 4.3).
+//
+// "Who read my shared pages" is the owner's question, so the row lives in the
+// OWNER's database — not a global log, not the reader's. Separate from
+// oversight_reads, which records the owner looking at their own data.
+test("a cross-root read leaves an audit row in the owner's database", () => {
+  const data = tmpData();
+  try {
+    const owner = new StoreRoot(data, "u-audited");
+    owner.writePage("default", "notes", "p", newPage("note", "共享页", "正文", {}));
+    owner.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/p.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    owner.db.promotePage("default/notes/p.md", "stable", "测试", "2026-11-22T01:00:00Z");
+    owner.db.setPageShareable("default/notes/p.md", true, "2026-11-22T02:00:00Z");
+
+    assert.deepEqual(owner.db.shareReads(), [], "读之前没有记录");
+
+    owner.db.noteSharedRead("d-alice-pack", ["default/notes/p.md"], "2026-11-22T03:00:00Z");
+    const reads = owner.db.shareReads();
+    assert.equal(reads.length, 1);
+    assert.equal(reads[0].reader_root, "d-alice-pack");
+    assert.equal(reads[0].page_rel, "default/notes/p.md");
+    assert.equal(reads[0].ts, "2026-11-22T03:00:00Z");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("the share_reads table appears on a database that predates it", () => {
+  const data = tmpData();
+  try {
+    const first = new StoreRoot(data, "u-shareReads");
+    first.db.db.exec("DROP TABLE IF EXISTS share_reads; UPDATE schema_meta SET value='6' WHERE key='version';");
+    const before = first.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_reads'").all() as Array<{ name: string }>;
+    assert.equal(before.length, 0, "前提：老库没有该表");
+
+    const second = new StoreRoot(data, "u-shareReads");
+    const after = second.db.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='share_reads'").all() as Array<{ name: string }>;
+    assert.equal(after.length, 1, "reopen 后必须建出该表");
+    assert.deepEqual(second.db.shareReads(), []);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// ── downstream signals: citation and supersede ──────────────────────────────
+//
+// 2026-11-22: the two usage counters proved unusable as automatic criteria —
+// retrieval almost never fires (700:5, and those 5 were manual tests) and
+// injection is deterministic (98 pages shared the identical 7/78654). Citation
+// and supersede DO vary and answer the real question: did anyone build on this,
+// and did a newer page replace it.
+test("a superseded page can never be auto-promoted, even with usage", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-superseded");
+    root.writePage("default", "notes", "old", newPage("note", "旧结论", "正文", {}));
+    root.writePage("default", "notes", "new", newPage("note", "新结论", "正文", {}));
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/old.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    // The newer page supersedes the older one.
+    const oldId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get("%/old.md") as { page_id: string }).page_id;
+    root.db.db.prepare("INSERT INTO superseded_edges (superseded_id, by_path, project) VALUES (?,?,?)")
+      .run(oldId, "default/notes/new.md", "default");
+
+    // Heavily "used" — that must not save it.
+    for (let i = 0; i < 10; i++) root.db.notePagesRetrieved(["default/notes/old.md"]);
+
+    const c = root.db.classifyPendingProposals("default", { minRetrieved: 1 });
+    assert.equal(c.auto.length, 0, "被取代的页不该因为「用得多」而提升");
+    assert.equal(c.conflict.length, 1);
+    assert.match(c.conflict[0].why, /已被更新的页取代/);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("citation count is the primary positive signal", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-cited");
+    root.writePage("default", "notes", "base", newPage("note", "被引用的结论", "正文", {}));
+    const baseId = (root.db.db.prepare("SELECT page_id FROM pages WHERE path LIKE ?").get("%/base.md") as { page_id: string }).page_id;
+    // Three later pages cite it.
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `c${i}`, newPage("note", `引用 ${i}`, "正文", { sources: [baseId] } as never));
+    }
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/base.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    // No reads, no injections — only citations. Must still be enough.
+    const c = root.db.classifyPendingProposals("default", { minCited: 3 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/base.md"], "被引用 3 次足以支撑提升");
+    assert.match(c.auto[0].why, /cited_by=3/);
+
+    // And the threshold is inert when omitted.
+    assert.equal(root.db.classifyPendingProposals("default", {}).auto.length, 0, "没给阈值就不提升");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// Citation matching must understand the real sources format.
+//
+// 2026-11-22: a first version compared `j.value = page_id` and returned 0 for
+// every page in the live store, while 891 pages actually carried citations —
+// because sources entries are `session:<path>`, not bare ids. A criterion that
+// silently matches nothing looks exactly like "nobody cited this".
+test("cited_by matches session:<path> entries, not just bare ids", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-cite");
+    root.writePage("default", "notes", "base", newPage("note", "被引用的", "正文", {}));
+    // The shape the live store actually uses.
+    root.writePage("default", "notes", "c1", newPage("note", "引用一", "正文", { sources: ["session:default/notes/base.md"] } as never));
+    root.writePage("default", "notes", "c2", newPage("note", "引用二", "正文", { sources: ["session:default/notes/base.md"] } as never));
+    root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+      .run("default", "default/notes/base.md", "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+
+    const c = root.db.classifyPendingProposals("default", { minCited: 2 });
+    assert.deepEqual(c.auto.map((x) => x.page_rel), ["default/notes/base.md"], "session:<path> 形式的引用必须被算到");
+    assert.match(c.auto[0].why, /cited_by=2/);
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+// Process records are not conclusions — an OPT-IN filter, not a rule.
+//
+// Measured 2026-11-22: 16 of the 51 pages cited >=3 times start with '['
+// (`[substantive-user-turn] …`, `[conclusion] … 转交说明`). A task's execution,
+// handoff and evidence all cite the same pages, so process notes accumulate
+// citations without being reusable knowledge.
+//
+// Off by default on purpose: what the shared face should contain is a product
+// decision, not a correctness rule.
+test("excludeProcessNotes is opt-in and filters only bracketed titles", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-proc");
+    root.writePage("default", "notes", "real", newPage("note", "真实结论", "正文", {}));
+    root.writePage("default", "notes", "proc", newPage("note", "[substantive-user-turn] 执行记录", "正文", {}));
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `c${i}`, newPage("note", `引用${i}`, "正文", { sources: ["session:default/notes/real.md", "session:default/notes/proc.md"] } as never));
+    }
+    for (const slug of ["real", "proc"]) {
+      root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", `default/notes/${slug}.md`, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    }
+
+    // Default: both qualify — the filter is not a correctness rule.
+    const dflt = root.db.classifyPendingProposals("default", { minCited: 3 });
+    assert.equal(dflt.auto.length, 2, "默认不过滤，两条都在");
+
+    // Opt-in: the bracketed one drops out.
+    const filtered = root.db.classifyPendingProposals("default", { minCited: 3, excludeProcessNotes: true });
+    assert.deepEqual(filtered.auto.map((x) => x.page_rel), ["default/notes/real.md"], "开启后只留真结论");
+    assert.ok(filtered.no_signal.some((x) => x.page_rel === "default/notes/proc.md"), "被过滤的进 no_signal，不是消失");
   } finally {
     rmSync(data, { recursive: true, force: true });
   }

@@ -8,11 +8,11 @@
 // d-<packId>. Writes carry an optional audit identity (principal + scope)
 // recorded as companion rows.
 
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, appendFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
-import { execFileSync } from "node:child_process";
-import { RootDb, HandoffRow } from "./db.js";
+import { execFile, execFileSync } from "node:child_process";
+import { RootDb, HandoffRow, ObservationRow, observationDigest } from "./db.js";
 import { namespaceParts } from "./auth.js";
 import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
 import { sanitize } from "./sanitize.js";
@@ -77,6 +77,12 @@ export class StoreRoot {
   readonly wikiDir: string;
   readonly db: RootDb;
   private gitTimer: NodeJS.Timeout | null = null;
+  /** Serialises git add/commit pairs — two overlapping runs race on index.lock. */
+  private snapshotInFlight = false;
+  /** When the last snapshot completed; drives the throttle window. */
+  private lastSnapshotAt = 0;
+  /** Most recent label awaiting a snapshot ("" means "already captured"). */
+  private pendingSnapshotLabel: string | null = null;
 
   constructor(dataDir: string, rootKey: string) {
     this.rootDir = join(dataDir, "owners", rootKey);
@@ -101,6 +107,12 @@ export class StoreRoot {
         execFileSync("git", ["init", "-q"], { cwd: this.wikiDir, stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "config", "user.email", "fd-memory@localhost"], { stdio: "ignore" });
         execFileSync("git", ["-C", this.wikiDir, "config", "user.name", "fd-memory"], { stdio: "ignore" });
+        // Compact sooner than git's default (2026-11-19). The wiki commits once
+        // per page write, so loose objects accumulate fast: measured 5,729 loose
+        // objects / 426MB after ~17k commits, against a default threshold of
+        // 6,700 — it would have grown for days more before tripping. 500 keeps
+        // the repo small with a cheap check on each snapshot.
+        execFileSync("git", ["-C", this.wikiDir, "config", "gc.auto", "500"], { stdio: "ignore" });
         this.gitAvailable = true;
       } catch {
         this.gitAvailable = false;
@@ -108,18 +120,83 @@ export class StoreRoot {
     }
   }
 
+  /**
+   * Wiki snapshot to git — ASYNC and throttled (2026-11-18 root cause).
+   *
+   * The bug this replaces: every `writePage` scheduled a 500ms timer that ran
+   * `execFileSync("git", ["add","-A"])` + `execFileSync("git", ["commit"])` ON
+   * THE EVENT LOOP. Measured: the wiki's `.git` was 504MB with **16,655
+   * commits**, and one `git add -A` took 0.13–0.24s when the machine was idle —
+   * far worse under load. `/observe` runs ~9×/min, so the loop was being
+   * blocked continuously. The stall watchdog caught 2.4 / 2.6 / 4.3 / 4.5 /
+   * 6.7 / 8.8 / 9.0-second stalls, every one labelled `POST /observe`.
+   *
+   * Why it took fifteen rounds to find: every hypothesis pointed at I/O,
+   * slow queries, or connections — and SQLite queries genuinely measured
+   * 0.01–0.03s. The cost was never the disk; it was walking a repo index that
+   * had grown to sixteen thousand commits.
+   *
+   * Two changes, both needed:
+   *  · `execFile` instead of `execFileSync` — the git work moves off the loop.
+   *  · THROTTLE_MS between commits — one commit per page was the actual source
+   *     of the growth. A snapshot is a recovery aid, not a per-write guarantee,
+   *     so batching is the right trade.
+   *
+   * `inFlight` serialises runs: two overlapping `git add`/`commit` pairs race
+   * on `index.lock`, and a failed pair was silently swallowed before.
+   */
+  private static readonly SNAPSHOT_DEBOUNCE_MS = 500;
+  private static readonly SNAPSHOT_THROTTLE_MS = 30_000;
+
   snapshotSoon(label: string): void {
-    if (this.gitTimer) return;
+    this.pendingSnapshotLabel = label;
+    if (this.gitTimer || this.snapshotInFlight) return;
+    // If a snapshot ran recently, wait out the remainder of the throttle rather
+    // than dropping the request: the last write before a quiet period must
+    // still land, otherwise the git history silently stops at the last busy
+    // moment.
+    const since = Date.now() - this.lastSnapshotAt;
+    const wait = Math.max(StoreRoot.SNAPSHOT_DEBOUNCE_MS, StoreRoot.SNAPSHOT_THROTTLE_MS - since);
     this.gitTimer = setTimeout(() => {
       this.gitTimer = null;
-      if (!this.gitAvailable) return;
-      try {
-        execFileSync("git", ["-C", this.wikiDir, "add", "-A"], { stdio: "ignore" });
-        execFileSync("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { stdio: "ignore" });
-      } catch {
-        /* git snapshot is best-effort; wiki writes are already durable */
+      this.runSnapshot();
+    }, wait);
+    this.gitTimer.unref?.();
+  }
+
+  private runSnapshot(): void {
+    if (this.snapshotInFlight || !this.gitAvailable) return;
+    this.snapshotInFlight = true;
+    const label = this.pendingSnapshotLabel ?? "snapshot";
+    const done = () => {
+      this.snapshotInFlight = false;
+      this.lastSnapshotAt = Date.now();
+      // A write may have arrived while this run was in flight; schedule once
+      // more so the final state is captured rather than lost.
+      if (this.pendingSnapshotLabel !== null && this.pendingSnapshotLabel !== label) {
+        this.pendingSnapshotLabel = null;
+        this.snapshotSoon("");
       }
-    }, 500);
+    };
+    execFile("git", ["-C", this.wikiDir, "add", "-A"], { timeout: 120_000 }, (err) => {
+      if (err) return done(); // best-effort: wiki writes are already durable
+      execFile("git", ["-C", this.wikiDir, "commit", "-q", "-m", label, "--allow-empty"], { timeout: 120_000 }, () => {
+        // Opportunistic compaction (2026-11-19). Measured: the wiki's `.git` had
+        // grown to 510MB — 426MB of it LOOSE objects from 17,355 commits, one
+        // per page write. `git gc` packed it to 71MB in one run (442MB back).
+        //
+        // `--auto` (not a plain `gc`) is the point: it is a no-op unless the
+        // repo is over `gc.auto`, so the steady state costs one cheap
+        // `count-objects` check. We also lower `gc.auto` (see the constructor)
+        // because the default 6,700-object threshold took days to trip in a repo
+        // that commits this often.
+        //
+        // Not awaited and errors ignored: a compaction failure must never block
+        // or fail a page write — the wiki content is already durable, the git
+        // history is a recovery aid.
+        execFile("git", ["-C", this.wikiDir, "gc", "--auto", "--quiet"], { timeout: 600_000 }, () => done());
+      });
+    });
   }
 
   // projectDir: the project's wiki subtree (persons may carry p/<name>, d/
@@ -133,6 +210,94 @@ export class StoreRoot {
     mkdirSync(dir, { recursive: true });
     projectManifest(dir, project);
     return dir;
+  }
+
+  // appendObservation: the L0 capture lane's durable write.
+  //
+  // Why this exists (change yongyi-multi-agent-memory-plane, requirement
+  // "L0 捕获流 MUST 为 append-only 且可重建索引"): the observations table used
+  // to be the ONLY copy of hook-captured events — insert into SQLite, done.
+  // That made it simultaneously truth and index, so switching storage backends
+  // (or losing the DB file) lost events outright. Every other lane (pages,
+  // handoffs) had the wiki as truth and could be rebuilt by `reindex`; this one
+  // could not. Now the append-only JSONL under <project>/observations/_log/ is
+  // the truth and the SQLite row is a rebuildable index.
+  //
+  // Order matters: the truth write happens FIRST and is never undone by an
+  // index failure. A turn must not be blocked or lost because the index is
+  // locked — that is exactly the failure mode we hit with SQLite under
+  // concurrent writers (25ms busy_timeout, 1275 "database is locked" in a day).
+  appendObservation(o: ObservationRow): { stored: boolean; indexed: boolean } {
+    const dir = this.ensureProject(o.project ?? "default");
+    const logDir = join(dir, "observations", "_log");
+    mkdirSync(logDir, { recursive: true });
+    const record = {
+      session_id: o.session_id,
+      agent: o.agent,
+      event: o.event,
+      tool: o.tool ?? null,
+      summary: o.summary,
+      created_at: o.created_at,
+      project: o.project ?? "default",
+    };
+    // One JSON object per line: appended, never rewritten. Rotation is by
+    // month so a single file stays bounded without needing a compaction pass.
+    const logPath = join(logDir, `${o.created_at.slice(0, 7)}.jsonl`);
+    appendFileSync(logPath, JSON.stringify(record) + "\n", "utf8");
+
+    let indexed = true;
+    try {
+      this.db.addObservation(o);
+    } catch (err) {
+      // Truth is safe; the index can be rebuilt from the log. Surface it in the
+      // return value so callers can report a degraded capture instead of a
+      // failed one.
+      indexed = false;
+      console.error(`[appendObservation] truth written, index failed: ${(err as Error).message}`);
+    }
+    return { stored: true, indexed };
+  }
+
+  /**
+   * Withdraw every observation an import harness wrote (change
+   * add-harness-memory-import, requirement "导入记忆 MUST 标注来源并可整批撤回").
+   *
+   * Two properties this has to keep:
+   *
+   *  - **The log is never rewritten.** The retract appends a marker line naming
+   *    each withdrawn row by digest (session_id + summary), then drops the index
+   *    rows. `replayObservationsFromLog` collects markers before inserting, so a
+   *    rebuild reproduces "withdrawn" instead of resurrecting rows the user asked
+   *    to remove. Deleting from the log instead would make the truth mutable and
+   *    lose the audit trail.
+   *  - **A later re-import survives.** The marker carries one digest per withdrawn
+   *    row and replay spends those allowances one at a time, so bytes appended
+   *    after the retract (a deliberate re-import) are kept.
+   *
+   * Markers are written per project because the log is per project. The caller
+   * reads back `markers`/`deleted` so "nothing matched" and "matched nothing
+   * because the label is wrong" stay distinguishable.
+   */
+  retractObservations(labels: string[], at = new Date().toISOString()): { markers: number; projects: string[]; deleted: number } {
+    const projects = this.db.projectsForAgentLabels(labels);
+    let markers = 0;
+    let deleted = 0;
+    for (const project of projects) {
+      const rows = this.db.observationsForAgentLabels(labels, project);
+      if (rows.length === 0) continue;
+      const dir = join(this.ensureProject(project), "observations", "_log");
+      mkdirSync(dir, { recursive: true });
+      const logPath = join(dir, `${at.slice(0, 7)}.jsonl`);
+      const retracted = rows.map((r) => observationDigest(r.session_id, r.summary));
+      appendFileSync(
+        logPath,
+        JSON.stringify({ _retract: true, labels, project, at, retracted }) + "\n",
+        "utf8",
+      );
+      markers++;
+      deleted += this.db.deleteObservationsByAgent(labels, project);
+    }
+    return { markers, projects, deleted };
   }
 
   writePage(project: string, typeDir: string, slug: string, page: ReturnType<typeof newPage>, audit?: AuditIdentity): string {

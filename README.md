@@ -7,6 +7,9 @@ Working memory for agentic platforms — durable, layered, self-distilling memor
 
 > **永久免费**：永忆本体自托管免费，无计量面、无付费墙、无 license 检查机制；嵌入与蒸馏的模型成本由运营者自担（BYO 模型）。Free forever — self-host free, no metering, no paywall; bring your own model budget.
 
+> **别和 `FindDataTechnology/finddata-memory` 搞混。** 那个是**我们自己的 agent 记忆账本**
+> （Markdown 索引 + 事故取证记录，内部用），不是本产品的代码仓。名字像，内容无关。
+
 ## 为什么
 
 Agentic 平台的共同问题：
@@ -209,6 +212,69 @@ graph.invoke(inputs, config={"callbacks": [handler]})
 ### 换工具不换记忆
 
 `--as` 绑定的是人根身份（`u/<id>`）：同一身份在多个 harness 接入，写入自动合流到同一 u/ 根。Claude Code 会话里记下的部署口径，在 ZCode 新会话的 digest 里直接可召回；跨来源的更正经蒸馏接替旧结论；每页带 harness 来源标注，Portal 可见。断开任何一个工具都不删记忆。合流只发生在同一 person 根内——deployment 根（d/<pack>/<member>）不参与，岗位私有分区不串门。
+
+### 导入已有记忆（接入之前的历史）
+
+接入永忆之前的会话不会自动进来。两个命令解决：**导入**把历史拉进永忆，**送达**把记忆摆到 harness 会读的位置。
+
+```bash
+# 1. 先看会导入什么（不写任何东西）
+yongyi import claude-code --root <rootKey> --dry-run
+
+# 2. 实际导入（分批、可中断、可重跑）
+yongyi import claude-code --root <rootKey> --project default --batch 200 --pause 200
+
+# 3. 把记忆送到 harness 启动时会读的文件
+yongyi deliver --root <rootKey> --project default --file /path/to/CLAUDE.md
+```
+
+**导入不是全量搬运。** 实测本机 28 个 Claude Code 转录（4.8 万行 / 1 582 条会话回合）筛选后只保留 32 条——因为长期记忆要的是「配方与结论」，不是「说过的话」。筛掉的仍留在源里，调整规则可重跑。
+
+| 规则 | 收什么 |
+|---|---|
+| `explicit-remember` | 用户显式要求记住的（记住/以后都/必须/always） |
+| `conclusion` | 结论性语句（决定/结论/口径/约定） |
+| `handoff` | 未竟事项与交接（待办/下一步/未完成） |
+| `substantive-user-turn` | 用户提出的实质性问题（长度足够、非纯指令） |
+
+只取**用户侧**：助手复述你的「记住」不算记忆，否则同一件事记两遍还归错因。harness 注入的信封（`<task-notification>`、slash command 回显、skill 正文）一律当噪声丢弃——它们不是你说的。
+
+**送达写的是受管区块**（`<!-- yongyi:memory:begin -->` … `end`），区块外逐字不动，重复送达幂等，`--off` 断开后文件恢复原状且记忆保留。送达**不会**碰 harness 的会话存储——不改 Claude Code 的 JSONL 链，也不往 ZCode 的消息表插数据（那是一个 8.4 GB、30 并发写、`busy_timeout` 仅 25 ms 的库，往里加写入者只会拖垮它）。
+
+**当前支持**：Claude Code、ZCode（提取 + 筛选 + 导入 + 送达）。Cursor / Codex 尚未实现。
+
+ZCode 的提取走它自己的标记，不靠猜：
+
+```bash
+yongyi import zcode --root <rootKey> --db ~/.zcode/cli/db/db.sqlite --dry-run
+```
+
+| 关卡 | 依据 | 实测效果 |
+|---|---|---|
+| `part.type == 'text'` | ZCode 的 part 类型（另有 tool / reasoning / step-*） | 只取正文 |
+| `part.synthetic != true` | **ZCode 自己打的注入标记** | 滤掉 91.4% 的 user 侧文本（token 计数、工具提醒、hook 上下文） |
+| `message.role == 'user'` | 角色在 message、正文在 part | 排除助手推理 |
+| 内置规则 | 同 Claude | 3 000 条候选 → 1 034 条 |
+
+全库实测：852 千条消息、8.5 GB，顺序扫描约 46 秒；抽样 3 000 条产出 1 034 条记忆。
+
+**已知局限**：
+
+- harness 已清理的历史无法导入（源里没有就是没有）
+- 工具调用的输入输出不入库（体量大、信噪比低）
+- 只做单向导入，不把记忆写回 harness 的会话历史
+
+### L0 真源与索引重建
+
+平台侧捕获的回合事件（`/observe`、`/hook`）以 append-only JSONL 为真源（`<project>/observations/_log/<YYYY-MM>.jsonl`），SQLite 的 `observations` 表只是可重建的索引。
+
+索引写失败时**真源仍然落盘**，捕获返回 `degraded` 而非失败——一条记录不该因为索引锁住就丢掉。索引丢了或换后端后用真源重建：
+
+```bash
+yongyi replay --root <rootKey>
+```
+
+
 
 ## 配置（生产）
 

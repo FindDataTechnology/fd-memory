@@ -8,7 +8,7 @@
 
 import { StoreRoot, rootKeyForNamespace, normalizeMetadata } from "./store.js";
 import { namespaceParts, Scope } from "./auth.js";
-import { PageFilter } from "./db.js";
+import { PageFilter, pageFilterSql } from "./db.js";
 import { newPage } from "./okf.js";
 import { randomUUID } from "node:crypto";
 
@@ -166,6 +166,10 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
   // overview's name.
   const OVERVIEW_PARTITIONS = 25;
   const OVERVIEW_TITLES = 3;
+  // Domain lookups are "what do we have on this thing" — a compass, not an
+  // export. Capped like the overview so a broad value (a party shared by many
+  // matters) cannot turn one call into a bulk dump.
+  const DOMAIN_LOOKUP_LIMIT = 50;
 
   const clampListLimit = (raw: unknown): number => {
     const n = Math.floor(Number(raw));
@@ -285,9 +289,18 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         // Newest first is the useful order for "is one addressed to me, and how
         // recent is it" — the old query sorted ascending and the caller read the
         // whole list anyway.
-        const all = root.db.openHandoffs(r.projects)
-          .slice()
-          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+        //
+        // `reverse()`, not a comparator, and that matters: `created_at` is
+        // millisecond ISO text, so handoffs opened in one tick (a fleet round, a
+        // batch import, a 30-iteration loop) compare EQUAL. `openHandoffs`
+        // returns `ORDER BY created_at, rowid ASC`, so reversing yields
+        // created_at DESC *and* rowid DESC — "later is newer" holds for ties too.
+        // Sorting by created_at alone is stable, which preserves the ties in
+        // ASCENDING rowid order, i.e. oldest-first among same-millisecond rows:
+        // that is precisely the ~1-in-6 flake seen 2026-11-18 in
+        // `mcp tools: handoff list is capped, newest-first`.
+        // (Ordering by `id` would not help — ids are randomUUID.)
+        const all = root.db.openHandoffs(r.projects).slice().reverse();
         let summariesTruncated = 0;
         const handoffs = all.slice(0, cap).map((row) => {
           const gist = clip(row.summary, HANDOFF_SUMMARY_CHARS);
@@ -470,6 +483,11 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
         if (!seg || !may(seg, "r")) return err("forbidden_project");
         const page = root.readPageByRel(rel);
         if (!page) return err("not_found");
+        // forgotten_at is the store's one definition of "withdrawn" (forgetPage /
+        // retractHarness frontmark it) — the search and recent faces filter it
+        // via the dropped index row, so this body face must too, or a retracted
+        // import stays readable by path (add-harness-memory-import 4.2).
+        if (page.frontmatter?.forgotten_at) return err("not_found");
         const bodyText = String(page.body ?? "");
         // Byte-bounded paging (optimize-yongyi-read-surfaces 2.2). Measured on
         // production the largest page is 10.7 KB, so this cap never fires today
@@ -524,6 +542,23 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           // Structured metadata (add-agent-memory-foundation): machine
           // addressing rides HERE, never in the title string.
           metadata: { type: "object", description: "Optional structured key/values (scalars or arrays of scalars) — the structured filter lane reads this." },
+          // Explicit correction (2026-11-20). Before this the write face had NO
+          // way to say "this replaces an earlier conclusion": supersedes existed
+          // in the page model, the edge table, and the distill lane, but
+          // appeared 0 times in this file — and MCP is the ONLY way a session
+          // writes memory. Measured: 16 of 57,852 pages had ever used it, so
+          // changing a conclusion three times left three pages side by side and
+          // readers had no way to tell which was current.
+          //
+          // Values are page ids (basename minus .md — the vocabulary
+          // superseded_edges already speaks), NOT paths: a path changes when a
+          // page is rewritten, an id does not. Superseded pages stay readable
+          // through read_page/history; they simply stop being current.
+          supersedes: {
+            type: "array",
+            items: { type: "string" },
+            description: "Page ids this page replaces (the `page` field returned when the old page was written, or a path's basename without .md). Those pages leave the injection and digest faces but remain readable via read_page. Unknown ids are ignored rather than rejected, so a typo never blocks the write.",
+          },
           ...targetProps,
         },
         required: ["title", "body"],
@@ -550,9 +585,120 @@ export function buildTools(scope: Scope, root: StoreRoot, grants: GrantCheck, no
           if (["draft", "stable", "canonical"].includes(tier)) extra.tier = tier;
           if (args.origin) extra.origin = String(args.origin);
         }
+        // Explicit correction rides the page model's existing `supersedes`
+        // frontmatter key, so the edge table and every read face pick it up
+        // through the same path a distilled correction takes.
+        //
+        // Unknown ids are IGNORED, not rejected: a correction is a deliberate
+        // act the user asked for, and failing the whole write because one id
+        // was misspelled would lose the new conclusion too. The tool
+        // description says so, so the behaviour is not a surprise.
+        if (Array.isArray(args.supersedes)) {
+          const ids = args.supersedes.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20);
+          if (ids.length > 0) extra.supersedes = ids;
+        }
         const rel = root.writePage(w.project!, dir, randomUUID().slice(0, 8), newPage(type, String(args.title), String(args.body), extra), auditOf(w.project!));
         notifyWrite(w.project!);
+        // Domain-key hint (add-domain-memory-schema). Reported, never enforced:
+        // the storage layer's standing rule is that the truth write happens
+        // first and is never undone, so a missing companion key must not turn a
+        // deliberate memory into a failed one. Making it visible is the point —
+        // a hint nobody can see is the same as no schema at all.
+        //
+        // The declared key (add-memory-schema-axis) drives WHICH domain is being
+        // asked about; without a declaration this is the old infer-from-metadata
+        // behaviour, byte for byte. That read is what makes `schema.key_by` have
+        // a consumer rather than being a declaration nothing honours.
+        const declaredKey = root.db.declaredDomainKey(w.project!);
+        const hint = root.db.domainHintFor(meta as Record<string, unknown> | null, declaredKey);
+        if (hint && hint.missing.length > 0) {
+          return text({
+            path: rel,
+            source: sourceOf(w.project!),
+            domain_hint: {
+              domain: hint.domain,
+              present: hint.present,
+              missing: hint.missing,
+              note: `这条记忆已按 ${hint.domain} 域保存，但缺少同域的 ${hint.missing.join(", ")}。补上之后可以按该键聚拢与召回；不补也能读，只是召回时只能按别的条件找。`,
+            },
+          });
+        }
         return text({ path: rel, source: sourceOf(w.project!) });
+      },
+    },
+    {
+      name: "memory_by_domain",
+      description:
+        "Recall everything filed under a domain value — the instrument, party, case number, supplier or SKU — WITHOUT knowing which metadata key the writer used. " +
+        "Answers 'what do we have on this thing' directly: pass the value you already have (a ticker, a party name) and it finds which domain key carries it, then returns those pages. " +
+        "If the value matches more than one domain key, all of them are reported rather than one being guessed. Read-only.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          value: { type: "string", description: "The domain value to look up, e.g. a ticker '600519' or a party name." },
+          limit: { type: "number", description: `Max pages to return (default ${DOMAIN_LOOKUP_LIMIT}).` },
+          // Composable with the same filter shape the other read tools take
+          // (add-domain-memory-schema: "MUST 与既有的 project、时间窗口、类型等
+          // 过滤条件可组合"). Without it a caller could not ask "this
+          // instrument, since the last review, notes only" — the spec requires
+          // the three conditions to intersect rather than one being ignored.
+          filter: FILTER_SCHEMA,
+          ...targetProps,
+        },
+        required: ["value"],
+      },
+      handler: (args) => {
+        const r = readProjects(args.target);
+        if (r.error) return r.error;
+        const value = String(args.value ?? "").trim();
+        if (!value) return err("missing_domain_value", { hint: "pass the value you want to look up, e.g. a ticker or a party name" });
+        const cap = Math.min(clampListLimit(args.limit), DOMAIN_LOOKUP_LIMIT);
+        const matches = root.db.domainKeysForValue(value, r.projects);
+        if (matches.length === 0) {
+          return text({
+            value, matches: [], pages: [],
+            note: "没有任何领域键带这个值。可能是没人按领域记过，或值拼写不同（例如带交易所前缀）。",
+          });
+        }
+        // Query each matching key separately and merge, so a value that is both
+        // a party and a case number returns both sets instead of whichever key
+        // happened to be checked first.
+        const seen = new Set<string>();
+        const pages: Array<Record<string, unknown>> = [];
+        // `projects: null` means "no partition restriction" (a person token owns
+        // its whole root) — it is not an empty list. Passing JSON.stringify(null)
+        // into json_each yields the single value "null", which matches no row,
+        // so the lookup silently returned nothing for exactly the callers who
+        // have the broadest access.
+        const projectClause = r.projects ? "AND project IN (SELECT value FROM json_each(?))" : "";
+        // Composable filters (add-domain-memory-schema). Reuses the same
+        // readFilter the other read faces take, so the three conditions
+        // INTERSECT — a caller asking "instrument X, since last week, notes
+        // only" gets the intersection, never just one of them.
+        const f = readFilter(args);
+        if (f.error) return f.error;
+        const extra = pageFilterSql(f.filter, null, "project", "updated_at", "type");
+        for (const m of matches) {
+          const args: unknown[] = [];
+          if (r.projects) args.push(JSON.stringify(r.projects));
+          args.push(`$."${m.key}"`, value, ...(extra.args as unknown[]), cap);
+          const rows = root.db.db
+            .prepare(`SELECT path, project, type, title, updated_at FROM pages WHERE 1=1 ${projectClause} AND json_extract(metadata, ?) = ?${extra.clause} ORDER BY updated_at DESC LIMIT ?`)
+            .all(...(args as never[])) as Array<{ path: string; project: string; type: string; title: string; updated_at: string }>;
+          for (const row of rows) {
+            if (seen.has(row.path)) continue;
+            seen.add(row.path);
+            pages.push({ ...row, domain: m.domain, domain_key: m.key, source: sourceOf(row.project) });
+          }
+        }
+        pages.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
+        return text({
+          value,
+          matches,
+          total: pages.length,
+          truncated: pages.length > cap,
+          pages: pages.slice(0, cap),
+        });
       },
     },
     {

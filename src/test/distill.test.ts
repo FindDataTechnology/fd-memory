@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { TokenStore } from "../auth.js";
 import { StoreRoot } from "../store.js";
 import { distillCandidates } from "../distill.js";
-import { DistillScheduler } from "../distill-scheduler.js";
+import { DistillScheduler, EXTRACT_MAX_TOKENS } from "../distill-scheduler.js";
 import { Service } from "../http.js";
 import { createServer } from "node:http";
 
@@ -90,6 +90,29 @@ test("mcp reads: mixed-layer project yields layer + sources on L2 rows", async (
     assert.ok(rec.observations.every((o: { layer: string }) => o.layer === "L0"));
   } finally {
     await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
+    rmSync(data, { recursive: true, force: true });
+  }
+});
+
+test("candidates: a page retired in one project must stay visible in another", () => {
+  // 2026-11-20 实测缺陷：supersededIds() 返回全库并集，而 page_id 只是
+  // basename，只在单个 project 内唯一。于是 alpha 的更正让 beta 里同名的
+  // 活页从 digest 里静默消失——用户以为那条结论还在，其实已经召回不到了。
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "d-packS");
+    root.writeDistillPage("alpha", "experience", { id: "exp_x", engine: "e", task: "旧结论", search_keys: ["dns"], solution: "old", sources: [], supersedes: [] });
+    root.writeDistillPage("alpha", "experience", { id: "exp_y", engine: "e", task: "新结论", search_keys: ["dns"], solution: "new", sources: [], supersedes: ["exp_x"] });
+    // beta 里同名 exp_x，没有被任何人接替
+    root.writeDistillPage("beta", "experience", { id: "exp_x", engine: "e", task: "beta 的独立结论", search_keys: ["dns"], solution: "beta", sources: [], supersedes: [] });
+
+    const alphaHits = distillCandidates(root, ["alpha"], "DNS");
+    assert.ok(!alphaHits.map((c) => c.id).includes("exp_x"), "alpha 自己的 exp_x 确实被接替");
+
+    const betaHits = distillCandidates(root, ["beta"], "DNS");
+    assert.ok(betaHits.map((c) => c.id).includes("exp_x"),
+      `beta 的 exp_x 没有被接替，必须仍是候选；实际 ${JSON.stringify(betaHits.map((c) => c.id))}`);
+  } finally {
     rmSync(data, { recursive: true, force: true });
   }
 });
@@ -256,7 +279,7 @@ test("d-root: a budget stop is persisted in the ledger, not only logged (11-13 c
       // with the call budget at 1 it must be refused, which is the stop we count.
       return { ok: true, status: 200, json: async () => ({
         facts: [], experiences: [], cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 7500, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -365,7 +388,7 @@ test("d-root: a truncating batch is held for the next round, not split mid-reque
       return { ok: true, status: 200, json: async () => ({
         facts: [], experiences: [],
         cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 7500, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -482,7 +505,7 @@ test("d-root: the budget binds BETWEEN calls, not once per run (11-12 production
       return { ok: true, status: 200, json: async () => ({
         facts: [], experiences: [],
         cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 4000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 7500, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -715,7 +738,7 @@ test("d-root: a truncated single-batch run holds the cursor instead of advancing
         facts: [], experiences: [],
         cursor_next: { obs: 9999, handoff: "2999-01-01T00:00:00.000Z" },
         // Every call sits exactly on the ceiling, so splitting cannot rescue it.
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 30000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 30000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 36000, errors: [],
       }) };
     }) as unknown as typeof fetch,
@@ -763,7 +786,7 @@ test("d-root: a held batch is attempted again within 30 minutes (hold must not s
       // 每次抽取都顶到 6,000 天花板 → 必被扣住
       return { ok: true, status: 200, json: async () => ({
         facts: [], experiences: [], cursor_next: {},
-        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: 6000 }],
+        llm_calls: [{ stage: "coding_extract", ok: true, prompt_tokens: 18000, completion_tokens: EXTRACT_MAX_TOKENS }],
         tokens: 24000, errors: [],
       }) };
     }) as unknown as typeof fetch,

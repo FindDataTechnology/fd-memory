@@ -14,7 +14,15 @@ import { TokenStore } from "../auth.js";
 // claude-code/zcode get file-level adapters; mcp is the paste-ready generic
 // snippet; dify/coze are recipe-shaped (UI-configured platforms — no config
 // file to write, see adapters.ts).
-export type Harness = "claude-code" | "zcode" | "mcp" | "dify" | "coze";
+export type Harness =
+  | "claude-code"
+  | "zcode"
+  | "workbuddy"
+  | "gemini-cli"
+  | "qwen"
+  | "mcp"
+  | "dify"
+  | "coze";
 
 export interface Binding {
   url: string;
@@ -97,6 +105,27 @@ export function writeEnvFile(path: string, creds: CredentialFile, url: string): 
 
 export function credentialPaths(yongyiDir: string): { creds: string; env: string } {
   return { creds: yongyiDir + "/credentials.json", env: yongyiDir + "/env" };
+}
+
+// ── shell-profile export (unify-harness-delivery 1.2) ────────────────────────
+//
+// The MCP entry references `${YONGYI_TOKEN_<HARNESS>}` — a reference, never a
+// literal, and that rule is what keeps tokens out of harness configs. But a
+// reference only resolves if something exports the variable, and nothing did:
+// `~/.yongyi/env` was written by connect and sourced by nobody, so the MCP
+// entry 401'd on every call while hooks kept working (they read the credential
+// file directly). This is the missing half.
+//
+// The block carries a `source` line, not the token: the 0600 env file stays the
+// only place the token lives, and removing the block (disconnect) leaves nothing
+// behind.
+export const PROFILE_BEGIN = "# >>> yongyi >>>";
+export const PROFILE_END = "# <<< yongyi <<<";
+
+export function profileSourceLine(envPath: string): string {
+  // Single-quote the path: no expansion, so a home dir with spaces or `$` is safe.
+  const escaped = envPath.replace(/'/g, `'\\''`);
+  return `[ -f '${escaped}' ] && . '${escaped}'`;
 }
 
 export function fileExists(p: string): boolean {

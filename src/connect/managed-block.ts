@@ -17,23 +17,30 @@ export interface BlockEdit {
   changed: boolean;
 }
 
-function blockText(inner: string): string {
-  return BLOCK_BEGIN + "\n" + inner.trim() + "\n" + BLOCK_END + "\n";
+export interface Markers {
+  begin: string;
+  end: string;
+}
+
+const DISCIPLINE: Markers = { begin: BLOCK_BEGIN, end: BLOCK_END };
+
+function blockText(inner: string, m: Markers): string {
+  return m.begin + "\n" + inner.trim() + "\n" + m.end + "\n";
 }
 
 // Region [begin, end) covered by a well-formed block: from the begin marker to
 // the end marker, plus one immediately-following newline when present.
-function blockRegion(content: string, beginIdx: number): { start: number; end: number } | null {
-  const endIdx = content.indexOf(BLOCK_END, beginIdx + BLOCK_BEGIN.length);
+function blockRegion(content: string, beginIdx: number, m: Markers): { start: number; end: number } | null {
+  const endIdx = content.indexOf(m.end, beginIdx + m.begin.length);
   if (endIdx < 0) return null; // unterminated block — handled by caller
-  let end = endIdx + BLOCK_END.length;
+  let end = endIdx + m.end.length;
   if (content[end] === "\n") end += 1;
   return { start: beginIdx, end };
 }
 
-export function upsertManagedBlock(content: string, inner: string): BlockEdit {
-  const beginIdx = content.indexOf(BLOCK_BEGIN);
-  const fresh = blockText(inner);
+export function upsertManagedBlock(content: string, inner: string, markers: Markers = DISCIPLINE): BlockEdit {
+  const beginIdx = content.indexOf(markers.begin);
+  const fresh = blockText(inner, markers);
 
   if (beginIdx < 0) {
     // No block yet — append. Exactly one separating newline (ours) unless the
@@ -42,7 +49,7 @@ export function upsertManagedBlock(content: string, inner: string): BlockEdit {
     return { text: content + sep + fresh, changed: true };
   }
 
-  const region = blockRegion(content, beginIdx);
+  const region = blockRegion(content, beginIdx, markers);
   if (!region) {
     // Unterminated block (begin without end): treat everything from begin to
     // EOF as ours and rebuild cleanly.
@@ -56,11 +63,11 @@ export function upsertManagedBlock(content: string, inner: string): BlockEdit {
   return { text: content.slice(0, region.start) + fresh + content.slice(region.end), changed: true };
 }
 
-export function removeManagedBlock(content: string): BlockEdit {
-  const beginIdx = content.indexOf(BLOCK_BEGIN);
+export function removeManagedBlock(content: string, markers: Markers = DISCIPLINE): BlockEdit {
+  const beginIdx = content.indexOf(markers.begin);
   if (beginIdx < 0) return { text: content, changed: false };
 
-  const region = blockRegion(content, beginIdx);
+  const region = blockRegion(content, beginIdx, markers);
   if (!region) {
     // Unterminated: remove begin-to-EOF (and our separator, if any).
     const before = stripOurTrailingNewline(content.slice(0, beginIdx));

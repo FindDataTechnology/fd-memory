@@ -42,3 +42,35 @@ test("keepwarm: embed failures are swallowed (silent opportunism)", async () => 
   kw.stop();
   assert.ok(true, "no unhandled rejection escaped");
 });
+
+test("keepwarm honours the GLOBAL embed switch, not just its own (2026-11-18)", async () => {
+  // Found in production: FD_MEMORY_EMBED=off was set, the gateway has no
+  // embedding model, and this lane still pinged /embed every 4 minutes — a
+  // guaranteed 404 forever. The lane had its own kill switch and never
+  // consulted the global one: the same "switch honoured at one seam and
+  // ignored at another" shape as hybridCandidates (fixed the same day).
+  // Keep-warm is pure opportunism, so silencing it when embeddings are off
+  // costs nothing.
+  const { calls, impl } = countingFetch();
+  const kw = startEmbedKeepwarm({
+    env: { FD_MEMORY_DISTILLER_URL: "http://sidecar.test", FD_MEMORY_EMBED: "off" },
+    fetchImpl: impl,
+    intervalMs: 30,
+  });
+  await new Promise((r) => setTimeout(r, 120));
+  kw.stop();
+  assert.equal(calls.length, 0, "FD_MEMORY_EMBED=off must stop keep-warm pings entirely");
+
+  // The pair: with embeddings ON (unset), the same env must ping — otherwise a
+  // gate that is accidentally always-on would pass the assertion above while
+  // silently killing warmth for every real deployment.
+  const { calls: onCalls, impl: onImpl } = countingFetch();
+  const on = startEmbedKeepwarm({
+    env: { FD_MEMORY_DISTILLER_URL: "http://sidecar.test" },
+    fetchImpl: onImpl,
+    intervalMs: 30,
+  });
+  await new Promise((r) => setTimeout(r, 120));
+  on.stop();
+  assert.ok(onCalls.length >= 1, `unset must keep pinging (saw ${onCalls.length})`);
+});

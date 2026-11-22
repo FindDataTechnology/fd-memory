@@ -198,6 +198,16 @@ async def embed_texts(provider_factory, texts):
     SAME provider env the engine uses. Returns (vectors, model, tokens, errors)."""
     errors = []
     vectors = []
+    # The kill switch has to be honored HERE too, not only on the /embed route
+    # (2026-11-22 measured). `app.py` answers /embed without touching upstream
+    # when MEMORY_EMBED=off, but distill() calls this function directly — so the
+    # switch silenced the standalone endpoint while every distillation still
+    # tried to reach the embedding lane, failed with FileNotFoundError, and the
+    # scheduler recorded `engine errors: …` on every tick. A kill switch that
+    # only covers one of two entry points is a half-off switch: the operator
+    # sees "off" in the config and a wall of failures in the ledger.
+    if str(os.environ.get("MEMORY_EMBED", "")).strip().lower() in ("off", "0", "false", "no"):
+        return [], EMBED_MODEL, 0, errors
     # Lane credentials resolved HERE (same chain as hy's provider config:
     # MEMORY_EMBED_* → MEMORY_LLM_* → LLM_*) — a construction-time empty key
     # raises outside the try below, so resolve before touching openai.
@@ -549,7 +559,15 @@ async def distill(request):
     recorder = CallRecorder()
     provider = LLMProvider(MemoryConfig())
     recorder.wrap(provider)
-    extractor = CodingMemoryExtractor(llm_provider=provider, max_tokens=6000, scene="working")
+    # max_tokens 可配置（2026-11-17 实测调高）：6000 是早期「2 条/批、800 字
+    # 摘要」下测出来的安全值，但 note 类内容往往比 handoff 长得多（带完整正文
+    # 与上下文），实测 31 条 note 分块后仍有多批撞穿 6000 天花板，被
+    # extract_truncated_skipped 整批跳过、cursor 不动 —— 表面上「预算还充足却
+    # 不推进」。天花板是自设的护栏，撞上了就抬高它，不是等它。
+    # 必须与 src/distill-scheduler.ts 的 FD_MEMORY_EXTRACT_MAX_TOKENS 同步：
+    # 那边用同一个值 DETECT 截断，两边不一致会导致「明明截断了却判不出」。
+    _max_tokens = int(os.environ.get("MEMORY_EXTRACT_MAX_TOKENS", "16000") or 16000)
+    extractor = CodingMemoryExtractor(llm_provider=provider, max_tokens=_max_tokens, scene="working")
 
     messages, session_ids = items_to_messages(items)
     sources = [f"session:{sid}" for sid in session_ids]

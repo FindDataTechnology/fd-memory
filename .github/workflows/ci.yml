@@ -1,0 +1,44 @@
+name: ci
+
+# The test suite runs HERE, not on a laptop (user directive 2026-11-18: local
+# green is not evidence). fd-memory had no CI at all until now — every "N/N
+# passing" in its history was a local run on an 8GB box whose memory pressure
+# made results unreproducible.
+#
+# The repo is PUBLIC, so Actions minutes are free and unmetered: there is no
+# reason to run the suite anywhere else.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A superseded run tells nobody anything. Cancel it and let the newest commit
+  # own the result — the suite takes several minutes and pushes here are frequent.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # node:sqlite is a core module from 22.5; the package declares
+          # engines >=22.5.0. Pinning 22 keeps CI on the same line the service
+          # actually runs on rather than testing an untested newer major.
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+
+      - name: typecheck
+        run: npx tsc -p tsconfig.json --noEmit
+
+      - name: test
+        run: npm test

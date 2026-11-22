@@ -40,16 +40,20 @@ export class CaptureIngest {
     private openRoot: (rootKey: string) => StoreRoot,
   ) {}
 
-  ingest(rootKey: string, project: string, events: CaptureEvent[], audit?: AuditIdentity): { stored: number } {
+  ingest(rootKey: string, project: string, events: CaptureEvent[], audit?: AuditIdentity): { stored: number; degraded: number } {
     const root = this.roots.get(rootKey) ?? this.openRoot(rootKey);
     if (!this.roots.has(rootKey)) this.roots.set(rootKey, root);
     root.ensureProject(project);
     let stored = 0;
+    let degraded = 0;
     const sessions = new Set<string>();
     for (const e of events) {
       if (!e || typeof e.event !== "string" || typeof e.session_id !== "string") continue;
       const agent = sanitize(String(e.agent ?? "platform"));
-      root.db.addObservation({
+      // appendObservation writes the append-only JSONL truth first, then the
+      // SQLite index. A locked index degrades to `indexed: false` instead of
+      // dropping the event — the log can be replayed later.
+      const r = root.appendObservation({
         session_id: e.session_id,
         agent,
         event: e.event,
@@ -58,6 +62,7 @@ export class CaptureIngest {
         created_at: e.at ?? new Date().toISOString(),
         project,
       });
+      if (!r.indexed) degraded++;
       sessions.add(e.session_id);
       stored++;
     }
@@ -80,6 +85,6 @@ export class CaptureIngest {
       }
     }
     root.snapshotSoon(`capture: ${stored} events`);
-    return { stored };
+    return { stored, degraded };
   }
 }

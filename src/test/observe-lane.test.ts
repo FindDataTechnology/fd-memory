@@ -27,11 +27,11 @@ function tmpData(prefix = "fdm-observe-"): string {
   return d;
 }
 
-async function boot() {
+async function boot(env?: NodeJS.ProcessEnv) {
   __resetEmbedGate();
   __resetObserveRateLimiter();
   const data = tmpData();
-  const svc = new Service({ dataDir: data, port: 0, pepper: "p" });
+  const svc = new Service({ dataDir: data, port: 0, pepper: "p", ...(env ? { env } : {}) });
   const server = createServer((req, res) => {
     void (svc as unknown as { route(req: unknown, res: unknown): Promise<void> }).route(req as never, res as never);
   });
@@ -210,6 +210,57 @@ test("/observe: rate guard — burst over the per-token window sheds with a retr
   }
 });
 
+test("/observe: shell-command captures ride a tighter body budget than every other kind", async () => {
+  // 2026-11-20: `tool_call Bash` was 72% of the pages table (38,842/54,063),
+  // ~14.6MB/day of growth counting the FTS copy. The title already carries the
+  // command clipped to 200 chars, so the long-form body (cwd/session/tool/raw
+  // JSON) is duplicate plumbing nobody reads. The user chose "keep but
+  // truncate" over "filter out" specifically to keep the capture stream
+  // complete — so the event must still LAND, just smaller.
+  //
+  // This pins three things at once: the tighter cap applies to Bash, a
+  // non-Bash tool_call keeps the generous cap (a blanket tool_call cap would
+  // silently shrink Edit/Write payloads that DO get read back), and the
+  // in-page annotation names the real budget instead of always saying 32KB.
+  const { svc, base, close } = await boot();
+  try {
+    const person = svc.tokens.mint("person", "u/alice").token;
+    const longBody = `cwd: /tmp\nsession: abc\ntool: Bash\ninput: ${"x".repeat(4000)}`;
+
+    const bashRes = await post(base, person, {
+      type: "tool_call", idempotency_key: "bash-1",
+      title: "tool_call Bash: echo hello", body: longBody,
+    });
+    assert.equal(bashRes.status, 202, "a shell capture still lands — truncate, never drop");
+    const bd = (await bashRes.json()) as { page: string; truncated: boolean };
+    assert.equal(bd.truncated, true, "over-budget shell capture reports truncation");
+
+    const bashPage = svc.rootForKey("u-alice").readPageByRel(bd.page)!;
+    const bashBytes = Buffer.byteLength(bashPage.body, "utf8");
+    assert.ok(bashBytes <= 256 + 128, `shell body stays near the 256-byte cap (got ${bashBytes})`);
+    assert.ok(bashPage.body.includes("cwd:"), "the head of the body survives — it is still identifiable");
+    assert.ok(bashPage.body.includes("256"), "the annotation names the REAL budget, not a stale 32KB");
+    assert.equal(bashPage.frontmatter.title, "tool_call Bash: echo hello", "the title keeps the command, so 'which command' stays answerable");
+
+    // A non-Bash tool_call keeps the old generous budget.
+    const editRes = await post(base, person, {
+      type: "tool_call", idempotency_key: "edit-1",
+      title: "tool_call Edit: some/file.ts", body: longBody,
+    });
+    const ed = (await editRes.json()) as { page: string; truncated?: boolean };
+    assert.equal("truncated" in ed, false, "a 4KB Edit payload is under the 32KB cap and must NOT be truncated");
+    const editPage = svc.rootForKey("u-alice").readPageByRel(ed.page)!;
+    assert.ok(Buffer.byteLength(editPage.body, "utf8") > 4000, "the Edit body landed whole");
+
+    // turn_outcome keeps the generous budget too.
+    const turnRes = await post(base, person, {
+      type: "turn_outcome", idempotency_key: "turn-1", title: "回合结论", body: longBody,
+    });
+    const td = (await turnRes.json()) as { truncated?: boolean };
+    assert.equal("truncated" in td, false, "turn_outcome is never squeezed by the shell budget");
+  } finally { await close(); }
+});
+
 test("/observe: body cap — oversized body truncates on a clean UTF-8 boundary with in-page annotation + truncated indicator", async () => {
   const { svc, base, close } = await boot();
   try {
@@ -376,5 +427,33 @@ test("/observe: idempotency stays root-global across projects — same key in an
     assert.equal(root.db.recentObservationPages("room-a", 50).length, 1, "room-a holds exactly the first page");
     assert.equal(root.db.recentObservationPages("room-b", 50).length, 0, "room-b holds nothing — no per-project key fork");
     assert.equal(root.db.recentObservationPages("default", 50).length, 0, "default holds nothing");
+  } finally { await close(); }
+});
+
+test("/observe: 会话边界（stop）要通知蒸馏，其余事件不通知", async () => {
+  // 2026-11-17 实测断链：/observe 落库后从不调 notifyCapture，蒸馏只能靠
+  // fallbackScan 每 10 分钟兜底；预算一紧就彻底停摆（实测停 7 小时）。
+  // hook 把 stop/session-start 都归一成 type=turn_outcome，类型层面分不开，
+  // 但 title 保留了原始事件名（`stop · finddata`），判 title 前缀即可。
+  // 蒸馏要过两门（URL + ENABLED=1）；不设 env 时 notifyCapture 第一行就 return。
+  const { svc, base, close } = await boot({
+    FD_MEMORY_DISTILLER_URL: "http://127.0.0.1:1",
+    FD_MEMORY_DISTILL_ENABLED: "1",
+  });
+  try {
+    const person = svc.tokens.mint("person", "u/dana").token;
+    const before = svc.distill.pendingCount();
+
+    // tool_call 不是会话边界，不该排队
+    await post(base, person, { type: "tool_call", idempotency_key: "t-1", title: "tool_call Bash: ls", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before, "tool_call 不触发蒸馏");
+
+    // session-start 也不是边界
+    await post(base, person, { type: "turn_outcome", idempotency_key: "s-1", title: "session-start · finddata", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before, "session-start 不触发蒸馏");
+
+    // stop 才是边界
+    await post(base, person, { type: "turn_outcome", idempotency_key: "e-1", title: "stop · finddata", body: "x" });
+    assert.equal(svc.distill.pendingCount(), before + 1, "stop 必须排队蒸馏");
   } finally { await close(); }
 });

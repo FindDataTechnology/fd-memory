@@ -28,7 +28,29 @@ export const OBSERVE_BODY_CAP_BYTES = 32 * 1024;
 export const OBSERVE_TITLE_MAX_CHARS = 200;
 const OBSERVE_IDEM_MAX_CHARS = 256;
 const OBSERVE_FIELD_MAX_CHARS = 128;
-const OBSERVE_TRUNCATION_NOTE = "\n\n…（正文超过 32KB 上限，已截断）";
+
+// Per-kind body budget for shell-command captures (2026-11-20).
+//
+// Why: `tool_call Bash` was 72% of the whole pages table — 38,842 of 54,063
+// rows, 18MB of body, ~14.6MB/day of growth counting the FTS copy (≈5.3GB/year).
+// The body is `cwd/session/tool/input{full JSON command}`; the title already
+// carries the command clipped to 200 chars, so the 32KB body adds only the
+// session plumbing and the raw JSON no one reads.
+//
+// This is a GRANULARITY change, not a capture-policy change: the event is still
+// captured (so "which session ran what" stays answerable — the title survives
+// intact), only the duplicate long-form blob is clipped. Deliberately NOT the
+// same move as spool's shouldSpool(), which drops Bash entirely: that is only
+// defensible for the bounded outage buffer, where capacity forces a choice.
+// Here the user chose "keep but truncate" over "filter" precisely to keep the
+// capture stream complete.
+export const OBSERVE_TOOL_CALL_BODY_CAP_BYTES = 256;
+
+/** The body budget for this event kind. */
+export function bodyCapFor(ev: { type: ObserveEventType; title: string }): number {
+  if (ev.type === "tool_call" && /^tool_call Bash\b/.test(ev.title)) return OBSERVE_TOOL_CALL_BODY_CAP_BYTES;
+  return OBSERVE_BODY_CAP_BYTES;
+}
 
 export interface NormalizedObserveEvent {
   type: ObserveEventType;
@@ -129,12 +151,18 @@ export function parseObserveEvent(raw: unknown): ObserveParseResult {
 // Byte-accurate truncation: cut on a UTF-8 character boundary (walk back over
 // continuation bytes) so a clean prefix survives — never a replacement-garbled
 // tail — then annotate IN the page body (spec: 截断 MUST 在页内标注).
+//
+// The note states the ACTUAL budget, not a fixed "32KB": shell-command captures
+// ride a much tighter cap (see OBSERVE_TOOL_CALL_BODY_CAP_BYTES), and a note
+// claiming 32KB on a 256-byte cut would be a false explanation of what happened
+// — the exact class of misleading annotation this codebase keeps paying for.
 export function truncateObserveBody(body: string, capBytes = OBSERVE_BODY_CAP_BYTES): { body: string; truncated: boolean } {
   if (Buffer.byteLength(body, "utf8") <= capBytes) return { body, truncated: false };
   const buf = Buffer.from(body, "utf8");
   let end = capBytes;
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
-  return { body: buf.subarray(0, end).toString("utf8") + OBSERVE_TRUNCATION_NOTE, truncated: true };
+  const label = capBytes >= 1024 ? `${Math.round(capBytes / 1024)}KB` : `${capBytes} 字节`;
+  return { body: buf.subarray(0, end).toString("utf8") + `\n\n…（正文超过 ${label} 上限，已截断）`, truncated: true };
 }
 
 export interface ObserveLanding {
@@ -160,7 +188,7 @@ export function landObserveEvent(root: StoreRoot, project: string, ev: Normalize
   if (!claim.first && claim.page_rel) {
     return { page: claim.page_rel, duplicate: true, truncated: false };
   }
-  const { body, truncated } = truncateObserveBody(ev.body);
+  const { body, truncated } = truncateObserveBody(ev.body, bodyCapFor(ev));
   // harness/subject ride the structured metadata as first-class fields (D5) —
   // the same metadata face the digest badge, Portal and the read filters use.
   const metadata: Record<string, unknown> = { ...(ev.metadata ?? {}) };

@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { createServer } from "node:http";
 import { Service } from "../http.js";
 import { StoreRoot, normalizeMetadata } from "../store.js";
+import { newPage } from "../okf.js";
 import { __resetMetrics } from "../metrics.js";
 import { __resetEmbedGate } from "../embed-gate.js";
 
@@ -56,6 +57,91 @@ async function mcpSession(base: string, tok: string) {
 }
 
 // ── metadata write face ──────────────────────────────────────────────────────
+
+test("memory_write_page: supersedes retires the old page from injection but keeps it readable", async () => {
+  // 2026-11-20: `supersedes` existed in the page model, the edge table and the
+  // distill lane, but appeared 0 times in mcp.ts — and MCP is the ONLY way a
+  // session writes memory. Measured: 16 of 57,852 pages had ever used it, so
+  // correcting a conclusion three times left three pages side by side.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/alice").token;
+    const call = await mcpSession(base, tok);
+
+    const first = await call("memory_write_page", {
+      title: "旧结论", body: "这条会被更正", metadata: { memory_type: "feedback" },
+    });
+    assert.ok(first.path, `首写失败: ${JSON.stringify(first)}`);
+    const oldId = String(first.path).split("/").pop()!.replace(/\.md$/, "");
+
+    const second = await call("memory_write_page", {
+      title: "新结论", body: "取代上一条", metadata: { memory_type: "feedback" },
+      supersedes: [oldId],
+    });
+    assert.ok(second.path, `更正写失败: ${JSON.stringify(second)}`);
+
+    // The edge exists, keyed by the id the write face speaks.
+    const edges = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    assert.deepEqual(edges.map((e) => e.superseded_id), [oldId], "接替边必须落库");
+
+    // Old page leaves the injection face…
+    const idx = await fetch(`${base}/memory/index?project=default&limit=20`, { headers: json(tok) });
+    const entries = ((await idx.json()) as { entries: Array<{ description: string }> }).entries;
+    // note 类型的 description 取 title（一句话结论），不是 body。
+    assert.equal(entries.filter((e) => e.description.trim() === "旧结论").length, 0,
+      "被接替的页不得出现在注入里");
+    assert.equal(entries.filter((e) => e.description.trim() === "新结论").length, 1,
+      "接替者照常出现");
+
+    // …but is NOT deleted: it stays readable, because "replaced" is not "forgotten".
+    const back = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT body FROM pages WHERE page_id=?").get(oldId) as { body?: string } | undefined;
+    assert.equal(back?.body?.trim(), "这条会被更正", "被接替页仍可读回");
+  } finally { await close(); }
+});
+
+test("memory_write_page: an unknown supersedes id is ignored, never blocks the write", async () => {
+  // A correction is a deliberate act the user asked for; failing the whole
+  // write because one id was mistyped would lose the new conclusion too.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/alice").token;
+    const call = await mcpSession(base, tok);
+    const r = await call("memory_write_page", {
+      title: "新结论", body: "旧 id 打错了也没关系",
+      supersedes: ["no-such-page-id"],
+    });
+    assert.ok(r.path, `写入不应失败: ${JSON.stringify(r)}`);
+    const edges = svc.rootForKey("u-alice").db.db
+      .prepare("SELECT superseded_id FROM superseded_edges").all() as Array<{ superseded_id: string }>;
+    assert.deepEqual(edges.map((e) => e.superseded_id), ["no-such-page-id"],
+      "不存在的 id 也落边——它对谁都没影响，但写作者的字面意图被保留");
+  } finally { await close(); }
+});
+
+test("supersede edges: the same page id in two projects must not collide", async () => {
+  // 2026-11-20 实测缺陷：superseded_id 是 page_id（= 文件名 basename），只在
+  // 单个 project 内唯一。它曾是唯一 PRIMARY KEY，于是 beta 的接替边被 alpha
+  // 静默覆盖——beta 那页永远退不出注入面，因为读面按 project 过滤边表，
+  // beta 找不到属于自己的那条。
+  const { svc, close } = await boot();
+  try {
+    const root = svc.rootForKey("u-zoe");
+    root.writePage("alpha", "notes", "old-1", newPage("note", "A旧", "A 正文"));
+    root.writePage("alpha", "notes", "new-1", newPage("note", "A新", "A 新正文", { supersedes: ["old-1"] } as never));
+    root.writePage("beta", "notes", "old-1", newPage("note", "B旧", "B 正文"));
+    root.writePage("beta", "notes", "new-1", newPage("note", "B新", "B 新正文", { supersedes: ["old-1"] } as never));
+
+    const edges = root.db.db
+      .prepare("SELECT superseded_id, project FROM superseded_edges ORDER BY project").all() as Array<{ superseded_id: string; project: string }>;
+    assert.deepEqual(
+      edges.map((e) => `${e.project}:${e.superseded_id}`),
+      ["alpha:old-1", "beta:old-1"],
+      "两个 project 各自的接替边都必须存在",
+    );
+  } finally { await close(); }
+});
 
 test("metadata: write lands in frontmatter + index, structured filter finds it by kind and memberId", async () => {
   const { svc, base, close } = await boot();
@@ -160,9 +246,15 @@ test("filters: /digest meta filter narrows L2+notes; empty intersection is an em
   try {
     const platform = svc.tokens.mint("platform", "*").token;
     const root = svc.rootForKey("d-pk");
-    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[turn][clerk] 报数", metadata: { kind: "turn", memberId: "clerk" } }, body: "报数 body\n" });
+    // The filter's subject must be a kind the digest actually renders. `turn`
+    // was used here historically, but the digest now suppresses `kind: turn`
+    // and `kind: health` as platform bookkeeping (FD_MEMORY_DIGEST_KEEP_TURN_PAGES,
+    // 2026-11-18) — so a filter on `turn` matches a page the renderer then
+    // throws away, and this test read that as "the filter broke". What the test
+    // is about is narrowing, not suppression, so use an ordinary note kind.
+    root.writePage("f-team", "notes", "n1", { frontmatter: { type: "note", title: "[clerk-note][clerk] 报数", metadata: { kind: "clerk-note", memberId: "clerk" } }, body: "报数 body\n" });
     root.writePage("f-team", "notes", "n2", { frontmatter: { type: "note", title: "拍板记录", metadata: { kind: "decision-resolved", memberId: "lead" } }, body: "拍板 body\n" });
-    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:turn`, { headers: json(platform) });
+    const hit = await fetch(`${base}/digest?rootKey=d-pk&project=f-team&meta=kind:clerk-note`, { headers: json(platform) });
     assert.equal(hit.status, 200);
     const hitBody = await hit.json() as { digest: string };
     assert.ok(hitBody.digest.includes("报数"));
@@ -340,4 +432,149 @@ test("normalizeMetadata: absent vs invalid vs valid", () => {
   assert.equal(normalizeMetadata({ bad: [{}, 1] }), null);
   assert.equal(normalizeMetadata({ big: "x".repeat(300) }), null);
   assert.deepEqual(normalizeMetadata({ flag: true }), { flag: true });
+});
+
+test("memory_write_page: a missing domain companion key is reported, never fatal", async () => {
+  // add-domain-memory-schema. Two things must hold at once:
+  //   1. the memory LANDS (truth write is never undone by a derived check)
+  //   2. the response SAYS the domain key is missing (a hint nobody sees is the
+  //      same as no schema)
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/ivy").token;
+    const call = await mcpSession(base, tok);
+
+    // lex has two keys; sending only `party` must still write.
+    const partial = await call("memory_write_page", {
+      title: "某案的争点", body: "记录", metadata: { party: "P-1" },
+    });
+    assert.ok(partial.path, `缺同域键也必须写入成功: ${JSON.stringify(partial)}`);
+    assert.ok(partial.domain_hint, "响应里必须能看到缺失提示");
+    assert.equal(partial.domain_hint.domain, "lex");
+    assert.deepEqual(partial.domain_hint.missing, ["case_no"]);
+
+    // The page really is in the index — the hint did not become a gate.
+    const rows = svc.rootForKey("u-ivy").db.db
+      .prepare("SELECT metadata FROM pages WHERE path=?").get(String(partial.path)) as { metadata?: string } | undefined;
+    assert.ok(rows?.metadata, "缺键的记忆仍必须落索引");
+    assert.equal(JSON.parse(String(rows!.metadata)).party, "P-1");
+
+    // Complete metadata -> no hint at all.
+    const full = await call("memory_write_page", {
+      title: "某案结论", body: "记录", metadata: { party: "P-2", case_no: "C-9" },
+    });
+    assert.ok(full.path);
+    assert.equal(full.domain_hint, undefined, "同域键齐全时不应有提示");
+
+    // A page with no domain key is never nagged.
+    const plain = await call("memory_write_page", { title: "随手记", body: "与领域无关" });
+    assert.ok(plain.path);
+    assert.equal(plain.domain_hint, undefined, "无领域键的普通记忆不该被提示");
+  } finally { await close(); }
+});
+
+test("memory_by_domain: recall by value without knowing the key name", async () => {
+  // add-domain-memory-schema tasks 3.x. The point of a domain vocabulary is that
+  // a reader asks "what do we have on this thing", not "what is the metadata key
+  // called". Forcing callers to remember `instrument` (and not ticker/symbol/
+  // code) rebuilds the free-text taxonomy problem one level down.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/jon").token;
+    const call = await mcpSession(base, tok);
+
+    await call("memory_write_page", { title: "600519 复盘一", body: "a", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "600519 复盘二", body: "b", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "别的标的", body: "c", metadata: { instrument: "000001" } });
+    await call("memory_write_page", { title: "某案", body: "d", metadata: { party: "P-9" } });
+
+    const hit = await call("memory_by_domain", { value: "600519" });
+    assert.equal(hit.matches.length, 1, `应只匹配 instrument 一个键: ${JSON.stringify(hit.matches)}`);
+    assert.equal(hit.matches[0].key, "instrument");
+    assert.equal(hit.matches[0].domain, "invest");
+    assert.equal(hit.matches[0].count, 2, "两条同标的记忆都应计入");
+    assert.equal(hit.pages.length, 2);
+    assert.ok(hit.pages.every((p: { domain_key: string }) => p.domain_key === "instrument"));
+
+    // A value nobody filed under any domain key is an empty answer with a
+    // readable note, not an error.
+    const miss = await call("memory_by_domain", { value: "NOPE" });
+    assert.equal(miss.matches.length, 0);
+    assert.equal(miss.pages.length, 0);
+    assert.ok(miss.note, "未命中必须给出可读说明");
+
+    // The value matched by a DIFFERENT domain key is found just the same.
+    const party = await call("memory_by_domain", { value: "P-9" });
+    assert.equal(party.matches[0].key, "party");
+    assert.equal(party.pages.length, 1);
+  } finally { await close(); }
+});
+
+test("memory_by_domain: a value matching two domain keys reports both", async () => {
+  // "600519" filed as both an instrument and a party is unusual but legal.
+  // Picking whichever key is checked first would hide half the answer.
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/kai").token;
+    const call = await mcpSession(base, tok);
+    await call("memory_write_page", { title: "作标的", body: "a", metadata: { instrument: "X-1" } });
+    await call("memory_write_page", { title: "作当事人", body: "b", metadata: { party: "X-1" } });
+
+    const r = await call("memory_by_domain", { value: "X-1" });
+    const keys = r.matches.map((m: { key: string }) => m.key).sort();
+    assert.deepEqual(keys, ["instrument", "party"], `两个键都必须报告: ${JSON.stringify(keys)}`);
+    assert.equal(r.pages.length, 2, "两个来源的页都要返回");
+  } finally { await close(); }
+});
+
+test("memory_by_domain: 领域键、时间窗口与类型三个条件必须交集", async () => {
+  // add-domain-memory-schema：「该过滤 MUST 与既有的 project、时间窗口、类型等
+  // 过滤条件可组合」，且 scenario 明确要求「三个条件同时生效（交集），而不是
+  // 任一条件被忽略」。实现此前只接受 value/limit —— spec 承诺了，代码没有。
+  const { svc, base, close } = await boot();
+  try {
+    const tok = svc.tokens.mint("person", "u/lia").token;
+    const call = await mcpSession(base, tok);
+
+    // 同一标的四条：#1 note（新）、#2 feedback（新）、#3 note（旧）
+    await call("memory_write_page", { title: "600519 笔记新", body: "a", metadata: { instrument: "600519" } });
+    await call("memory_write_page", { title: "600519 纪律", body: "b", metadata: { instrument: "600519", memory_type: "feedback" } });
+    // 先写 #3，再把它的 updated_at 改旧
+    const old3 = await call("memory_write_page", { title: "600519 笔记旧", body: "c", metadata: { instrument: "600519" } });
+    // rootKey uses a dash, not the namespace slash: rootKeyForRef("u/lia") is
+    // "u-lia". Using "u/lia" here created a SECOND StoreRoot (empty database),
+    // so the UPDATE matched zero rows and the failure looked like a broken
+    // filter. Assert on the hit count so this cannot hide again.
+    const root = svc.rootForKey("u-lia");
+    // Compute the stamp from a FIXED instant, not from Date.now() at this line:
+    // this runs ~23ms AFTER the writes above, so `Date.now() - 30d` was still
+    // later than the freshly-written rows and matched nothing — the old page
+    // kept its write time and the since-filter had nothing to exclude. The
+    // first version of this test failed for that reason, not because the
+    // feature was broken.
+    const oldStamp = new Date(Date.now() - 30 * 86400_000).toISOString();
+    const changed = root.db.db.prepare("UPDATE pages SET updated_at=? WHERE path=?").run(oldStamp, String(old3.path)).changes;
+    assert.ok(Number(changed) === 1, `UPDATE 必须命中一行，实际 ${changed}；path=${String(old3.path)}`);
+
+    // 无过滤：三条都在
+    const all = await call("memory_by_domain", { value: "600519" });
+    assert.ok(all.pages.length === 3, `无过滤应三条，实际 ${all.pages.length}`);
+
+    // 只有时间窗口：旧的那条被排除
+    const recent = await call("memory_by_domain", { value: "600519", filter: { since: new Date(Date.now() - 86400_000).toISOString() } });
+    assert.ok(recent.pages.length === 2,
+      `时间窗口应剩两条，实际 ${recent.pages.length}；明细=${JSON.stringify(recent.pages.map((p: Record<string, unknown>) => ({ t: p.title, at: p.updated_at })))}；旧页时间=${oldStamp}`);
+
+    // 只有类型：feedback 之外被排除
+    const onlyNote = await call("memory_by_domain", { value: "600519", filter: { layer: "L1" } });
+    assert.ok(onlyNote.pages.length >= 1, `按 layer 过滤应至少一条，实际 ${onlyNote.pages.length}`);
+
+    // 组合：时间窗口 + metadata（memory_type=feedback）—— 只剩 #2
+    const combo = await call("memory_by_domain", {
+      value: "600519",
+      filter: { since: new Date(Date.now() - 86400_000).toISOString(), metadata: { memory_type: "feedback" } },
+    });
+    assert.ok(combo.pages.length === 1, `三个条件交集应只剩一条，实际 ${combo.pages.length}：${JSON.stringify(combo.pages.map((p: { title: string }) => p.title))}`);
+    assert.ok(String(combo.pages[0].title).includes("纪律"), "交集的结果应是那条纪律");
+  } finally { await close(); }
 });
