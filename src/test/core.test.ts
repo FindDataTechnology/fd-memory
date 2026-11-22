@@ -1559,3 +1559,39 @@ test("cited_by matches session:<path> entries, not just bare ids", () => {
     rmSync(data, { recursive: true, force: true });
   }
 });
+
+// Process records are not conclusions — an OPT-IN filter, not a rule.
+//
+// Measured 2026-11-22: 16 of the 51 pages cited >=3 times start with '['
+// (`[substantive-user-turn] …`, `[conclusion] … 转交说明`). A task's execution,
+// handoff and evidence all cite the same pages, so process notes accumulate
+// citations without being reusable knowledge.
+//
+// Off by default on purpose: what the shared face should contain is a product
+// decision, not a correctness rule.
+test("excludeProcessNotes is opt-in and filters only bracketed titles", () => {
+  const data = tmpData();
+  try {
+    const root = new StoreRoot(data, "u-proc");
+    root.writePage("default", "notes", "real", newPage("note", "真实结论", "正文", {}));
+    root.writePage("default", "notes", "proc", newPage("note", "[substantive-user-turn] 执行记录", "正文", {}));
+    for (let i = 0; i < 3; i++) {
+      root.writePage("default", "notes", `c${i}`, newPage("note", `引用${i}`, "正文", { sources: ["session:default/notes/real.md", "session:default/notes/proc.md"] } as never));
+    }
+    for (const slug of ["real", "proc"]) {
+      root.db.db.prepare("INSERT INTO tier_proposals (project, page_rel, proposed_tier, reason, proposed_by, proposed_at) VALUES (?,?,?,?,?,?)")
+        .run("default", `default/notes/${slug}.md`, "stable", "理由", "ai", "2026-11-22T00:00:00Z");
+    }
+
+    // Default: both qualify — the filter is not a correctness rule.
+    const dflt = root.db.classifyPendingProposals("default", { minCited: 3 });
+    assert.equal(dflt.auto.length, 2, "默认不过滤，两条都在");
+
+    // Opt-in: the bracketed one drops out.
+    const filtered = root.db.classifyPendingProposals("default", { minCited: 3, excludeProcessNotes: true });
+    assert.deepEqual(filtered.auto.map((x) => x.page_rel), ["default/notes/real.md"], "开启后只留真结论");
+    assert.ok(filtered.no_signal.some((x) => x.page_rel === "default/notes/proc.md"), "被过滤的进 no_signal，不是消失");
+  } finally {
+    rmSync(data, { recursive: true, force: true });
+  }
+});

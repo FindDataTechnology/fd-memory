@@ -1494,7 +1494,7 @@ export class RootDb {
    */
   classifyPendingProposals(
     project: string,
-    opts: { minRetrieved?: number; minInjectedRate?: number; minCited?: number; limit?: number } = {},
+    opts: { minRetrieved?: number; minInjectedRate?: number; minCited?: number; excludeProcessNotes?: boolean; limit?: number } = {},
   ): {
     auto: Array<{ page_rel: string; proposed_tier: string; reason: string; why: string }>;
     conflict: Array<{ page_rel: string; reason: string; why: string }>;
@@ -1513,7 +1513,7 @@ export class RootDb {
     const minCited = hasCited ? Number(opts.minCited) : Number.POSITIVE_INFINITY;
     const rows = this.db
       .prepare(
-        `SELECT p.page_rel, p.proposed_tier, p.reason,
+        `SELECT p.page_rel, p.proposed_tier, p.reason, pg.title AS page_title,
                 COALESCE(pg.retrieved_n, 0) AS retrieved_n,
                 COALESCE(pg.injected_n, 0) AS injected_n,
                 COALESCE(pg.injected_seen_n, 0) AS injected_seen_n,
@@ -1539,7 +1539,7 @@ export class RootDb {
          ORDER BY p.proposed_at DESC LIMIT ?`,
       )
       .all(project, Math.max(1, opts.limit ?? 200)) as Array<{
-        page_rel: string; proposed_tier: string; reason: string;
+        page_rel: string; proposed_tier: string; reason: string; page_title: string;
         retrieved_n: number; injected_n: number; injected_seen_n: number;
         cited_by: number; superseded: number;
       }>;
@@ -1549,6 +1549,18 @@ export class RootDb {
     const no_signal: Array<{ page_rel: string; reason: string }> = [];
 
     for (const r of rows) {
+      // Process records are not conclusions (measured 2026-11-22): a task's
+      // execution, handoff and evidence all cite the same pages, so process
+      // notes accumulate citations without being reusable knowledge — 16 of the
+      // 51 pages cited >=3 times start with '['.
+      //
+      // OFF BY DEFAULT: what the shared face should contain is a product
+      // decision, not a correctness rule. Callers opt in.
+      if (opts.excludeProcessNotes && String(r.page_title ?? "").trimStart().startsWith("[")) {
+        no_signal.push({ page_rel: r.page_rel, reason: r.reason });
+        continue;
+      }
+
       // Downstream signals are the primary evidence (2026-11-22, measured).
       //
       // The two "usage" counters turned out to be unusable as automatic
