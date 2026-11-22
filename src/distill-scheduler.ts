@@ -140,10 +140,16 @@ let sidecarDispatcher: SidecarDispatcher | null = null;
 async function dispatcherForSidecar(): Promise<SidecarDispatcher | undefined> {
   if (sidecarDispatcher) return sidecarDispatcher;
   try {
-    // Same reason: the specifier is resolved at runtime, not compile time.
-    const { Agent } = (await import("undici")) as {
+    // Resolved at RUNTIME only. `await import("undici")` still makes TypeScript
+    // resolve the specifier at compile time and fail on a clean `npm ci`
+    // (TS2307) — the package is shipped by Node, never declared here. A dynamic
+    // specifier built at runtime is opaque to the type checker, which is
+    // exactly what we want: no dependency, no compile-time promise.
+    const specifier = "undici";
+    const mod = (await import(/* @vite-ignore */ specifier)) as {
       Agent: new (opts: { bodyTimeout: number; headersTimeout: number; connectTimeout: number }) => SidecarDispatcher;
     };
+    const { Agent } = mod;
     sidecarDispatcher = new Agent({
       bodyTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
       headersTimeout: DEFAULT_SIDECAR_TIMEOUT_MS,
