@@ -55,7 +55,35 @@ export interface LadderMemory {
 
 /** 集群记忆客户端三面（/digest、/pages 读、/pages 写）。 */
 export interface ClusterMemoryClient extends LadderMemory {
-  writeDigest(project: string, title: string, body: string): Promise<any>;
+  writeDigest(project: string, title: string, body: string, opts?: WriteDigestOptions): Promise<any>;
+  /**
+   * 按 metadata 读页（establish-agent-role-and-fitness-plane 6.2 / 7.2）：
+   * fd-memory 的 `GET /pages` 早已支持 `meta=key:value` 过滤（`add-agent-memory-
+   * foundation`），但客户端从没暴露过——于是 paas 只能读「全部页」再自己筛，
+   * 而那是把服务端的结构化过滤降级成客户端字符串匹配。
+   */
+  readPages(filter?: ReadPagesFilter): Promise<MemoryPage[]>;
+}
+
+/**
+ * 写入的可选面（纯增量：不传 = 与既有 `{project,title,body}` 逐字节相同）。
+ *
+ * `metadata` 是 fd-memory 的一等字段（标量或标量数组），**不是**新契约：
+ * 服务的 enum 注释明写「Categories go in metadata」。这也是为什么本变更
+ * 不需要新增 `type` 车道——`observation` / `competence` 不是新档位，
+ * 是 note 页上的一个 metadata 键。
+ */
+export interface WriteDigestOptions {
+  metadata?: Record<string, unknown>;
+  /** 显式更正：被取代的页 id（服务端 ignore 未知 id，拼错不阻塞写入）。 */
+  supersedes?: string[];
+}
+
+export interface ReadPagesFilter {
+  project?: string;
+  limit?: number;
+  /** `{key: value}` → 逐个 `meta=key:value`（数组值取 contains 语义）。 */
+  metadata?: Record<string, unknown>;
 }
 
 export interface ClusterClientOptions {
@@ -84,14 +112,39 @@ export function createClusterMemoryClient(opts: ClusterClientOptions): ClusterMe
       const doc = await r.json();
       return Array.isArray(doc?.pages) ? doc.pages : [];
     },
-    async writeDigest(project: string, title: string, body: string): Promise<any> {
+    async writeDigest(project: string, title: string, body: string, opts?: WriteDigestOptions): Promise<any> {
+      // 不传 opts ⇒ 请求体与改前逐字节相同（既有调用方零迁移）。
+      const payload: Record<string, unknown> = { project, title, body };
+      if (opts?.metadata && Object.keys(opts.metadata).length) payload.metadata = opts.metadata;
+      if (Array.isArray(opts?.supersedes) && opts.supersedes.length) payload.supersedes = opts.supersedes;
       const r = await fetchWithTimeout(`${url}/pages`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
-        body: JSON.stringify({ project, title, body }),
+        body: JSON.stringify(payload),
       }, { fetchImpl });
       if (!r.ok) throw new Error(`pages HTTP ${r.status}`);
       return await r.json();
+    },
+    /**
+     * 按 metadata 读页。参数拼装与服务端 `filterParamsOf` 同规：
+     * 值为对象/数组时 JSON 编码（服务端会尝试解析，解析失败按字符串），
+     * 字符串原样——这样 `{kind:"observation"}` 与 `{kind:"o\"b"}` 都能往返。
+     */
+    async readPages(filter: ReadPagesFilter = {}): Promise<MemoryPage[]> {
+      const qs = new URLSearchParams();
+      if (filter.project) qs.set("project", filter.project);
+      const lim = filter.limit;
+      if (typeof lim === "number" && Number.isInteger(lim) && lim > 0) qs.set("limit", String(lim));
+      for (const [k, v] of Object.entries(filter.metadata ?? {})) {
+        if (v === undefined || v === null) continue;
+        qs.append("meta", `${k}:${typeof v === "string" ? v : JSON.stringify(v)}`);
+      }
+      const r = await fetchWithTimeout(`${url}/pages?${qs.toString()}`, {
+        headers: { authorization: `Bearer ${token}` },
+      }, { fetchImpl });
+      if (!r.ok) throw new Error(`pages HTTP ${r.status}`);
+      const doc = await r.json();
+      return Array.isArray(doc?.pages) ? doc.pages : [];
     },
     // digest 读面（add-cluster-digest-injection）：服务端渲染块——一次机会、
     // 不重试（调用方的阶梯在任何失败时降级标题列表）。
