@@ -66,7 +66,20 @@ function listCandidateRels(root: StoreRoot, project: string): string[] {
 // (a page referenced by another live page's supersedes is history), ranked by
 // keyword overlap with `queryFor` (task + search_keys of the new items' most
 // recent session — callers pass the observed text digest), top-k.
-export function distillCandidates(root: StoreRoot, projects: string[], queryFor: string, k = 8): DistillCandidate[] {
+//
+// The remainder is REPORTED, not hidden (distill-output-contract R6): a caller
+// that only sees `k` entries cannot tell "8 candidates matched" from "8 of 200
+// matched", and a reconciler fed the first slice silently drops the rest. The
+// count is what makes the second case observable.
+export interface DistillCandidatesResult {
+  candidates: DistillCandidate[];
+  /** Live pages that scored above the floor, before the top-k slice. */
+  matched: number;
+  /** `matched - candidates.length`; zero when nothing was left out. */
+  omitted: number;
+}
+
+function rankCandidates(root: StoreRoot, projects: string[], queryFor: string): DistillCandidate[] {
   const live: DistillCandidate[] = [];
   for (const project of projects) {
     for (const rel of listCandidateRels(root, project)) {
@@ -93,7 +106,7 @@ export function distillCandidates(root: StoreRoot, projects: string[], queryFor:
     .toLowerCase()
     .split(/[^\p{L}\p{N}_-]+/u)
     .filter((t) => t.length >= 2);
-  if (terms.length === 0) return active.slice(0, k);
+  if (terms.length === 0) return active;
   // Field-weighted overlap (2026-10-26 precision probe): a flat haystack let
   // pages whose BODY merely mentions the topic tie with pages whose TITLE is
   // the topic — "记忆 作用域" surfaced fleet patrol pages that mention memory in
@@ -111,5 +124,20 @@ export function distillCandidates(root: StoreRoot, projects: string[], queryFor:
     return { c, score };
   });
   scored.sort((a, b) => b.score - a.score);
-  return scored.filter((x) => x.score > 0).slice(0, k).map((x) => x.c);
+  return scored.filter((x) => x.score > 0).map((x) => x.c);
+}
+
+export function distillCandidatesDetailed(
+  root: StoreRoot,
+  projects: string[],
+  queryFor: string,
+  k = 8,
+): DistillCandidatesResult {
+  const ranked = rankCandidates(root, projects, queryFor);
+  const candidates = ranked.slice(0, k);
+  return { candidates, matched: ranked.length, omitted: Math.max(0, ranked.length - candidates.length) };
+}
+
+export function distillCandidates(root: StoreRoot, projects: string[], queryFor: string, k = 8): DistillCandidate[] {
+  return distillCandidatesDetailed(root, projects, queryFor, k).candidates;
 }

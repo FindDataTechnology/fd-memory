@@ -40,6 +40,13 @@ from json_repair import repair_json
 
 ENGINE = "engine:hy-memory/0244ebe"
 
+# The shape of this response, versioned independently of ENGINE (which names the
+# model/harness build). `fd-memory/src/distill-scheduler.ts` refuses a batch whose
+# contract it does not know instead of reading missing fields as empty — a
+# silent shape change there used to surface as a page that had quietly lost a
+# section (distill-output-contract R5).
+CONTRACT_VERSION = 1
+
 EMBED_MODEL = os.environ.get("MEMORY_EMBED_MODEL", "Qwen/Qwen3-Embedding-8B")
 
 # Unified memory & outputs (add-unified-memory-and-outputs): tagging lane —
@@ -657,8 +664,14 @@ async def distill(request):
         tokens += etokens
 
     return {
+        "contract_version": CONTRACT_VERSION,
         "facts": facts_out,
         "experiences": experiences_out,
+        # The citation universe for THIS batch (distill-output-contract R2).
+        # `entry_from_draft` writes these into `sources`; shipping the set lets
+        # the write face check each entry's refs against what it actually sent
+        # instead of trusting whatever comes back in the entry.
+        "sources": sources,
         "cursor_next": {},
         "llm_calls": recorder.calls,
         "tokens": tokens,

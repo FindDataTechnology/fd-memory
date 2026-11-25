@@ -230,3 +230,53 @@ def test_promote_items_tolerates_unparseable_output():
     out = _asyncio.run(engine.promote_items(provider, [{"title": "x", "summary": "y"}]))
     assert out["results"] == []
     assert out["tokens"] > 0, "the burned call is still accounted"
+
+
+# ── distill-output-contract R2/R5: the response carries its own shape ────────
+
+def test_response_declares_contract_version_and_citation_universe():
+    # R5: the shape is versioned, so the write face can refuse a batch it does
+    # not understand instead of reading missing fields as empty.
+    # R2: the batch ships the citation universe it built, so the writer can
+    # check every `sources` ref against it rather than trusting the entry.
+    import asyncio
+    import hy_memory.coding.extractor as ex_mod
+
+    class _Draft:
+        def to_dict(self):
+            return {"task": "排障", "search_keys": ["5xx"], "solution": "切 DNS"}
+
+    real = ex_mod.CodingMemoryExtractor.extract
+
+    async def fake_extract(self, **kw):
+        return [_Draft()], []
+
+    ex_mod.CodingMemoryExtractor.extract = fake_extract
+    try:
+        async def go():
+            req = {
+                "scope": "d-p/agentA",
+                "items": [{"kind": "observation", "session_id": "s1",
+                           "event": "user-prompt-submit", "summary": "排障 5xx"}],
+                "candidates": [],
+            }
+            # The embed step is not reached (no vectors requested); stub it out.
+            orig = engine.embed_texts
+            engine.embed_texts = lambda *a, **k: _async_ok()
+            try:
+                return await engine.distill(req)
+            finally:
+                engine.embed_texts = orig
+
+        out = asyncio.run(go())
+    finally:
+        ex_mod.CodingMemoryExtractor.extract = real
+
+    assert out["contract_version"] == engine.CONTRACT_VERSION == 1
+    assert out["sources"] == ["session:s1"], "the universe is the batch's own session ids"
+    for e in out["experiences"]:
+        assert set(e["sources"]) <= set(out["sources"]), "every entry cites within the universe"
+
+
+async def _async_ok():
+    return [], "m", 0, []

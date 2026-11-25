@@ -15,7 +15,7 @@ import { CaptureIngest, CaptureEvent } from "./capture.js";
 import { parseObserveEvent, landObserveEvent, observeRateGuard } from "./observe.js";
 import { handlePortal } from "./portal-server.js";
 import { buildTools, writeNotePage } from "./mcp.js";
-import { DistillScheduler, hybridCandidates, sidecarEmbed } from "./distill-scheduler.js";
+import { DistillScheduler, hybridCandidatesDetailed, sidecarEmbed } from "./distill-scheduler.js";
 import { startEmbedKeepwarm } from "./keepwarm.js";
 import { startStallWatchdog, type StallWatchdog } from "./stall-watchdog.js";
 import { serializeEmbed, embedLaneCoolingDown, noteEmbedOutcome } from "./embed-gate.js";
@@ -676,7 +676,14 @@ export class Service {
           clearTimeout(timer);
         }
       };
-      const candidates = await hybridCandidates({ root: dRoot, project: primary, projects: recallProjects, queryFor: q, k, embed });
+      // R6 (distill-output-contract): report what the top-k hid. The injection
+      // face already does this (`beyond_budget`, below); the digest face used to
+      // answer "8 items" with no way to tell 8-of-8 from 8-of-200. Counted before
+      // the structured filter, because the filter narrows what is RENDERED, not
+      // what the recall lane matched.
+      const candRes = await hybridCandidatesDetailed({ root: dRoot, project: primary, projects: recallProjects, queryFor: q, k, embed });
+      const candidates = candRes.candidates;
+      const candidatesOmitted = candRes.omitted;
       // Structured filter (add-agent-memory-foundation): ONE indexed SQL pass
       // answers "which pages match"; candidates/notes/refs keep only members
       // of that set. The retrieval lanes stay untouched — the filter narrows
@@ -864,6 +871,15 @@ export class Service {
         items: items.length,
         notes: renderedNotes,
         truncated: rendered < allItems.length,
+        // R6 (distill-output-contract): the recall lane's own remainder, distinct
+        // from `truncated` (items the TOKEN BUDGET dropped). Both can be > 0 at
+        // once; conflating them would blame the budget for a recall-lane slice.
+        ...(candidatesOmitted > 0
+          ? {
+              candidates_omitted: candidatesOmitted,
+              candidates_note: `另有 ${candidatesOmitted} 条候选未进入本次召回（本次取最相关 ${candidates.length} 条）。用 memory_query 按词检索，或提高 k。`,
+            }
+          : {}),
         ...(modelNote ? { model_note: modelNote } : {}),
         ...(multi ? { projects: readProjects, sources: readProjects } : {}),
       }));

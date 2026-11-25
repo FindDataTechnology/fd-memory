@@ -8,14 +8,14 @@
 // d-<packId>. Writes carry an optional audit identity (principal + scope)
 // recorded as companion rows.
 
-import { mkdirSync, existsSync, appendFileSync } from "node:fs";
+import { mkdirSync, existsSync, appendFileSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import { execFile, execFileSync } from "node:child_process";
 import { RootDb, HandoffRow, ObservationRow, observationDigest } from "./db.js";
 import { namespaceParts } from "./auth.js";
-import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest } from "./okf.js";
-import { sanitize } from "./sanitize.js";
+import { newPage, writePageFile, readPageFile, appendLedger, projectManifest, workspaceManifest, dumpPage, parsePage } from "./okf.js";
+import { demoteHeadings, sanitize } from "./sanitize.js";
 
 export interface HandoffInput {
   summary: string;
@@ -428,16 +428,23 @@ export class StoreRoot {
     audit?: AuditIdentity,
   ): string {
     const title = String(payload.statement ?? payload.task ?? payload.id).slice(0, 120);
+    // The section skeleton is OUR structure (distill-output-contract R1): the
+    // model fills fields, the renderer owns headings. A field that carries its
+    // own ATX heading is neutralised rather than rejected — losing a real memory
+    // over a formatting slip is the worse failure, and every reader downstream
+    // already strips headings from excerpts, so leaving them in only ever
+    // corrupted the page body.
+    const field = (v: unknown): string => demoteHeadings(sanitize(String(v ?? "")));
     const body =
       kind === "fact"
-        ? `## Statement\n${sanitize(String(payload.statement ?? ""))}` +
-          (payload.subject ? `\n\nsubject: ${sanitize(String(payload.subject))}` : "") +
-          ((payload.files ?? []).length ? `\n\nfiles: ${payload.files!.map((f) => sanitize(String(f))).join(", ")}` : "") +
-          (payload.details ? `\n\n## Details\n${sanitize(String(payload.details)).slice(0, 4000)}` : "")
-        : `## Task\n${sanitize(String(payload.task ?? ""))}` +
-          `\n\n## Solution\n${sanitize(String(payload.solution ?? ""))}` +
-          (payload.boundary_envs ? `\n\nboundary_envs: ${sanitize(String(payload.boundary_envs))}` : "") +
-          ((payload.search_keys ?? []).length ? `\n\nsearch_keys: ${payload.search_keys!.map((k) => sanitize(String(k))).join(", ")}` : "");
+        ? `## Statement\n${field(payload.statement)}` +
+          (payload.subject ? `\n\nsubject: ${field(payload.subject)}` : "") +
+          ((payload.files ?? []).length ? `\n\nfiles: ${payload.files!.map((f) => field(f)).join(", ")}` : "") +
+          (payload.details ? `\n\n## Details\n${field(payload.details).slice(0, 4000)}` : "")
+        : `## Task\n${field(payload.task)}` +
+          `\n\n## Solution\n${field(payload.solution)}` +
+          (payload.boundary_envs ? `\n\nboundary_envs: ${field(payload.boundary_envs)}` : "") +
+          ((payload.search_keys ?? []).length ? `\n\nsearch_keys: ${payload.search_keys!.map((k) => field(k)).join(", ")}` : "");
     const rel = this.writePage(
       project,
       kind === "fact" ? "facts" : "experiences",
@@ -462,6 +469,78 @@ export class StoreRoot {
     }
     writePageFile(join(this.wikiDir, rel), page);
     return rel;
+  }
+
+  /**
+   * Write a whole distillation batch as ONE unit (distill-output-contract R4).
+   *
+   * The write path used to call `writeDistillPage` in a loop. A failure partway
+   * through (disk full, permissions, the process killed mid-run) left the pages
+   * already written in place while the cursor stayed put — so the next round
+   * re-distilled the same items and wrote them again under fresh uuid ids. The
+   * pages that DID land never got a chance to be the "already handled" evidence,
+   * and the batch's duplicates were invisible to dedup because their ids differ.
+   *
+   * All-or-nothing: on any failure every file this batch created is removed and
+   * every file it overwrote is restored from a snapshot taken before the write.
+   * The snapshot is kept (not deleted on failure) so the failure is diagnosable,
+   * and a restore failure never masks the original error — the caller sees why
+   * the batch failed, not why the cleanup did.
+   *
+   * Scoped to the distill output contract: it undoes page bytes and their index
+   * rows, which is everything `writeDistillPage` produces. It is not a general
+   * transaction and does not claim to be one.
+   */
+  writeDistillBatch<T extends { project: string; kind: "fact" | "experience"; payload: Parameters<StoreRoot["writeDistillPage"]>[2]; audit?: AuditIdentity }>(
+    entries: T[],
+  ): string[] {
+    const snapshots = new Map<string, string | null>();
+    const written: string[] = [];
+    for (const e of entries) {
+      // Predict the path without writing: `writeDistillPage` derives it from
+      // (project, kind, payload.id), so the snapshot set is known up front.
+      const rel = `${e.project}/${e.kind === "fact" ? "facts" : "experiences"}/${e.payload.id}.md`;
+      // Two entries on one path would mean the last silently wins, and the
+      // earlier one's body is gone with nothing to show it existed (R3). The ids
+      // are generated upstream, so this only fires on a real upstream defect —
+      // which is exactly why it should be loud rather than a quiet overwrite.
+      if (snapshots.has(rel)) {
+        throw new Error(
+          `distillation batch writes the same path twice: ${rel} — each entry must own a distinct id; refusing rather than letting the later entry overwrite the earlier one`,
+        );
+      }
+      const page = this.readPageByRel(rel);
+      snapshots.set(rel, page ? dumpPage(page) : null);
+    }
+    try {
+      for (const e of entries) {
+        written.push(this.writeDistillPage(e.project, e.kind, e.payload, e.audit));
+      }
+      return written;
+    } catch (err) {
+      for (const [rel, before] of snapshots) {
+        try {
+          if (before === null) {
+            // Created by this batch: remove the file AND its index row, so a
+            // failed batch leaves no trace a reader could still see.
+            rmSync(join(this.wikiDir, rel), { force: true });
+            this.db.deletePageIndex(rel);
+          } else {
+            const page = parsePage(before);
+            writePageFile(join(this.wikiDir, rel), page);
+            this.db.indexPage(rel.split("/")[0], rel, String(page.frontmatter.type ?? "note"), String(page.frontmatter.title ?? ""), page.body, {
+              sources: Array.isArray(page.frontmatter.sources) ? (page.frontmatter.sources as string[]) : [],
+              supersedes: Array.isArray(page.frontmatter.supersedes) ? (page.frontmatter.supersedes as string[]) : [],
+              tags: [], tier: "draft", source_ref: null, metadata: null,
+            });
+          }
+        } catch {
+          // Keep the ORIGINAL failure: a restore that itself failed is worth
+          // knowing about, but it must not replace the reason the batch broke.
+        }
+      }
+      throw err;
+    }
   }
 
   // Logical delete (memory-visibility): frontmark the truth, drop from every

@@ -17,3 +17,25 @@ export function sanitize(text: string): string {
   out = out.replace(LABELED_SECRET, (_m, label: string) => `${label}=[REDACTED]`);
   return out;
 }
+
+// ATX headings at line start. Fenced code is NOT special-cased: a `# ` line
+// inside a fence still reads as a heading to every Markdown parser, so leaving
+// it would keep the ambiguity this exists to remove.
+const ATX_HEADING = /^#{1,6}[ \t]+/gm;
+
+/**
+ * Neutralise model-authored document structure inside a FIELD (R1 of
+ * distill-output-contract). The page's own skeleton \u2014 `## Statement`,
+ * `## Solution` \u2014 is written by the renderer; a field that carries `##` of its
+ * own either collides with those sections or invents new ones, and the read
+ * faces that split on headings then mis-slice the page.
+ *
+ * Demotion, not rejection: a model formatting a solution with headings is
+ * still telling us something true, and refusing the whole memory over
+ * presentation would lose it. The text is kept verbatim; only its claim to be
+ * a section is dropped.
+ */
+export function demoteHeadings(text: string): string {
+  if (!text) return text;
+  return text.replace(ATX_HEADING, "");
+}

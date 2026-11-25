@@ -100,7 +100,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, result)
         except asyncio.TimeoutError:
             self._json(200, {
-                "facts": [], "experiences": [], "cursor_next": {},
+                # Same shape as a success (contract_version + sources), so a
+                # timeout is read as "this batch produced nothing", not as a
+                # sidecar speaking an older contract.
+                "contract_version": engine.CONTRACT_VERSION,
+                "facts": [], "experiences": [], "sources": [], "cursor_next": {},
                 "llm_calls": [], "tokens": 0,
                 "errors": [f"distill_deadline_exceeded: no result within {deadline:.0f}s "
                            f"(one LLM call most likely hung; the caller would otherwise "
@@ -109,7 +113,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # engine-level failure: report, keep caller's cursor
             import traceback; traceback.print_exc()
             self._json(200, {
-                "facts": [], "experiences": [], "cursor_next": {},
+                "contract_version": engine.CONTRACT_VERSION,
+                "facts": [], "experiences": [], "sources": [], "cursor_next": {},
                 "llm_calls": [], "tokens": 0,
                 "errors": [f"{type(e).__name__}: {str(e)[:300]}"],
             })

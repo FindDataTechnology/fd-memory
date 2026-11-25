@@ -724,23 +724,32 @@ export class DistillScheduler {
           const result = (await res.json()) as {
             facts: Array<Record<string, unknown>>;
             experiences: Array<Record<string, unknown>>;
+            sources?: string[];
             llm_calls: Array<unknown>;
             tokens: number;
             errors: string[];
           };
           if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
-          for (const fact of result.facts ?? []) {
-            const entry = normalizeEntry(fact, "fact");
-            entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
-            const rel = root.writeDistillPage(project, "fact", entry, audit);
-            writeEntryVector(root, rel, fact, this.log);
-          }
-          for (const exp of result.experiences ?? []) {
-            const entry = normalizeEntry(exp, "experience");
-            entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
-            const rel = root.writeDistillPage(project, "experience", entry, audit);
-            writeEntryVector(root, rel, exp, this.log);
-          }
+          checkContractVersion((result as { contract_version?: unknown }).contract_version, this.log);
+          // The batch's own session ids, in the `session:<sid>` shape the engine
+          // emits. Anything else the sidecar returns is not a citation we can
+          // resolve, so it is not written (R2).
+          // Absent `sources` = an older sidecar that never declared its universe:
+          // no opinion, keep the entry's own refs. An explicit (even empty) array
+          // means the sidecar answered, so only those refs are writable. Reading
+          // absent as empty would strip every citation the moment this build met
+          // an un-upgraded sidecar — caught on real fd-prod traffic 2026-11-25.
+          const allowedSources = Array.isArray(result.sources) ? new Set(result.sources.map(String)) : undefined;
+          const raws = [...(result.facts ?? []).map((e) => ({ e, kind: "fact" as const })), ...(result.experiences ?? []).map((e) => ({ e, kind: "experience" as const }))];
+          const distillBatch = raws.map(({ e, kind }) => {
+            const entry = normalizeEntry(e, kind, allowedSources);
+            entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), kind)];
+            return { project, kind, payload: entry, audit };
+          });
+          // One unit (R4): a failure partway through must not leave a half-landed
+          // batch the next round would write again under fresh ids.
+          const rels = root.writeDistillBatch(distillBatch);
+          raws.forEach(({ e }, i) => writeEntryVector(root, rels[i], e, this.log));
           for (const c of result.llm_calls ?? []) stageCalls.push(c);
           // Truncation visibility only (fix-distill-extract-truncation 1.1/1.3):
           // this run's extract output may have been cut at the completion
@@ -915,24 +924,24 @@ export class DistillScheduler {
         const result = (await res.json()) as {
           facts: Array<Record<string, unknown>>;
           experiences: Array<Record<string, unknown>>;
+          sources?: string[];
           cursor_next: { obs: number; handoff: string };
           llm_calls: Array<unknown>;
           tokens: number;
           errors: string[];
         };
         if (result.errors?.length) throw new Error(`engine errors: ${result.errors.slice(0, 3).join("; ")}`);
-        for (const fact of result.facts ?? []) {
-          const entry = normalizeEntry(fact, "fact");
-          entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), "fact")];
-          const rel = root.writeDistillPage(project, "fact", entry, audit);
-          writeEntryVector(root, rel, fact, this.log);
-        }
-        for (const exp of result.experiences ?? []) {
-          const entry = normalizeEntry(exp, "experience");
-          entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.task ?? ""), "experience")];
-          const rel = root.writeDistillPage(project, "experience", entry, audit);
-          writeEntryVector(root, rel, exp, this.log);
-        }
+        checkContractVersion((result as { contract_version?: unknown }).contract_version, this.log);
+        // Absent = older sidecar, no opinion (see the chunked path above).
+        const allowedSources = Array.isArray(result.sources) ? new Set(result.sources.map(String)) : undefined;
+        const raws = [...(result.facts ?? []).map((e) => ({ e, kind: "fact" as const })), ...(result.experiences ?? []).map((e) => ({ e, kind: "experience" as const }))];
+        const distillBatch = raws.map(({ e, kind }) => {
+          const entry = normalizeEntry(e, kind, allowedSources);
+          entry.supersedes = [...entry.supersedes, ...dedupeSupersedes(String(entry.statement ?? entry.task ?? ""), kind)];
+          return { project, kind, payload: entry, audit };
+        });
+        const rels = root.writeDistillBatch(distillBatch);
+        raws.forEach(({ e }, i) => writeEntryVector(root, rels[i], e, this.log));
         for (const c of result.llm_calls ?? []) stageCalls.push(c);
         engineCalls += result.llm_calls?.length ?? 0;
         billed += result.tokens ?? 0;
@@ -1108,6 +1117,28 @@ function holdCursorForTruncation(
     : `[distill] ${key}: extract truncated even after splitting — cursor held, this batch retries next round (gap ${gaps})`);
 }
 
+export interface HybridCandidatesResult {
+  candidates: Array<DistillCandidate & { score?: number }>;
+  /** Ranked live matches before the top-k slice (keyword ∪ vector). */
+  matched: number;
+  /** `matched - candidates.length`. See distillCandidatesDetailed. */
+  omitted: number;
+}
+
+export async function hybridCandidatesDetailed(opts: {
+  root: StoreRoot;
+  project: string;
+  projects?: string[];
+  queryFor: string;
+  k?: number;
+  embed: (texts: string[]) => Promise<{ vectors: number[][]; model: string; tokens: number }>;
+  log?: { warn: (msg: string) => void };
+}): Promise<HybridCandidatesResult> {
+  const ranked = await hybridRank(opts);
+  const candidates = ranked.slice(0, opts.k ?? 8);
+  return { candidates, matched: ranked.length, omitted: Math.max(0, ranked.length - candidates.length) };
+}
+
 export async function hybridCandidates(opts: {
   root: StoreRoot;
   project: string;
@@ -1120,11 +1151,26 @@ export async function hybridCandidates(opts: {
   embed: (texts: string[]) => Promise<{ vectors: number[][]; model: string; tokens: number }>;
   log?: { warn: (msg: string) => void };
 }): Promise<Array<DistillCandidate & { score?: number }>> {
+  const out = await hybridCandidatesDetailed(opts);
+  return out.candidates;
+}
+
+async function hybridRank(opts: {
+  root: StoreRoot;
+  project: string;
+  projects?: string[];
+  queryFor: string;
+  k?: number;
+  embed: (texts: string[]) => Promise<{ vectors: number[][]; model: string; tokens: number }>;
+  log?: { warn: (msg: string) => void };
+}): Promise<Array<DistillCandidate & { score?: number }>> {
   const { root, project, queryFor, k = 8, embed, log } = opts;
   const projects = opts.projects && opts.projects.length
     ? [...new Set(opts.projects)]
     : project === "shared" ? [project] : [project, "shared"];
-  const keyword = distillCandidates(root, projects, queryFor);
+  // No slice here: the caller slices once and reports what it hid (R6). A
+  // count taken after `.slice(0, k)` cannot say how much was dropped.
+  const keyword = distillCandidates(root, projects, queryFor, Number.MAX_SAFE_INTEGER);
   // Vector lane kill switch (2026-11-18). `EMBED_DISABLED` was only honoured
   // inside the scheduler, so every /digest and /memory read still reached for
   // the embed lane and ate a 404 round-trip before falling back to keywords —
@@ -1196,10 +1242,10 @@ export async function hybridCandidates(opts: {
       // stranded history. Actionable fix: POST /admin/reembed.
       log?.warn(`[hybrid] ${project}: ${modelMismatch} vector(s) on other models EXCLUDED from cosine — recall is running on a partial corpus; re-embed via POST /admin/reembed`);
     }
-    return merged.slice(0, k);
+    return merged;
   } catch (e) {
     log?.warn(`[hybrid] embed query failed — keyword-only candidates: ${(e as Error)?.message ?? e}`);
-    return keyword.slice(0, k); // the fallback must honour k like the success path
+    return keyword; // the caller's single slice applies k on both paths
   }
 }
 
@@ -1243,13 +1289,35 @@ function cosine(a: ArrayLike<number>, b: ArrayLike<number>): number {
   return denom > 0 ? dot / denom : 0;
 }
 
-function normalizeEntry(entry: Record<string, unknown>, kind: "fact" | "experience") {
+/**
+ * Keep only sources the sidecar could legitimately have produced for THIS
+ * batch (distill-output-contract R2).
+ *
+ * The engine builds `sources` itself from the batch's session ids, so today no
+ * model input reaches this field. The write face still validated nothing: any
+ * sidecar change, regression, or swap that started echoing model-chosen strings
+ * would put a fabricated citation on a page, and a reader following it finds
+ * nothing. Provenance is only worth something if the writer cannot invent it,
+ * so the allowed set is passed in rather than trusted.
+ *
+ * Dropping an unknown ref keeps the memory (the fact is still true) while
+ * refusing the unverifiable claim about where it came from — the same shape as
+ * the read faces' `sources` display, which never renders an id it cannot
+ * resolve.
+ */
+function filterSources(raw: unknown, allowed: ReadonlySet<string> | undefined): string[] {
+  const list = Array.isArray(raw) ? raw.map(String) : [];
+  if (!allowed) return list;
+  return list.filter((s) => allowed.has(s));
+}
+
+function normalizeEntry(entry: Record<string, unknown>, kind: "fact" | "experience", allowedSources?: ReadonlySet<string>) {
   const id = String(entry.id ?? `${kind}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`);
   return {
     id,
     engine: String(entry.engine ?? "engine:unknown"),
     confidence: entry.confidence != null ? Number(entry.confidence) : undefined,
-    sources: Array.isArray(entry.sources) ? (entry.sources as string[]) : [],
+    sources: filterSources(entry.sources, allowedSources),
     supersedes: Array.isArray(entry.supersedes) ? (entry.supersedes as string[]) : [],
     statement: entry.statement != null ? String(entry.statement) : undefined,
     subject: entry.subject != null ? String(entry.subject) : undefined,
@@ -1260,6 +1328,40 @@ function normalizeEntry(entry: Record<string, unknown>, kind: "fact" | "experien
     solution: entry.solution != null ? String(entry.solution) : undefined,
     boundary_envs: entry.boundary_envs != null ? String(entry.boundary_envs) : undefined,
   };
+}
+
+/**
+ * The sidecar contract this build understands (distill-output-contract R5).
+ *
+ * `engine.py`'s `CONTRACT_VERSION` names the SHAPE of the response; `ENGINE`
+ * names the model/harness build and moves for unrelated reasons. Only the shape
+ * is versioned here, because a shape change is what used to fail silently: the
+ * scheduler read `result.facts ?? []`, and a renamed field became "the model
+ * produced nothing" — a page with a missing section that nothing flagged.
+ *
+ * Missing is treated as unknown, not as "version 1": an older sidecar that does
+ * not send the field is exactly the thing this protects against, but refusing it
+ * would break every deployment mid-rollout. Instead it is accepted and logged
+ * once, so the mismatch is visible without taking distillation offline.
+ */
+const SUPPORTED_CONTRACT_VERSION = 1;
+
+let warnedMissingContract = false;
+
+function checkContractVersion(v: unknown, log?: { warn: (m: string) => void }): void {
+  if (v === undefined || v === null) {
+    if (!warnedMissingContract) {
+      warnedMissingContract = true;
+      log?.warn(`[distill] sidecar sent no contract_version (this build understands ${SUPPORTED_CONTRACT_VERSION}) — batch parsed by field name only; upgrade the sidecar to make shape drift refuse loudly`);
+    }
+    return;
+  }
+  if (Number(v) !== SUPPORTED_CONTRACT_VERSION) {
+    throw new Error(
+      `sidecar contract_version ${String(v)} != supported ${SUPPORTED_CONTRACT_VERSION} — refusing the batch rather than reading unknown fields as empty. ` +
+      `Redeploy fd-memory and the distiller sidecar from the same revision.`,
+    );
+  }
 }
 
 function tomorrowMs(now: number): number {
