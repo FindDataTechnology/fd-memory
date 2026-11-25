@@ -146,7 +146,10 @@ export class RootDb {
   // simply absent while everything else looks healthy.
   // 7 — batch 4 adds the share_reads audit table. Every schema change needs
   // this bump; the idempotent guards inside migrate() are not triggers.
-  static readonly SCHEMA_VERSION = 7;
+  // 8 — the pages_touched partial index (usage-signal counts). Same trap a third
+  // time: CREATE INDEX IF NOT EXISTS is not a trigger either, so without the
+  // bump every already-migrated database keeps the 38s `/admin/metrics` scan.
+  static readonly SCHEMA_VERSION = 8;
 
   /**
    * The closed domain-key vocabulary (add-domain-memory-schema).
@@ -387,6 +390,15 @@ export class RootDb {
     // Application Support 下，符合前提。
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
+    // Cap the WAL file (2026-11-25). WAL grows to the largest transaction's
+    // working set and then STAYS there: measured the live root at 311MB against
+    // a 767MB main file, never shrinking between runs. Every read of a page
+    // living in the WAL pays a lookup in that 311MB index on the same event
+    // loop, and on a machine already swapping the page faults dominate.
+    // `journal_size_limit` truncates the WAL back to this size the next time it
+    // checkpoints, so the cap costs nothing at steady state and stops the file
+    // from becoming a permanent second copy of the table.
+    this.db.exec("PRAGMA journal_size_limit = 67108864"); // 64MB
     // NOT setting cache_size/mmap_size here (2026-11-18, tried and reverted).
     // Hypothesis was that SQLite's default 2MB page cache explained the
     // "first healthz after a while takes 24s, then 38ms" shape. Measured it:
@@ -701,6 +713,23 @@ export class RootDb {
       const path = `'$."${key.replace(/"/g, '""')}"'`;
       this.db.exec(`CREATE INDEX IF NOT EXISTS ${this.domainIndexName(key)} ON pages(project, json_extract(metadata, ${path}))`);
     }
+    // Usage-signal partial index (2026-11-25). `/admin/metrics` answers
+    // `usageSignalStats()`, which counts `retrieved_n > 0` / `injected_n > 0`
+    // and sorts the touched rows. Those counters are 0 on almost every page —
+    // measured on the live 156k-row index: 22 retrieved, 505 injected — so each
+    // COUNT was a full scan of a table whose rows are mostly observation bodies.
+    // Measured on a copy of the live DB: 10.7s + 11.0s + 7.8s + 8.6s ≈ 38s of
+    // SYNCHRONOUS work per request, which is exactly the /healthz outage the
+    // stall watchdog reports (and why a hook's 1s /observe budget times out
+    // while a stats scrape is in flight).
+    //
+    // Partial on the touched predicate, which is also the query's WHERE: only
+    // the ~527 matching rows are indexed, so the scan above collapses to an
+    // index probe. Measured after: 0.00s for all four. Build cost 8.9s on the
+    // live row count — this is why it rides the version bump instead of a
+    // per-open CREATE INDEX.
+    this.db.exec("CREATE INDEX IF NOT EXISTS pages_touched ON pages(retrieved_n, injected_n) WHERE retrieved_n > 0 OR injected_n > 0");
+
     // Give the planner statistics for the indexes above (add-domain-memory-schema).
     //
     // Measured: without stats, a domain index on a key that is still mostly NULL
@@ -1122,9 +1151,18 @@ export class RootDb {
     top_retrieved: Array<{ path: string; retrieved_n: number; injected_rate: number | null }>;
   } {
     const total = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages").get() as { c: number }).c);
+    // `retrieved` / `injected` / `top` are served by the pages_touched partial
+    // index (see migrate()). `never_touched` is NOT: its predicate is the
+    // NEGATION of that index's, so it cannot use it and still scanned every row
+    // (measured 3.0s on the live 156k-row index, vs 0.001s for the other two
+    // counts). Derive it instead — a page is untouched exactly when it was
+    // neither retrieved nor injected, and both of those counts are index probes,
+    // so this is `total - union(retrieved, injected)` with one extra probe for
+    // the overlap. Same answer, no scan.
     const retrieved = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n > 0").get() as { c: number }).c);
     const injected = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE injected_n > 0").get() as { c: number }).c);
-    const untouched = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n = 0 AND injected_n = 0").get() as { c: number }).c);
+    const both = Number((this.db.prepare("SELECT COUNT(*) AS c FROM pages WHERE retrieved_n > 0 AND injected_n > 0").get() as { c: number }).c);
+    const untouched = total - (retrieved + injected - both);
     const rows = this.db
       .prepare("SELECT path, retrieved_n, injected_n, injected_seen_n FROM pages WHERE retrieved_n > 0 OR injected_n > 0 ORDER BY retrieved_n DESC, injected_n DESC LIMIT 10")
       .all() as Array<{ path: string; retrieved_n: number; injected_n: number; injected_seen_n: number }>;

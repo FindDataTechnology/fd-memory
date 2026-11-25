@@ -979,9 +979,17 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
     // the event ends up on the spool either way, and a healthy service answers
     // /observe in ~40ms (measured), so 1s is still 25× the real latency.
     //
+    // 1000 → 250 (2026-11-25). A healthy /observe is p50 11ms / p90 55ms / p99
+    // 99ms over 60 live samples, so 250ms is still ~2.5× the p99. The 1s budget
+    // was not harmless: POST-TOOL-USE fires on EVERY tool call, so on a service
+    // that is blocking (a /admin/metrics scrape used to hold the loop ~38s) the
+    // harness paid a full second per call — the difference between a 1.3s and a
+    // 0.2s Bash turn. Waiting longer than 250ms cannot rescue an event anyway;
+    // it ends up on the spool either way.
+    //
     // The spool makes this safe: a short timeout means "capture it locally"
     // slightly sooner, never "lose it".
-    timeoutMs: 1000,
+    timeoutMs: 250,
   });
   if (!result.delivered) {
     // Spool it instead of dropping it (2026-11-19). Fail-drop was the original

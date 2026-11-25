@@ -550,7 +550,14 @@ export class DistillScheduler {
       // Pack roots discover work via capture observations; person roots
       // (add-u-root-distillation D3) have none — the pages index is their
       // project discovery surface.
-      for (const row of root.db.recentObservations(2000) as unknown as Array<{ project: string }>) projects.add(row.project);
+      //
+      // Only the PROJECT NAMES are needed here, so ask for those. This used to
+      // call recentObservations(2000), which selects every column of 2000 rows
+      // (including `summary`) and runs `COUNT(*) OVER ()` over the whole table
+      // to fill a field the caller never reads — measured 125ms on the live
+      // 156k-row index, 2.7ms for the DISTINCT it actually wanted. It runs
+      // synchronously in the scheduler's drain tick, i.e. on the event loop.
+      for (const row of root.db.db.prepare("SELECT DISTINCT project FROM observations").all() as Array<{ project: string }>) projects.add(row.project);
       // Discovery must not be observation-only (fix-distill-extract-truncation 6.2).
       // A d-root whose material lives entirely in notes/handoffs has no
       // observations at all, so it never entered `projects` and the scan could
