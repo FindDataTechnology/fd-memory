@@ -1,0 +1,297 @@
+[
+  {
+    "ran_at": "2026-11-26T12:38:23.615Z",
+    "kind": "merge-arm-comparison",
+    "code_version": "6913b82",
+    "scenes_sha": "63c5663ccd60bf9a",
+    "replay": "node scripts/eval-continue.mjs --merge --scenes fixtures/eval/merge-scenes.json",
+    "scenes_file": "fixtures/eval/merge-scenes.json",
+    "scenes_version": "12 scenes",
+    "agent_model": "deepseek-v4-pro",
+    "judge_model": "deepseek-v4-pro",
+    "embed_lane": false,
+    "total_budget_tokens": 800,
+    "arm_budget_tokens": [
+      {
+        "scene": "mx-1",
+        "merged": 158,
+        "split": 199,
+        "ceiling": 800
+      },
+      {
+        "scene": "mx-2",
+        "merged": 212,
+        "split": 260,
+        "ceiling": 800
+      },
+      {
+        "scene": "mx-3",
+        "merged": 102,
+        "split": 146,
+        "ceiling": 800
+      },
+      {
+        "scene": "mx-4",
+        "merged": 145,
+        "split": 186,
+        "ceiling": 800
+      },
+      {
+        "scene": "mo-1",
+        "merged": 97,
+        "split": 141,
+        "ceiling": 800
+      },
+      {
+        "scene": "mo-2",
+        "merged": 95,
+        "split": 139,
+        "ceiling": 800
+      },
+      {
+        "scene": "mo-3",
+        "merged": 92,
+        "split": 136,
+        "ceiling": 800
+      },
+      {
+        "scene": "mo-4",
+        "merged": 88,
+        "split": 132,
+        "ceiling": 800
+      },
+      {
+        "scene": "ms-1",
+        "merged": 89,
+        "split": 134,
+        "ceiling": 800
+      },
+      {
+        "scene": "ms-2",
+        "merged": 95,
+        "split": 140,
+        "ceiling": 800
+      },
+      {
+        "scene": "ms-3",
+        "merged": 93,
+        "split": 138,
+        "ceiling": 800
+      },
+      {
+        "scene": "ms-4",
+        "merged": 89,
+        "split": 134,
+        "ceiling": 800
+      }
+    ],
+    "thresholds": {
+      "winTieRate": 0.7,
+      "meanDiff": -0.25,
+      "minN": 12
+    },
+    "pairing": {
+      "re_derivation": {
+        "n": 12,
+        "wins": 0,
+        "ties": 11,
+        "losses": 1,
+        "winTieRate": 0.917,
+        "meanDiff": -0.083,
+        "winTieMargin": 0.217,
+        "meanDiffMargin": 0.167
+      },
+      "first_step": {
+        "n": 12,
+        "wins": 1,
+        "ties": 9,
+        "losses": 2,
+        "winTieRate": 0.833,
+        "meanDiff": -0.083,
+        "winTieMargin": 0.133,
+        "meanDiffMargin": 0.167
+      },
+      "tie_rate": 0.917
+    },
+    "verdict": "PASS",
+    "reason": "合并臂不劣：胜+平 0.917/0.833（平局 11/9），平均分差 -0.083/-0.083",
+    "failures": [],
+    "rollback": "删除 platform 清单 env FD_MEMORY_DIGEST_MERGE_OWN_SHARED（同时删 deploy 上的同名 env）并重建 pod，回到三段形状",
+    "per_scene": [
+      {
+        "scene": "mx-1",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 5252
+      },
+      {
+        "scene": "mx-1",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4050
+      },
+      {
+        "scene": "mx-2",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4360
+      },
+      {
+        "scene": "mx-2",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 3757
+      },
+      {
+        "scene": "mx-3",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 2882
+      },
+      {
+        "scene": "mx-3",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4232
+      },
+      {
+        "scene": "mx-4",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4377
+      },
+      {
+        "scene": "mx-4",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 5139
+      },
+      {
+        "scene": "mo-1",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 3765
+      },
+      {
+        "scene": "mo-1",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4446
+      },
+      {
+        "scene": "mo-2",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4467
+      },
+      {
+        "scene": "mo-2",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4120
+      },
+      {
+        "scene": "mo-3",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 4,
+        "tokens": 6964
+      },
+      {
+        "scene": "mo-3",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 4308
+      },
+      {
+        "scene": "mo-4",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 4,
+        "tokens": 5760
+      },
+      {
+        "scene": "mo-4",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 3929
+      },
+      {
+        "scene": "ms-1",
+        "arm": "digest-merged",
+        "re_derivation": 1,
+        "first_step": 2,
+        "tokens": 5923
+      },
+      {
+        "scene": "ms-1",
+        "arm": "digest-split",
+        "re_derivation": 2,
+        "first_step": 2,
+        "tokens": 5966
+      },
+      {
+        "scene": "ms-2",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 3598
+      },
+      {
+        "scene": "ms-2",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 4,
+        "tokens": 5975
+      },
+      {
+        "scene": "ms-3",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 6573
+      },
+      {
+        "scene": "ms-3",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 7839
+      },
+      {
+        "scene": "ms-4",
+        "arm": "digest-merged",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 3444
+      },
+      {
+        "scene": "ms-4",
+        "arm": "digest-split",
+        "re_derivation": 5,
+        "first_step": 5,
+        "tokens": 5381
+      }
+    ],
+    "tokens": 120805,
+    "run_dir_local": "/var/folders/rp/2v4sddsn10vg4z9sljcz87sh0000gn/T/fdm-eval-continue-1795694882233",
+    "blind_map_local_only": {
+      "digest-merged": "A",
+      "digest-split": "B"
+    }
+  }
+]

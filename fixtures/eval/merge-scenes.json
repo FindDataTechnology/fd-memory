@@ -2,7 +2,7 @@
   {
     "id": "mx-1",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mx-1",
       "project": "site-heal"
@@ -70,7 +70,7 @@
   {
     "id": "mx-2",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mx-2",
       "project": "digest-pipeline"
@@ -138,7 +138,7 @@
   {
     "id": "mx-3",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mx-3",
       "project": "fleet-planner"
@@ -206,7 +206,7 @@
   {
     "id": "mx-4",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mx-4",
       "project": "crawl-ops"
@@ -274,7 +274,7 @@
   {
     "id": "mo-1",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mo-1",
       "project": "site-heal"
@@ -324,7 +324,7 @@
   {
     "id": "mo-2",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mo-2",
       "project": "digest-pipeline"
@@ -374,7 +374,7 @@
   {
     "id": "mo-3",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mo-3",
       "project": "fleet-planner"
@@ -424,7 +424,7 @@
   {
     "id": "mo-4",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-mo-4",
       "project": "crawl-ops"
@@ -474,7 +474,7 @@
   {
     "id": "ms-1",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-ms-1",
       "project": "site-heal"
@@ -522,7 +522,7 @@
   {
     "id": "ms-2",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-ms-2",
       "project": "digest-pipeline"
@@ -570,7 +570,7 @@
   {
     "id": "ms-3",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-ms-3",
       "project": "fleet-planner"
@@ -618,7 +618,7 @@
   {
     "id": "ms-4",
     "merge_only": true,
-    "review": "pending",
+    "review": "reviewed",
     "source": {
       "root": "d-eval-ms-4",
       "project": "crawl-ops"
