@@ -11,6 +11,7 @@ import {
   applyClaudeCode,
   applyGeminiFamily,
   applyHermes,
+  applyOpenclaw,
   applyWorkbuddy,
   applyZcode,
   cozeDisconnectNotes,
@@ -20,6 +21,7 @@ import {
   disconnectClaudeCode,
   disconnectGeminiFamily,
   disconnectHermes,
+  disconnectOpenclaw,
   disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
@@ -53,13 +55,14 @@ export const CONNECT_USAGE = `usage:
   yongyi connect gemini-cli --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect qwen --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect hermes --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect openclaw --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
   yongyi connect dify --url <service-url> --as <user> [--project P]
   yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
-const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes"] as const;
+const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw"] as const;
 
 // ── Recall-injection envelope, per harness (2026-11-18) ─────────────────────
 //
@@ -92,6 +95,10 @@ export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
   // hermes shell hooks answer on stdout; `pre_llm_call` takes {"context": "..."}
   // (a bare string is equivalent). Vendor docs, read 2026-11-28.
   hermes: "context-key",
+  // openclaw's internal hooks are observation points (message events cannot
+  // inject); recall would ride the before_prompt_build plugin hook, which this
+  // adapter does not install. `none` is the honest answer until that lands.
+  openclaw: "none",
 };
 
 /**
@@ -122,7 +129,7 @@ export function injectionPayload(harness: string, ctx: string): Record<string, u
 const RECIPE_HARNESSES = ["dify", "coze"] as const;
 
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "mcp", "dify", "coze"];
+  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -267,6 +274,8 @@ export async function runConnect(argv: string[]): Promise<void> {
     report.files = applyGeminiFamily(t, ".qwen", "qwen", url, envVar);
   } else if (harness === "hermes") {
     report.files = applyHermes(t, url, envVar);
+  } else if (harness === "openclaw") {
+    report.files = applyOpenclaw(t, url, envVar);
   } else {
     report.snippet = genericMcpSnippet(url, envVar);
   }
@@ -371,6 +380,8 @@ export function runDisconnect(argv: string[]): void {
     files = disconnectGeminiFamily(t, ".qwen", "qwen");
   } else if (harness === "hermes") {
     files = disconnectHermes(t);
+  } else if (harness === "openclaw") {
+    files = disconnectOpenclaw(t);
   } else if (harness === "dify") {
     const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
     files = dropBinding("dify", paths.creds, paths.env);

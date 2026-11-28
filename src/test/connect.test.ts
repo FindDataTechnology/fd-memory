@@ -1006,3 +1006,65 @@ test("hermes: usage text and supported set agree", () => {
     assert.ok(CONNECT_USAGE.includes(`connect ${h} `), `${h} missing from usage text`);
   }
 });
+
+// ── openclaw (yongyi-capture-six-harnesses S3) ───────────────────────────────
+// openclaw has no shell hooks; its internal hooks are JS modules running inside
+// the gateway. This adapter therefore ships a BRIDGE (HOOK.md + handler.js) that
+// forwards to the same `yongyi hook` command. The tests pin the properties that
+// would otherwise only show up as a broken gateway in production.
+test("openclaw: connect writes the bridge hook and the MCP entry", async () => {
+  const { applyOpenclaw, openclawHookDir } = await import("../connect/adapters.js");
+  const home = tmp("fdm-oc-");
+  const proj = tmp("fdm-ocp-");
+  const t = targetsFor(home, proj);
+  applyOpenclaw(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const dir = openclawHookDir(t);
+  const hookMd = readFileSync(join(dir, "HOOK.md"), "utf8");
+  assert.ok(hookMd.includes("message:received"), "must subscribe to a message event");
+  assert.ok(hookMd.includes("session:patch"), "must subscribe to a session event");
+  assert.match(hookMd, /yongyi connect openclaw/, "descriptor must say how to disconnect");
+
+  const handler = readFileSync(join(dir, "handler.js"), "utf8");
+  assert.match(handler, /spawnSync\("yongyi", \["hook", "openclaw"/, "handler must call the shared hook command");
+  assert.match(handler, /timeout: 10000/, "handler must be bounded");
+  assert.match(handler, /catch/, "handler must be fail-open");
+
+  const cfg = JSON.parse(readFileSync(join(home, ".openclaw", "openclaw.json"), "utf8"));
+  assert.equal(cfg.mcp.servers["fd-memory"].transport, "streamable-http");
+  assert.equal(cfg.mcp.servers["fd-memory"].headers.Authorization, "Bearer ${YONGYI_TOKEN_TEST}");
+});
+
+test("openclaw: re-running connect rewrites nothing", async () => {
+  const { applyOpenclaw, openclawHookDir } = await import("../connect/adapters.js");
+  const home = tmp("fdm-oc2-");
+  const proj = tmp("fdm-oc2p-");
+  const t = targetsFor(home, proj);
+  applyOpenclaw(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const first = applyOpenclaw(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const ours = first.filter((f) => f.path.startsWith(openclawHookDir(t)));
+  assert.ok(ours.every((f) => f.action === "unchanged"), "second run must be a no-op");
+});
+
+test("openclaw: disconnect removes only our hook directory", async () => {
+  const { applyOpenclaw, disconnectOpenclaw, openclawHookDir } = await import("../connect/adapters.js");
+  const home = tmp("fdm-oc3-");
+  const proj = tmp("fdm-oc3p-");
+  const t = targetsFor(home, proj);
+  // a neighbour hook that is not ours
+  mkdirSync(join(home, ".openclaw", "hooks", "someone-else"), { recursive: true });
+  writeFileSync(join(home, ".openclaw", "hooks", "someone-else", "HOOK.md"), "keep me\n");
+  applyOpenclaw(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  disconnectOpenclaw(t);
+
+  assert.equal(existsSync(openclawHookDir(t)), false, "our hook dir must be gone");
+  assert.ok(
+    existsSync(join(home, ".openclaw", "hooks", "someone-else", "HOOK.md")),
+    "another tool's hook must survive",
+  );
+});
+
+test("openclaw: recall envelope stays none until a real injection face is wired", () => {
+  assert.equal(INJECTION_ENVELOPE["openclaw"], "none");
+  assert.deepEqual(injectionPayload("openclaw", "text"), {}, "none emits nothing rather than a guess");
+});

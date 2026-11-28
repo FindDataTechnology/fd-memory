@@ -23,7 +23,8 @@ export type Harness =
   | "mcp"
   | "dify"
   | "coze"
-  | "hermes";
+  | "hermes"
+  | "openclaw";
 
 export interface Binding {
   url: string;

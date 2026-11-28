@@ -12,7 +12,7 @@
 // Both harnesses keep the same hook-entry schema: { matcher, hooks:
 // [{ type: "command", command, timeout }] } inside hooks.<EventName> arrays.
 
-import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { upsertManagedBlock, removeManagedBlock } from "./managed-block.js";
 import YAML from "yaml";
@@ -636,4 +636,121 @@ export function disconnectHermes(t: ConnectTargets): FileWrite[] {
     { ...written, action: written.action === "unchanged" ? "unchanged" : "removed" },
     removeMarkdownBlock(t.projectDir + "/AGENTS.md"),
   ];
+}
+
+// ── openclaw (yongyi-capture-six-harnesses S3) ────────────────────────────────
+//
+// openclaw has no shell-hook surface: its internal hooks are JS modules that run
+// INSIDE the gateway process (`HOOK.md` descriptor + a default-exported handler,
+// discovered from `~/.openclaw/hooks/<name>/`). Vendor docs, read 2026-11-28.
+//
+// So capture here is a thin BRIDGE, not a second implementation: the handler
+// serialises the event context and hands it to the same `yongyi hook` command
+// every other harness uses. Event→/observe mapping stays in hook-forward.ts —
+// duplicating it here would create the second source of truth this workspace
+// keeps getting bitten by.
+//
+// Three properties the handler must have, and why:
+//   • fail-open — it runs in-process, so a throw or a hang would take the
+//     gateway's hook path down with it. Every failure is swallowed to stderr.
+//   • bounded — a 10s timeout, matching the budget the other hooks declare.
+//   • no injection — openclaw's internal hooks are observation points; recall
+//     rides `before_prompt_build` (a plugin hook) which we do not install here,
+//     so INJECTION_ENVELOPE stays `none` rather than shipping a guess.
+export const OPENCLAW_HOOK_DIR = "yongyi-bridge";
+
+export function openclawHookDir(t: ConnectTargets): string {
+  return `${t.homeDir}/.openclaw/hooks/${OPENCLAW_HOOK_DIR}`;
+}
+
+const OPENCLAW_HOOKS_MD = `---
+name: ${OPENCLAW_HOOK_DIR}
+description: "Forward openclaw turn events to the yongyi (永忆) memory service"
+metadata:
+  { "openclaw": { "events": ["message:received", "session:patch"] } }
+---
+
+# yongyi bridge
+
+Managed by \`yongyi connect openclaw\`. Disconnect with \`yongyi disconnect openclaw\`.
+
+Forwards message and session events to \`yongyi hook openclaw <event>\` so they
+land as observations in your memory root. The handler is fail-open: if the
+command is missing or the service is unreachable the event is dropped and the
+gateway turn is unaffected.
+`;
+
+function openclawHandlerJs(): string {
+  // Kept dependency-free and tiny: it runs in the gateway process, so anything
+  // heavy here is paid on every message.
+  return `// Managed by \`yongyi connect openclaw\` — rewritten on every connect.
+// Fail-open by design: this runs in-process, and a throw would break the
+// gateway's hook path for every other hook too.
+import { spawnSync } from "node:child_process";
+
+const EVENT_MAP = { "message:received": "stop", "session:patch": "session-start" };
+
+export default function handler(event) {
+  try {
+    const ourEvent = EVENT_MAP[event?.type + ":" + event?.action] ?? null;
+    if (!ourEvent) return;
+    // hook-forward.ts reads canonical field names (session_id/prompt/tool_name).
+    // openclaw hands us event.context.content, so translate rather than teach
+    // the shared mapper a second vocabulary.
+    const ctx = event?.context ?? {};
+    const payload = {
+      session_id: event?.sessionKey,
+      prompt: typeof ctx.content === "string" ? ctx.content : JSON.stringify(ctx),
+      cwd: ctx.cwd,
+      tool_name: ctx.toolName ?? ctx.tool_name,
+    };
+    spawnSync("yongyi", ["hook", "openclaw", ourEvent], {
+      input: JSON.stringify(payload),
+      timeout: 10000,
+      stdio: ["pipe", "ignore", "inherit"],
+    });
+  } catch (err) {
+    // never let the bridge break a turn
+    console.error("[yongyi-bridge] forward failed:", err?.message ?? err);
+  }
+}
+`;
+}
+
+export function applyOpenclaw(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  const dir = openclawHookDir(t);
+  const files: FileWrite[] = [
+    applyServerEntry(`${t.homeDir}/.openclaw/openclaw.json`, ["mcp", "servers"], {
+      url: mcpUrlFor(baseUrl),
+      transport: "streamable-http",
+      headers: { Authorization: "Bearer ${" + envVar + "}" },
+    }),
+  ];
+  // Managed files: write only when content differs, so a re-run is a no-op.
+  for (const [name, body] of [["HOOK.md", OPENCLAW_HOOKS_MD], ["handler.js", openclawHandlerJs()]] as const) {
+    const path = `${dir}/${name}`;
+    const existed = existsSync(path);
+    if (existed && readFileSync(path, "utf8") === body) {
+      files.push({ path, action: "unchanged" });
+      continue;
+    }
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, body);
+    files.push({ path, action: existed ? "updated" : "created" });
+  }
+  return files;
+}
+
+export function disconnectOpenclaw(t: ConnectTargets): FileWrite[] {
+  const dir = openclawHookDir(t);
+  const files: FileWrite[] = [
+    removeServerEntry(`${t.homeDir}/.openclaw/openclaw.json`, ["mcp", "servers"]),
+  ];
+  if (existsSync(dir)) {
+    rmSync(dir, { recursive: true, force: true });
+    files.push({ path: dir, action: "removed" });
+  } else {
+    files.push({ path: dir, action: "absent" });
+  }
+  return files;
 }
