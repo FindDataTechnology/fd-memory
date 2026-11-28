@@ -78,6 +78,30 @@ observe 的失败语义面向调用方降级：明确错误码、有界响应时
 
 ---
 
+## 2.5 三种捕获形态（读这一节再挑客户端）
+
+不是每个客户端都能跑实时钩子。形态决定了「捕获怎么发生」和「排障该往哪看」：
+
+| 形态 | harness | 机制 |
+|---|---|---|
+| **shell hook** | claude-code、zcode、workbuddy、gemini-cli、qwen、hermes、qoder | 客户端自己的 hook 配置里写命令，事件实时转发 |
+| **进程内插件** | openclaw、opencode、pi | 生成薄桥模块，客户端加载它，内部 spawn 同一条 hook 命令 |
+| **运行后收割** | trae | 无钩子面；读 `--trajectory-file` 的产物，事后交一次 |
+
+进程内插件型的桥 MUST 满足三条（写在这里因为它们决定故障时的行为）：
+**fail-open**（失败/超时只写 stderr，绝不让宿主回合失败）、**有界**（子进程 ≤10 秒）、
+**幂等**（重跑覆盖自己的受管文件，disconnect 只删自己那份）。
+
+## 2.6 Windows 专有四个坑
+
+这四条在 macOS 上一个都不复现，所以第一次踩到要花掉一天。如果捕获在笔记本上正常、Windows 上不行，按序查：
+
+1. **`HOME` 不生效** —— Node 读 `USERPROFILE`。只设 HOME 的工具会把内容写进**真实用户目录**，而你以为写进了临时目录。
+2. **`spawnSync` 不能直接执行 `.cmd`** —— 需要 `shell: true`。没有它调用静默返回空，读起来像「命令什么都没输出」。
+3. **开了 `shell: true` 之后命令行是拼接的** —— 任何带空格的路径都要加引号，**包括命令本身**
+   （`C:\Program Files\nodejs\node.exe` 会在空格处被切开）。
+4. **ESM 的 `import()` 不吃裸 Windows 路径** —— 要先转成 `file://` URL。
+
 ## 3. connect：每适配器一节
 
 `yongyi connect <harness> --url <service> --as <id>` 一条命令生成目标 harness 的全部接入工件：MCP 挂载、捕获接线、纪律注入、身份绑定。执行结果会列出写了哪些文件、绑定了哪个身份根。全部写操作先查受管标记再合并，**幂等重跑**：连续运行两次，条目与区块只存在一份。
@@ -109,6 +133,131 @@ yongyi connect zcode --url http://localhost:49375 --as you@example.com
 ```
 
 与 claude-code 等价的能力：MCP 挂载、捕获接线、**AGENTS.md 受管纪律区块**；幂等语义、受管区块纪律、断开还原与 claude-code 相同（`yongyi disconnect zcode`）。
+
+### 3.2a gemini-cli / qwen（同族）
+
+```bash
+yongyi connect gemini-cli --url http://localhost:49375 --as you@example.com
+yongyi connect qwen       --url http://localhost:49375 --as you@example.com
+```
+
+这一族把 MCP 条目写在 `~/.<name>/settings.json` 的 `mcpServers` 下，形状是 `{ httpUrl, headers }`
+（注意是 `httpUrl` 不是 `url`）；hook 是 `hooks.<Event>` 数组，与 claude-code 同构，注入信封也同构
+（`hookSpecificOutput.additionalContext`）。
+
+**各自的坑**：gemini-cli 的 `security.auth.selectedType` 必须是 `gemini-api-key`，否则无头运行直接退出 41；
+qwen 0.28+ 把 MCP 卡在 `Pending approval`，要先 `qwen mcp approve <name>` 才能让 agent 看到工具。
+
+### 3.2b workbuddy
+
+```bash
+yongyi connect workbuddy --url http://localhost:49375 --as you@example.com
+```
+
+MCP 写在 `~/.workbuddy/mcp.json`（项目级 `<dir>/.workbuddy/mcp.json`），形状 `{ type: "http", url, headers }`。
+
+**注意**：这个客户端的 hook **不在用户级 `settings.json` 里** —— 它只从**插件**里跑 hook。
+所以 connect 写 MCP 与纪律区块（`CODEBUDDY.md`），但捕获要靠装了携带 hooks 的功能集。
+两条路径任一条成立即可；同时存在时靠幂等键去重，不会同一次事件落两页。
+
+### 3.2c hermes
+
+```bash
+yongyi connect hermes --url http://localhost:49375 --as you@example.com
+```
+
+hermes 把**所有配置放在一个 YAML 文件** `~/.hermes/config.yaml`：
+
+- MCP：`mcp_servers.<name>.{url, headers}`
+- hook：顶层 `hooks:` 是**列表**，每项 `{event, command, timeout}`，事件是 `pre_llm_call` / `post_tool_call`
+- 注入信封：shell hook 在 **stdout** 输出 JSON，`pre_llm_call` 的形状是 `{"context": "..."}`
+
+**两个必须知道的点**：
+
+1. **首用确认** —— hermes 对每个 `(事件, 命令)` 组合第一次触发时会问一次。这是它的设计，不是接入失败。
+2. **`on_session_start` 不能接注入** —— 官方文档写明它的返回值**被忽略**。接上去既注入无效、又对同一会话
+   重复捕获，所以只接 `pre_llm_call`（每轮都触发，含第一轮，注入与首轮捕获一条覆盖）。
+
+### 3.2d qoder
+
+```bash
+yongyi connect qoder --url http://localhost:49375 --as you@example.com
+```
+
+写入 `~/.qoder/settings.json`，形状与 claude-code **完全同构**（`mcpServers` + `hooks.<Event>[]`）——
+qoder 自己的 `qodercli hooks migrate` 就是从 Claude Code 导入 hooks 的，所以契约一致。
+
+**账号**：不需要交互登录。PAT 路径是 `QODER_PERSONAL_ACCESS_TOKEN`（在
+`qoder.com/account/integrations` 生成），官方注明适用于 CI/CD 与 headless 自动化。
+
+### 3.2e openclaw（进程内插件）
+
+```bash
+yongyi connect openclaw --url http://localhost:49375 --as you@example.com
+```
+
+openclaw **没有 shell hook 面**：它的内部钩子是跑在网关进程里的 JS 模块，从
+`~/.openclaw/hooks/<name>/` 发现（`HOOK.md` 描述 + 默认导出的 handler）。所以适配器写的是一个**薄桥**：
+
+```
+~/.openclaw/hooks/yongyi-bridge/HOOK.md      # 订阅 message:received / session:patch
+~/.openclaw/hooks/yongyi-bridge/handler.js   # spawn 同一条 `yongyi hook openclaw <event>`
+```
+
+**桥 MUST fail-open**：它跑在网关进程内，抛错或卡住会连累其他所有 hook。失败只写 stderr，回合照常继续；
+子进程超时 10 秒。MCP 条目在 `~/.openclaw/openclaw.json` 的**顶层 `mcp.servers`**——
+写进 `nodeHost.mcp.servers` 只喂 Gateway，`agent exec` 看不到。
+
+### 3.2f opencode（进程内插件，按路径登记）
+
+```bash
+yongyi connect opencode --url http://localhost:49375 --as you@example.com
+```
+
+opencode 的插件 API 也是进程内 JS，但与 openclaw 不同：**按路径登记**在 `opencode.json` 的 `plugin`
+数组里，不是从目录自动发现。适配器写 `~/.config/opencode/plugins/yongyi-bridge.js` 并把路径追加进该数组。
+
+桥注册两个钩子：`ctx.session.hook("prompt")`（每轮的 prompt）与 `ctx.tool.hook("execute.after")`。
+MCP 条目在 `opencode.json` 的 `mcp.<name>`，形状 `{ type: "remote", url, headers, enabled: true }`。
+
+**坑**：`opencode run` 在部分机器上会崩（`EUNKNOWN: read` / 超时），排障时改走 server API
+（`opencode serve` → `POST /session` → `POST /session/<id>/message`）。隔离测试时
+`XDG_CONFIG_HOME` 与 `XDG_DATA_HOME` 要一起指进临时目录，只隔离前者会在会话库撞外键。
+
+### 3.2g pi（进程内插件，扩展目录）
+
+```bash
+yongyi connect pi --url http://localhost:49375 --as you@example.com
+```
+
+pi 有 `pi.on(session_start | tool_call | message_end)` 的扩展面，扩展放在
+`<PI_CODING_AGENT_DIR>/extensions/`（默认 `~/.pi/agent/extensions/`）。
+
+MCP 条目是**扁平**的 `~/.pi/agent/mcp.json`：`<name> -> {url, headers}`，没有外层容器。
+
+**坑**：`pi --print` 是 headless，但**必须**配 `--model <provider>/<id>`，否则默认走它内置的 anthropic
+模型 → 403；`models.json` 里的 provider 要 `api: "openai-completions"`。
+
+### 3.2h trae（运行后收割 —— 不是实时钩子）
+
+```bash
+yongyi connect trae --url http://localhost:49375 --as you@example.com
+```
+
+**trae 没有任何 hook 面**。它唯一的机器可读产物是 `trae-cli run --trajectory-file <json>` 在运行**结束后**
+写出的一份轨迹（含每步的 `tool_calls` 与 `tool_results`）。
+
+所以 trae 的捕获是**事后收割**：适配器写 `~/.trae/yongyi-harvest.mjs`，读跑完的轨迹，把 task 与步数/工具摘要
+交给共享的 `yongyi hook trae stop`。
+
+**必须说清的性质**：这不是实时钩子，也**没有回合中途的召回**。按实时钩子的预期去排障会一直找不到问题。
+
+**trae 的 MCP 也没有 HTTP 传输**（`http_url` 直接抛 `NotImplementedError`），所以 MCP 条目是 supergateway
+的 stdio 桥：`command: npx`、`args: [-y, supergateway, --streamableHttp <url> --oauth2Bearer <key>]`，
+且 server 名必须进 `allow_mcp_servers`，否则即使配了也不启用。
+
+**trae 配置的坑**：`trae_config.yaml` 的 `models` 段必须写全 `temperature` / `top_p` / `top_k` /
+`max_retries` / `parallel_tool_calls`，缺一个直接 `TypeError` 崩掉。
 
 ### 3.3 mcp（通用）
 

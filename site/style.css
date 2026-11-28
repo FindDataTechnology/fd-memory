@@ -542,3 +542,36 @@ a:focus-visible {
   html { scroll-behavior: auto; }
   .digest-list li { animation: none; }
 }
+
+/* ── Harness section (facet-yongyi-site-docs) ────────────────────────────────
+   Added with the "connect your AI client" section. A plain HTML table with no
+   styling reads as broken here: the site's measure is narrow and the table is
+   twelve rows wide, so it needs its own horizontal scroll and cell padding. */
+.overflow-x-auto { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+.harness-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  min-width: 30rem;
+}
+.harness-table th,
+.harness-table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem 0.5rem 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  vertical-align: top;
+}
+.harness-table th {
+  font-weight: 600;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.harness-table td:first-child { white-space: nowrap; font-weight: 500; }
+.harness-table tr:last-child td { border-bottom: 0; }
+
+.harness-notes { margin-top: 1.5rem; }
+.harness-notes p { margin: 0 0 0.875rem; line-height: 1.7; }
+.harness-notes .muted { opacity: 0.72; font-size: 0.875rem; }
