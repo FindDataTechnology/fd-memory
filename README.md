@@ -144,6 +144,45 @@ yongyi connect zcode --url http://localhost:49375 --as you@example.com
 
 与 claude-code 等价：MCP 挂载 + 捕获接线 + AGENTS.md 受管纪律区块，幂等语义相同；断开用 `yongyi disconnect zcode`。
 
+### 另外六家（2026-11-28 增补）
+
+harness 的捕获面分三种形态，适配器按形态落地——**形状不同不能套同一个模板**：
+
+| 形态 | harness | 怎么接 |
+|---|---|---|
+| **shell hook 型** | `hermes`、`qoder` | 往客户端自己的配置文件写 `hooks` 条目，命令是 `yongyi hook <harness> <event>` |
+| **进程内插件型** | `openclaw`、`opencode`、`pi` | 生成一个**薄桥模块**，由客户端插件机制加载，内部 spawn 同一条 `yongyi hook` |
+| **运行后收割型** | `trae` | trae 没有 hook 面；读它跑完写的 `--trajectory-file`，事后交一次 |
+
+```bash
+yongyi connect hermes   --url http://localhost:49375 --as you@example.com
+yongyi connect qoder    --url http://localhost:49375 --as you@example.com
+yongyi connect openclaw --url http://localhost:49375 --as you@example.com
+yongyi connect opencode --url http://localhost:49375 --as you@example.com
+yongyi connect pi       --url http://localhost:49375 --as you@example.com
+yongyi connect trae     --url http://localhost:49375 --as you@example.com
+```
+
+**三条所有桥接型共有的性质**（写在这里因为它们决定故障时的行为）：
+
+- **fail-open** — 桥模块跑在客户端进程内。它失败、超时或 `yongyi` 不在 PATH 时，
+  **只写 stderr，绝不让宿主的回合失败**。这一点是硬要求：桥坏不能拖垮客户端。
+- **有界** — 子进程超时 10 秒，与各家 hook 自己声明的预算一致。
+- **幂等** — 重跑 `connect` 不产生第二份；`disconnect` 只删自己创建的目录/条目，
+  同目录下别的插件、用户自己的 hook 逐字保留。
+
+**两处与"直觉"不同的行为**：
+
+- **hermes 的 shell hook 有首用确认** —— 每个 `(事件, 命令)` 组合第一次触发时它会问一次。
+  这是 hermes 的设计，不是接入失败；`connect` 的输出里会说明。
+- **trae 的捕获是事后收割** —— 它没有 hook 面，所以 `connect trae` 写的是
+  `~/.trae/yongyi-harvest.mjs`，等 `trae-cli run ... --trajectory-file <json>` 跑完后读那份轨迹。
+  **它不是实时钩子**，别按实时钩子的预期去排障。
+
+```bash
+yongyi disconnect hermes   # 同理 qoder / openclaw / opencode / pi / trae
+```
+
 ### 任意 MCP 客户端
 
 ```bash
