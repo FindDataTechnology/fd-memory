@@ -26,7 +26,8 @@ export type Harness =
   | "hermes"
   | "openclaw"
   | "opencode"
-  | "pi";
+  | "pi"
+  | "trae";
 
 export interface Binding {
   url: string;

@@ -1157,3 +1157,41 @@ test("pi: re-running connect is a no-op; disconnect removes the extension", asyn
 test("pi: recall envelope stays none until an injection is observed", () => {
   assert.equal(INJECTION_ENVELOPE["pi"], "none");
 });
+
+// ── trae (yongyi-capture-six-harnesses S4, corrected) ───────────────────────
+// An earlier matrix row claimed trae's model never emits tool_calls. That was
+// measured through the wrong entry point; a real --trajectory-file run shows
+// three steps with tool_calls and tool_results. Capture here is POST-RUN, and
+// the tests pin that honesty (the harvest reads a finished file, it is not a hook).
+test("trae: connect writes the supergateway MCP bridge and the post-run harvester", async () => {
+  const { applyTrae, traeHarvestPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-trae-");
+  const proj = tmp("fdm-traep-");
+  const t = targetsFor(home, proj);
+  applyTrae(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const cfg = readFileSync(join(home, ".trae", "trae_config.yaml"), "utf8");
+  assert.ok(cfg.includes("supergateway"), "trae has no HTTP MCP transport, so a stdio bridge is required");
+  assert.ok(cfg.includes("${YONGYI_TOKEN_TEST}"), "token stays an env reference");
+
+  const harvest = readFileSync(traeHarvestPath(t), "utf8");
+  assert.ok(harvest.includes("agent_steps"), "harvester must read the trajectory's steps");
+  assert.ok(harvest.includes('"hook", "trae", "stop"'), "harvester forwards to the shared hook command");
+  assert.ok(harvest.includes("catch"), "fail-open: a broken harvest must not fail the run");
+});
+
+test("trae: re-running connect is a no-op; disconnect removes the harvester", async () => {
+  const { applyTrae, disconnectTrae, traeHarvestPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-trae2-");
+  const proj = tmp("fdm-trae2p-");
+  const t = targetsFor(home, proj);
+  applyTrae(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const second = applyTrae(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  assert.ok(second.every((f) => f.action === "unchanged"));
+  disconnectTrae(t);
+  assert.equal(existsSync(traeHarvestPath(t)), false);
+});
+
+test("trae: recall is none because capture is post-run, not mid-turn", () => {
+  assert.equal(INJECTION_ENVELOPE["trae"], "none");
+});

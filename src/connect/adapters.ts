@@ -932,3 +932,89 @@ export function disconnectPi(t: ConnectTargets): FileWrite[] {
   }
   return files;
 }
+
+// ── trae (yongyi-capture-six-harnesses S4, corrected 2026-11-28) ─────────────
+//
+// An earlier matrix row said trae's model "never emits tool_calls". That was
+// measured with the wrong entry point (a stdio bridge, no trajectory capture) —
+// a real run with `--trajectory-file` shows three steps, each with tool_calls
+// AND tool_results. trae is captured POST-HOC rather than by hook:
+//
+//   trae-cli run <task> --config-file <cfg> --trajectory-file <json>
+//   → on exit, the whole run is in JSON (llm_interactions + agent_steps).
+//
+// So connect writes a wrapper that runs trae and then hands the trajectory to
+// `yongyi hook trae stop` with the turn text and a tool-call summary. That is
+// honest about what it is: not a live hook, a post-run harvest. The rig lane
+// for it must say so too.
+export function traeHarvestPath(t: ConnectTargets): string {
+  return `${t.homeDir}/.trae/yongyi-harvest.mjs`;
+}
+
+function traeHarvestJs(): string {
+  return `// Managed by \`yongyi connect trae\` — rewritten on every connect.
+// trae-agent has no hook surface; it writes a full trajectory JSON when a run
+// ends. This harvests that file into one observation, so capture is POST-RUN,
+// not live. Fail-open: a broken harvest must never fail the agent run.
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+const trajPath = process.argv[2];
+const sessionId = process.argv[3];
+if (!trajPath) {
+  console.error("usage: yongyi-harvest.mjs <trajectory.json> [session-id]");
+  process.exit(0);
+}
+
+try {
+  const d = JSON.parse(readFileSync(trajPath, "utf8"));
+  const steps = Array.isArray(d.agent_steps) ? d.agent_steps : [];
+  const tools = steps.flatMap((s) => (s.tool_calls ?? []).map((c) => c.name)).filter(Boolean);
+  const prompt = typeof d.task === "string" ? d.task : "";
+  const summary = \`steps=\${steps.length} tools=\${[...new Set(tools)].join(",") || "none"}\`;
+  spawnSync("yongyi", ["hook", "trae", "stop"], {
+    input: JSON.stringify({ session_id: sessionId, prompt, summary }),
+    timeout: 10000,
+    stdio: ["pipe", "ignore", "inherit"],
+  });
+} catch (err) {
+  console.error("[yongyi-harvest] failed:", err?.message ?? err);
+}
+`;
+}
+
+export function applyTrae(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  const configPath = `${t.homeDir}/.trae/trae_config.yaml`;
+  // trae's MCP transport is stdio-only, so the server entry is a supergateway
+  // bridge; that is the same shape the facet CLI writes for this target.
+  const files: FileWrite[] = [
+    applyServerEntry(configPath, ["mcp_servers", MCP_SERVER_NAME], {
+      command: "npx",
+      args: ["-y", "supergateway", "--streamableHttp", mcpUrlFor(baseUrl),
+             "--oauth2Bearer", "${" + envVar + "}"],
+    }),
+  ];
+  const path = traeHarvestPath(t);
+  const body = traeHarvestJs();
+  const existed = existsSync(path);
+  if (existed && readFileSync(path, "utf8") === body) {
+    files.push({ path, action: "unchanged" });
+  } else {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, body);
+    files.push({ path, action: existed ? "updated" : "created" });
+  }
+  return files;
+}
+
+export function disconnectTrae(t: ConnectTargets): FileWrite[] {
+  const files = [removeServerEntry(`${t.homeDir}/.trae/trae_config.yaml`, ["mcp_servers", MCP_SERVER_NAME])];
+  const path = traeHarvestPath(t);
+  if (existsSync(path)) {
+    rmSync(path, { force: true });
+    files.push({ path, action: "removed" });
+  } else {
+    files.push({ path, action: "absent" });
+  }
+  return files;
+}
