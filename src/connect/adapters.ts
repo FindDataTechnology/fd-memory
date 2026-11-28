@@ -705,6 +705,9 @@ export default function handler(event) {
       tool_name: ctx.toolName ?? ctx.tool_name,
     };
     spawnSync("yongyi", ["hook", "openclaw", ourEvent], {
+      // Windows resolves yongyi through a .cmd shim; spawnSync cannot exec that
+      // directly, so the forward silently no-ops there (found on windows-admin).
+      shell: process.platform === "win32",
       input: JSON.stringify(payload),
       timeout: 10000,
       stdio: ["pipe", "ignore", "inherit"],
@@ -776,6 +779,7 @@ import { spawnSync } from "node:child_process";
 function forward(event, payload) {
   try {
     spawnSync("yongyi", ["hook", "opencode", event], {
+      shell: process.platform === "win32",
       input: JSON.stringify(payload),
       timeout: 10000,
       stdio: ["pipe", "ignore", "inherit"],
@@ -878,6 +882,7 @@ import { spawnSync } from "node:child_process";
 function forward(event, payload) {
   try {
     spawnSync("yongyi", ["hook", "pi", event], {
+      shell: process.platform === "win32",
       input: JSON.stringify(payload),
       timeout: 10000,
       stdio: ["pipe", "ignore", "inherit"],
@@ -973,6 +978,7 @@ try {
   const prompt = typeof d.task === "string" ? d.task : "";
   const summary = \`steps=\${steps.length} tools=\${[...new Set(tools)].join(",") || "none"}\`;
   spawnSync("yongyi", ["hook", "trae", "stop"], {
+    shell: process.platform === "win32",
     input: JSON.stringify({ session_id: sessionId, prompt, summary }),
     timeout: 10000,
     stdio: ["pipe", "ignore", "inherit"],
