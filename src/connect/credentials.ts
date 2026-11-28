@@ -27,7 +27,8 @@ export type Harness =
   | "openclaw"
   | "opencode"
   | "pi"
-  | "trae";
+  | "trae"
+  | "qoder";
 
 export interface Binding {
   url: string;

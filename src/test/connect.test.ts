@@ -1195,3 +1195,48 @@ test("trae: re-running connect is a no-op; disconnect removes the harvester", as
 test("trae: recall is none because capture is post-run, not mid-turn", () => {
   assert.equal(INJECTION_ENVELOPE["trae"], "none");
 });
+
+// ── qoder (yongyi-capture-six-harnesses S4, corrected) ──────────────────────
+// Two earlier claims were wrong and these tests exist to keep them from coming
+// back: qoder does NOT require interactive login (PAT env var is documented for
+// CI), and it DOES have a hook surface — claude-code shaped, which is why
+// `qodercli hooks migrate` can import from it.
+test("qoder: connect writes hooks in the claude-code shape plus the MCP entry", async () => {
+  const { applyQoder, qoderSettingsPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-qoder-");
+  const proj = tmp("fdm-qoderp-");
+  const t = targetsFor(home, proj);
+  applyQoder(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const doc = JSON.parse(readFileSync(qoderSettingsPath(t), "utf8"));
+  assert.equal(doc.mcpServers["fd-memory"].httpUrl, "http://127.0.0.1:49376/mcp");
+  assert.equal(doc.mcpServers["fd-memory"].headers.Authorization, "Bearer ${YONGYI_TOKEN_TEST}");
+
+  // hooks.<Event>[] of { hooks: [{type:"command", command}] } — same as claude-code
+  assert.ok(doc.hooks, "hooks block must exist");
+  const flat = JSON.stringify(doc.hooks);
+  assert.ok(flat.includes("hook qoder session-start"), "SessionStart hook must be wired");
+  assert.ok(flat.includes("hook qoder post-tool-use"), "PostToolUse hook must be wired");
+});
+
+test("qoder: idempotent re-run and clean disconnect", async () => {
+  const { applyQoder, disconnectQoder, qoderSettingsPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-qoder2-");
+  const proj = tmp("fdm-qoder2p-");
+  const t = targetsFor(home, proj);
+  applyQoder(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const first = readFileSync(qoderSettingsPath(t), "utf8");
+  applyQoder(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  assert.equal(readFileSync(qoderSettingsPath(t), "utf8"), first, "second run must not change the file");
+
+  disconnectQoder(t);
+  const doc = JSON.parse(readFileSync(qoderSettingsPath(t), "utf8"));
+  assert.equal(doc.mcpServers?.["fd-memory"], undefined);
+  assert.ok(!JSON.stringify(doc.hooks ?? {}).includes("hook qoder"), "our hooks must be gone");
+});
+
+test("qoder: recall uses the claude-code envelope because the hook contract is the same", () => {
+  assert.equal(INJECTION_ENVELOPE["qoder"], "hookSpecificOutput");
+  const p = injectionPayload("qoder", "ctx") as { hookSpecificOutput?: { additionalContext?: string } };
+  assert.equal(p.hookSpecificOutput?.additionalContext, "ctx");
+});

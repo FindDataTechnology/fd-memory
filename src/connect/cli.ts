@@ -15,6 +15,7 @@ import {
   applyOpencode,
   applyPi,
   applyTrae,
+  applyQoder,
   applyWorkbuddy,
   applyZcode,
   cozeDisconnectNotes,
@@ -28,6 +29,7 @@ import {
   disconnectOpencode,
   disconnectPi,
   disconnectTrae,
+  disconnectQoder,
   disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
@@ -65,13 +67,14 @@ export const CONNECT_USAGE = `usage:
   yongyi connect opencode --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect pi --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect trae --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect qoder --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
   yongyi connect dify --url <service-url> --as <user> [--project P]
   yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
-const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode", "pi", "trae"] as const;
+const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode", "pi", "trae", "qoder"] as const;
 
 // ── Recall-injection envelope, per harness (2026-11-18) ─────────────────────
 //
@@ -117,6 +120,8 @@ export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
   pi: "none",
   // trae is harvested after the run, never mid-turn, so it has no injection point.
   trae: "none",
+  // qoder's hooks are claude-code shaped, so the envelope is too.
+  qoder: "hookSpecificOutput",
 };
 
 /**
@@ -147,7 +152,7 @@ export function injectionPayload(harness: string, ctx: string): Record<string, u
 const RECIPE_HARNESSES = ["dify", "coze"] as const;
 
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode", "pi", "trae", "mcp", "dify", "coze"];
+  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode", "pi", "trae", "qoder", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -300,6 +305,8 @@ export async function runConnect(argv: string[]): Promise<void> {
     report.files = applyPi(t, url, envVar);
   } else if (harness === "trae") {
     report.files = applyTrae(t, url, envVar);
+  } else if (harness === "qoder") {
+    report.files = applyQoder(t, url, envVar);
   } else {
     report.snippet = genericMcpSnippet(url, envVar);
   }
@@ -412,6 +419,8 @@ export function runDisconnect(argv: string[]): void {
     files = disconnectPi(t);
   } else if (harness === "trae") {
     files = disconnectTrae(t);
+  } else if (harness === "qoder") {
+    files = disconnectQoder(t);
   } else if (harness === "dify") {
     const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
     files = dropBinding("dify", paths.creds, paths.env);

@@ -1018,3 +1018,39 @@ export function disconnectTrae(t: ConnectTargets): FileWrite[] {
   }
   return files;
 }
+
+// ── qoder (yongyi-capture-six-harnesses S4, corrected 2026-11-28) ────────────
+//
+// Two corrections to the earlier matrix row, both from real runs:
+//
+//  1. "qoder requires interactive login" was wrong. The docs give a PAT path
+//     (`QODER_PERSONAL_ACCESS_TOKEN`, generated at qoder.com/account/integrations)
+//     explicitly recommended for CI/CD and headless automation. This session
+//     authenticated with the device flow, but nothing here needs it.
+//  2. "no hook surface" was also wrong — qoder ships a hooks system and even a
+//     `qodercli hooks migrate` command that imports them from Claude Code. The
+//     shape is the same as claude-code's: settings.hooks.<Event>[] of
+//     { matcher?, hooks: [{ type: "command", command, timeout? }] }.
+//
+// So this adapter is the claude-code one with a different file: no bridge, no
+// post-run harvest, just the same hook wiring pointing at `yongyi hook qoder`.
+export function qoderSettingsPath(t: ConnectTargets): string {
+  return `${t.homeDir}/.qoder/settings.json`;
+}
+
+export function applyQoder(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  return [
+    applyServerEntry(qoderSettingsPath(t), ["mcpServers"], {
+      httpUrl: mcpUrlFor(baseUrl),
+      headers: { Authorization: "Bearer ${" + envVar + "}" },
+    }),
+    applyJson(qoderSettingsPath(t), (doc) => wireHooks(doc, t, "qoder")),
+  ];
+}
+
+export function disconnectQoder(t: ConnectTargets): FileWrite[] {
+  return [
+    removeServerEntry(qoderSettingsPath(t), ["mcpServers"]),
+    applyJson(qoderSettingsPath(t), (doc) => unwireHooks(doc, t, "qoder"), "removed"),
+  ];
+}
