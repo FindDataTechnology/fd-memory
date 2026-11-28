@@ -15,6 +15,7 @@
 import { mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { upsertManagedBlock, removeManagedBlock } from "./managed-block.js";
+import YAML from "yaml";
 import { MCP_SERVER_NAME, managedDisciplineBlock, disciplineText, platformDisciplineText } from "./discipline-text.js";
 import type { Harness } from "./credentials.js";
 
@@ -530,5 +531,103 @@ export function cozeDisconnectNotes(): string[] {
   return [
     "coze 未写入任何平台配置，无需在平台侧移除",
     "本侧备料（凭据文件中的 coze 绑定与导出的令牌变量）已清理；身份根与记忆数据不动",
+  ];
+}
+
+// ── hermes (yongyi-capture-six-harnesses S2) ─────────────────────────────────
+//
+// hermes keeps EVERYTHING in one YAML file: `~/.hermes/config.yaml`. Two facts
+// from the vendor docs (hermes-agent.nousresearch.com, read 2026-11-28):
+//
+//  1. Shell hooks live in a top-level `hooks:` list of
+//     `{event, command, when?}` items — NOT a per-event object map like
+//     claude-code/zcode. Events we need: `on_session_start`, `post_tool_call`,
+//     `pre_llm_call`.
+//  2. A shell hook responds by printing JSON on stdout. For `pre_llm_call` the
+//     injection shape is `{"context": "<text>"}` (a plain string also works).
+//     Empty output is a legal silent no-op. That is a THIRD envelope, distinct
+//     from claude-code's hookSpecificOutput and from a bare top-level key — so
+//     INJECTION_ENVELOPE gains a `context-key` value rather than reusing one.
+//
+// hermes asks the user to confirm each (event, command) pair on first use.
+// connect reports that so a prompt is not mistaken for a broken install.
+//
+// YAML is parsed and rewritten, never string-spliced: a text-marker edit on a
+// file that also holds `model:`, `mcp_servers:` and `plugins:` silently
+// corrupts the wrong block (that exact failure has bitten this workspace).
+export function hermesConfigPath(t: ConnectTargets): string {
+  return `${t.homeDir}/.hermes/config.yaml`;
+}
+
+/** The hook events we install, mapped to the kebab spelling `hook` accepts. */
+const HERMES_HOOKS: ReadonlyArray<readonly [string, HookEventName]> = [
+  ["on_session_start", "SessionStart"],
+  ["post_tool_call", "PostToolUse"],
+  ["pre_llm_call", "SessionStart"], // recall injection rides SessionStart's payload
+];
+
+function readYamlDoc(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  const parsed = YAML.parse(readFileSync(path, "utf8")) as unknown;
+  if (parsed === null || parsed === undefined) return {};
+  if (typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`connect: target file is not a YAML mapping: ${path}`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function yamlChanged(path: string, doc: Record<string, unknown>, before: string): FileWrite {
+  const next = YAML.stringify(doc);
+  if (next === before) return { path, action: "unchanged" };
+  const existed = existsSync(path);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, next);
+  return { path, action: existed ? "updated" : "created" };
+}
+
+export function applyHermes(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  const path = hermesConfigPath(t);
+  const doc = readYamlDoc(path);
+  const before = JSON.stringify(doc);
+
+  const servers = (doc.mcp_servers ??= {}) as Record<string, unknown>;
+  servers[MCP_SERVER_NAME] = { url: mcpUrlFor(baseUrl), headers: { Authorization: "Bearer ${" + envVar + "}" } };
+
+  const hooks = Array.isArray(doc.hooks) ? (doc.hooks as unknown[]) : ((doc.hooks = []), doc.hooks as unknown[]);
+  // Match on BOTH event and command: all our entries share one command prefix
+  // (`yongyi hook hermes `), so matching on the prefix alone collapses the
+  // three events into one slot (found by the test below, 2026-11-28).
+  for (const [event, name] of HERMES_HOOKS) {
+    const command = hookCommand(t, "hermes", name);
+    const at = hooks.findIndex(
+      (h) =>
+        (h as { event?: unknown })?.event === event &&
+        typeof (h as { command?: unknown })?.command === "string" &&
+        (h as { command: string }).command === command,
+    );
+    if (at >= 0) hooks[at] = { event, command, timeout: 10 };
+    else hooks.push({ event, command, timeout: 10 });
+  }
+  return [applyMarkdownBlock(t.projectDir + "/AGENTS.md"), yamlChanged(path, doc, before)];
+}
+
+export function disconnectHermes(t: ConnectTargets): FileWrite[] {
+  const path = hermesConfigPath(t);
+  if (!existsSync(path)) return [{ path, action: "absent" }];
+  const doc = readYamlDoc(path);
+  const before = JSON.stringify(doc);
+
+  const servers = doc.mcp_servers as Record<string, unknown> | undefined;
+  if (servers && MCP_SERVER_NAME in servers) delete servers[MCP_SERVER_NAME];
+  if (Array.isArray(doc.hooks)) {
+    doc.hooks = (doc.hooks as unknown[]).filter(
+      (h) => !(typeof (h as { command?: unknown })?.command === "string" &&
+        (h as { command: string }).command.startsWith(hookPrefix(t, "hermes"))),
+    );
+  }
+  const written = yamlChanged(path, doc, before);
+  return [
+    { ...written, action: written.action === "unchanged" ? "unchanged" : "removed" },
+    removeMarkdownBlock(t.projectDir + "/AGENTS.md"),
   ];
 }

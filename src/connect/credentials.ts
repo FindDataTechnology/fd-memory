@@ -22,7 +22,8 @@ export type Harness =
   | "qwen"
   | "mcp"
   | "dify"
-  | "coze";
+  | "coze"
+  | "hermes";
 
 export interface Binding {
   url: string;

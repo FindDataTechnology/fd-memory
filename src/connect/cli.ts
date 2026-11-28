@@ -10,6 +10,7 @@ import { readInjectionState, recordInjection, stalenessNote } from "./injection-
 import {
   applyClaudeCode,
   applyGeminiFamily,
+  applyHermes,
   applyWorkbuddy,
   applyZcode,
   cozeDisconnectNotes,
@@ -18,6 +19,7 @@ import {
   difyRecipe,
   disconnectClaudeCode,
   disconnectGeminiFamily,
+  disconnectHermes,
   disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
@@ -50,13 +52,14 @@ export const CONNECT_USAGE = `usage:
   yongyi connect workbuddy --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect gemini-cli --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect qwen --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect hermes --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
   yongyi connect dify --url <service-url> --as <user> [--project P]
   yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
-const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen"] as const;
+const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes"] as const;
 
 // ── Recall-injection envelope, per harness (2026-11-18) ─────────────────────
 //
@@ -77,7 +80,7 @@ const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen
 //
 // `none` means: do not emit a guessed envelope. Absence is honest; a wrong shape
 // is a silent no-op that reads as working.
-export type InjectionEnvelope = "hookSpecificOutput" | "top-level" | "none";
+export type InjectionEnvelope = "hookSpecificOutput" | "top-level" | "context-key" | "none";
 
 export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
   "claude-code": "hookSpecificOutput",
@@ -86,6 +89,9 @@ export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
   "gemini-cli": "hookSpecificOutput",
   qwen: "hookSpecificOutput",
   zcode: "none",
+  // hermes shell hooks answer on stdout; `pre_llm_call` takes {"context": "..."}
+  // (a bare string is equivalent). Vendor docs, read 2026-11-28.
+  hermes: "context-key",
 };
 
 /**
@@ -100,6 +106,10 @@ export function injectionPayload(harness: string, ctx: string): Record<string, u
       return { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: ctx } };
     case "top-level":
       return { additionalContext: ctx };
+    // hermes: the shell hook's stdout JSON. Empty output is its legal no-op,
+    // which is why `{}` stays the answer for "nothing to say".
+    case "context-key":
+      return { context: ctx };
     default:
       return {};
   }
@@ -112,7 +122,7 @@ export function injectionPayload(harness: string, ctx: string): Record<string, u
 const RECIPE_HARNESSES = ["dify", "coze"] as const;
 
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "mcp", "dify", "coze"];
+  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -255,6 +265,8 @@ export async function runConnect(argv: string[]): Promise<void> {
     report.files = applyGeminiFamily(t, ".gemini", "gemini-cli", url, envVar);
   } else if (harness === "qwen") {
     report.files = applyGeminiFamily(t, ".qwen", "qwen", url, envVar);
+  } else if (harness === "hermes") {
+    report.files = applyHermes(t, url, envVar);
   } else {
     report.snippet = genericMcpSnippet(url, envVar);
   }
@@ -357,6 +369,8 @@ export function runDisconnect(argv: string[]): void {
     files = disconnectGeminiFamily(t, ".gemini", "gemini-cli");
   } else if (harness === "qwen") {
     files = disconnectGeminiFamily(t, ".qwen", "qwen");
+  } else if (harness === "hermes") {
+    files = disconnectHermes(t);
   } else if (harness === "dify") {
     const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
     files = dropBinding("dify", paths.creds, paths.env);

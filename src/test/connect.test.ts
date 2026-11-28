@@ -911,3 +911,96 @@ test("connect writes the export block to .zshenv, not .zshrc", async () => {
   assert.match(zshenv, /# >>> yongyi >>>/, ".zshenv must carry the block — every shell mode reads it");
   assert.equal(existsSync(join(home, ".zshrc")), false, "must not touch .zshrc (interactive-only, wrong target)");
 });
+
+// ── hermes (yongyi-capture-six-harnesses S2) ─────────────────────────────────
+// hermes stores everything in ONE YAML file, so this adapter parses and
+// rewrites `~/.hermes/config.yaml` rather than splicing text. These tests pin
+// the three things that would otherwise fail silently:
+//   • the hook list shape ({event, command}) is what hermes reads, not a per-event map;
+//   • a re-run adds no second copy of our entries;
+//   • our edits leave the user's own config (model, mcp_servers, their hooks) alone.
+test("hermes: connect writes mcp_servers + hooks into config.yaml, preserving the rest", async () => {
+  const { applyHermes, hermesConfigPath } = await import("../connect/adapters.js");
+  const YAML = (await import("yaml")).default;
+  const home = tmp("fdm-hermes-");
+  const proj = tmp("fdm-hermesp-");
+  mkdirSync(join(home, ".hermes"), { recursive: true });
+  writeFileSync(
+    join(home, ".hermes", "config.yaml"),
+    "model:\n  default: my-model\n  provider: custom\nhooks:\n  - event: post_tool_call\n    command: \"echo user-own\"\n",
+  );
+
+  const t = targetsFor(home, proj);
+  applyHermes(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const doc = YAML.parse(readFileSync(hermesConfigPath(t), "utf8"));
+
+  // user content survives verbatim
+  assert.equal(doc.model.default, "my-model", "unrelated sections must be preserved");
+  assert.equal(doc.model.provider, "custom");
+
+  // our MCP entry is hermes' shape: url + headers (not type/httpUrl)
+  const srv = doc.mcp_servers["fd-memory"];
+  assert.equal(srv.url, "http://127.0.0.1:49376/mcp");
+  assert.equal(srv.headers.Authorization, "Bearer ${YONGYI_TOKEN_TEST}", "token stays an env reference, never a literal");
+
+  // hooks is a LIST of {event, command} — hermes reads that, not a map
+  assert.ok(Array.isArray(doc.hooks), "hooks must stay a list");
+  const ours = doc.hooks.filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes "));
+  assert.equal(ours.length, 3, "one entry per installed event");
+  assert.deepEqual(
+    ours.map((h: { event: string }) => h.event).sort(),
+    ["on_session_start", "post_tool_call", "pre_llm_call"],
+  );
+  // the user's own hook is untouched
+  assert.ok(
+    doc.hooks.some((h: { command?: string }) => h.command === "echo user-own"),
+    "a user hook on the same file must survive",
+  );
+});
+
+test("hermes: re-running connect is idempotent", async () => {
+  const { applyHermes } = await import("../connect/adapters.js");
+  const YAML = (await import("yaml")).default;
+  const home = tmp("fdm-hermes2-");
+  const proj = tmp("fdm-hermes2p-");
+  const t = targetsFor(home, proj);
+  applyHermes(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const first = readFileSync(join(home, ".hermes", "config.yaml"), "utf8");
+  applyHermes(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const second = readFileSync(join(home, ".hermes", "config.yaml"), "utf8");
+  assert.equal(second, first, "a second run must not change the file");
+  const doc = YAML.parse(second);
+  assert.equal(doc.hooks.filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes ")).length, 3);
+});
+
+test("hermes: disconnect removes our artifacts and keeps memory-side config", async () => {
+  const { applyHermes, disconnectHermes, hermesConfigPath } = await import("../connect/adapters.js");
+  const YAML = (await import("yaml")).default;
+  const home = tmp("fdm-hermes3-");
+  const proj = tmp("fdm-hermes3p-");
+  const t = targetsFor(home, proj);
+  applyHermes(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  disconnectHermes(t);
+  const doc = YAML.parse(readFileSync(hermesConfigPath(t), "utf8"));
+  assert.equal(doc.mcp_servers?.["fd-memory"], undefined, "our MCP entry must be gone");
+  assert.equal(
+    (doc.hooks ?? []).filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes ")).length,
+    0,
+    "our hooks must be gone",
+  );
+});
+
+test("hermes: recall envelope is context-key, and empty context stays a no-op", () => {
+  assert.equal(INJECTION_ENVELOPE["hermes"], "context-key");
+  assert.deepEqual(injectionPayload("hermes", "remember this"), { context: "remember this" });
+  assert.deepEqual(injectionPayload("hermes", ""), {}, "no text means no output at all");
+});
+
+test("hermes: usage text and supported set agree", () => {
+  const harnesses = connectHarnesses();
+  assert.ok(harnesses.includes("hermes"));
+  for (const h of harnesses) {
+    assert.ok(CONNECT_USAGE.includes(`connect ${h} `), `${h} missing from usage text`);
+  }
+});
