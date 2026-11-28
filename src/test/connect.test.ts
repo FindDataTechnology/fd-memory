@@ -1121,3 +1121,39 @@ test("opencode: recall envelope stays none until an injection is observed", () =
   assert.equal(INJECTION_ENVELOPE["opencode"], "none");
   assert.deepEqual(injectionPayload("opencode", "text"), {});
 });
+
+// ── pi (yongyi-capture-six-harnesses S4) ─────────────────────────────────────
+test("pi: connect writes the extension and the flat mcp.json entry", async () => {
+  const { applyPi, piExtensionPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-pi-");
+  const proj = tmp("fdm-pip-");
+  const t = targetsFor(home, proj);
+  applyPi(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const mcp = JSON.parse(readFileSync(join(home, ".pi", "agent", "mcp.json"), "utf8"));
+  assert.equal(mcp["fd-memory"].url, "http://127.0.0.1:49376/mcp");
+  assert.equal(mcp["fd-memory"].headers.Authorization, "Bearer ${YONGYI_TOKEN_TEST}");
+
+  const body = readFileSync(piExtensionPath(t), "utf8");
+  assert.ok(body.includes('pi.on("message_end"'), "must hook message_end");
+  assert.ok(body.includes('pi.on("tool_call"'), "must hook tool_call");
+  assert.ok(body.includes("timeout: 10000"), "bounded");
+  assert.ok(body.includes("catch"), "fail-open");
+});
+
+test("pi: re-running connect is a no-op; disconnect removes the extension", async () => {
+  const { applyPi, disconnectPi, piExtensionPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-pi2-");
+  const proj = tmp("fdm-pi2p-");
+  const t = targetsFor(home, proj);
+  applyPi(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const second = applyPi(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  assert.ok(second.every((f) => f.action === "unchanged"), "second run must change nothing");
+
+  disconnectPi(t);
+  assert.equal(existsSync(piExtensionPath(t)), false);
+});
+
+test("pi: recall envelope stays none until an injection is observed", () => {
+  assert.equal(INJECTION_ENVELOPE["pi"], "none");
+});

@@ -856,3 +856,79 @@ export function disconnectOpencode(t: ConnectTargets): FileWrite[] {
   }
   return files;
 }
+
+// ── pi (yongyi-capture-six-harnesses S4) ─────────────────────────────────────
+//
+// pi ships an extension API with a real event surface (`pi.on(name, handler)`,
+// vendor docs read 2026-11-28): session_start, tool_call, message_end. An
+// earlier matrix row called pi "no mountable turn surface" — that judged the
+// wrong thing; the surface exists, it is just a JS extension rather than a hook.
+//
+// Extensions live under the agent dir: <PI_CODING_AGENT_DIR>/extensions/ (default
+// ~/.pi/agent/extensions/). Same bridge discipline as openclaw/opencode.
+export function piExtensionPath(t: ConnectTargets): string {
+  return `${t.homeDir}/.pi/agent/extensions/yongyi-bridge.js`;
+}
+
+function piExtensionJs(): string {
+  return `// Managed by \`yongyi connect pi\` — rewritten on every connect.
+// Fail-open: runs in-process inside the agent, so a throw would break the turn.
+import { spawnSync } from "node:child_process";
+
+function forward(event, payload) {
+  try {
+    spawnSync("yongyi", ["hook", "pi", event], {
+      input: JSON.stringify(payload),
+      timeout: 10000,
+      stdio: ["pipe", "ignore", "inherit"],
+    });
+  } catch (err) {
+    console.error("[yongyi-bridge] forward failed:", err?.message ?? err);
+  }
+}
+
+export default function (pi) {
+  pi.on("message_end", async (event) => {
+    if (event?.message?.role !== "assistant") return;
+    const text = typeof event.message.content === "string" ? event.message.content : "";
+    forward("stop", { session_id: event?.sessionId, prompt: text });
+  });
+
+  pi.on("tool_call", async (event) => {
+    forward("post-tool-use", { session_id: event?.sessionId, tool_name: event?.toolName ?? event?.name });
+  });
+}
+`;
+}
+
+export function applyPi(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  const files: FileWrite[] = [
+    applyServerEntry(`${t.homeDir}/.pi/agent/mcp.json`, [], {
+      url: mcpUrlFor(baseUrl),
+      headers: { Authorization: "Bearer ${" + envVar + "}" },
+    }),
+  ];
+  const path = piExtensionPath(t);
+  const body = piExtensionJs();
+  const existed = existsSync(path);
+  if (existed && readFileSync(path, "utf8") === body) {
+    files.push({ path, action: "unchanged" });
+  } else {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, body);
+    files.push({ path, action: existed ? "updated" : "created" });
+  }
+  return files;
+}
+
+export function disconnectPi(t: ConnectTargets): FileWrite[] {
+  const files = [removeServerEntry(`${t.homeDir}/.pi/agent/mcp.json`, [])];
+  const path = piExtensionPath(t);
+  if (existsSync(path)) {
+    rmSync(path, { force: true });
+    files.push({ path, action: "removed" });
+  } else {
+    files.push({ path, action: "absent" });
+  }
+  return files;
+}
