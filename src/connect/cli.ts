@@ -943,7 +943,9 @@ export async function runHook(argv: string[], readStdin: () => Promise<string>):
   const harness = positionals[0];
   const rawEvent = positionals[1];
   if (!harness || !rawEvent || !HOOK_HARNESSES.includes(harness as (typeof HOOK_HARNESSES)[number])) {
-    console.error(`usage: yongyi hook <claude-code|zcode|workbuddy|gemini-cli|qwen> <event>  (stdin: hook event JSON)\n${CONNECT_USAGE}`);
+    // Derived from HOOK_HARNESSES, never hand-copied: a hard-coded list here is
+    // how `hermes` shipped for a few minutes with a usage line that denied it.
+    console.error(`usage: yongyi hook <${HOOK_HARNESSES.join("|")}> <event>  (stdin: hook event JSON)\n${CONNECT_USAGE}`);
     process.exit(2);
   }
   const event = normalizeHookEvent(rawEvent);
