@@ -754,3 +754,105 @@ export function disconnectOpenclaw(t: ConnectTargets): FileWrite[] {
   }
   return files;
 }
+
+// ── opencode (yongyi-capture-six-harnesses S4) ───────────────────────────────
+//
+// opencode's plugin API is a JS module surface, like openclaw — but it is
+// registered by PATH in `opencode.json`'s `plugin` array rather than discovered
+// from a directory. Vendor docs (opencode plugins/server, read 2026-11-28):
+//   ctx.session.hook("prompt", cb)          — every turn's prompt
+//   ctx.tool.hook("execute.after", cb)      — after each tool call
+// Both run in-process, so the same three properties apply as openclaw:
+// fail-open, bounded, and no second event-mapping table.
+export function opencodePluginPath(t: ConnectTargets): string {
+  return `${t.homeDir}/.config/opencode/plugins/yongyi-bridge.js`;
+}
+
+function opencodePluginJs(): string {
+  return `// Managed by \`yongyi connect opencode\` — rewritten on every connect.
+// Fail-open: this runs in-process, so a throw would break opencode's hook path.
+import { spawnSync } from "node:child_process";
+
+function forward(event, payload) {
+  try {
+    spawnSync("yongyi", ["hook", "opencode", event], {
+      input: JSON.stringify(payload),
+      timeout: 10000,
+      stdio: ["pipe", "ignore", "inherit"],
+    });
+  } catch (err) {
+    console.error("[yongyi-bridge] forward failed:", err?.message ?? err);
+  }
+}
+
+export const YongyiBridge = async ({ ctx }) => {
+  await ctx.session.hook("prompt", (event) => {
+    const text = (event?.messages ?? [])
+      .filter((m) => m?.role === "user")
+      .map((m) => (typeof m.content === "string" ? m.content : ""))
+      .join("\\n");
+    forward("stop", { session_id: event?.sessionID, prompt: text });
+  });
+
+  await ctx.tool.hook("execute.after", (event) => {
+    forward("post-tool-use", {
+      session_id: event?.sessionID,
+      tool_name: event?.tool,
+      summary: event?.status,
+    });
+  });
+};
+`;
+}
+
+export function applyOpencode(t: ConnectTargets, baseUrl: string, envVar: string): FileWrite[] {
+  const pluginPath = opencodePluginPath(t);
+  const files: FileWrite[] = [];
+
+  // MCP entry: `mcp.<name>` with type remote (the shape facet writes too).
+  files.push(
+    applyServerEntry(`${t.homeDir}/.config/opencode/opencode.json`, ["mcp"], {
+      type: "remote",
+      url: mcpUrlFor(baseUrl),
+      headers: { Authorization: "Bearer ${" + envVar + "}" },
+      enabled: true,
+    }),
+  );
+
+  // Plugin registration: `plugin` is a path array.
+  files.push(
+    applyJson(`${t.homeDir}/.config/opencode/opencode.json`, (doc) => {
+      const list = Array.isArray(doc.plugin) ? (doc.plugin as unknown[]) : ((doc.plugin = []), doc.plugin as unknown[]);
+      if (!list.some((p) => p === pluginPath)) list.push(pluginPath);
+    }),
+  );
+
+  const body = opencodePluginJs();
+  const existed = existsSync(pluginPath);
+  if (existed && readFileSync(pluginPath, "utf8") === body) {
+    files.push({ path: pluginPath, action: "unchanged" });
+  } else {
+    mkdirSync(dirname(pluginPath), { recursive: true });
+    writeFileSync(pluginPath, body);
+    files.push({ path: pluginPath, action: existed ? "updated" : "created" });
+  }
+  return files;
+}
+
+export function disconnectOpencode(t: ConnectTargets): FileWrite[] {
+  const pluginPath = opencodePluginPath(t);
+  const files: FileWrite[] = [
+    removeServerEntry(`${t.homeDir}/.config/opencode/opencode.json`, ["mcp"]),
+    applyJson(`${t.homeDir}/.config/opencode/opencode.json`, (doc) => {
+      if (!Array.isArray(doc.plugin)) return;
+      doc.plugin = (doc.plugin as unknown[]).filter((p) => p !== pluginPath);
+    }, "removed"),
+  ];
+  if (existsSync(pluginPath)) {
+    rmSync(pluginPath, { force: true });
+    files.push({ path: pluginPath, action: "removed" });
+  } else {
+    files.push({ path: pluginPath, action: "absent" });
+  }
+  return files;
+}

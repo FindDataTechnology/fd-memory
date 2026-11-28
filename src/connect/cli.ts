@@ -12,6 +12,7 @@ import {
   applyGeminiFamily,
   applyHermes,
   applyOpenclaw,
+  applyOpencode,
   applyWorkbuddy,
   applyZcode,
   cozeDisconnectNotes,
@@ -22,6 +23,7 @@ import {
   disconnectGeminiFamily,
   disconnectHermes,
   disconnectOpenclaw,
+  disconnectOpencode,
   disconnectWorkbuddy,
   disconnectZcode,
   genericMcpSnippet,
@@ -56,13 +58,14 @@ export const CONNECT_USAGE = `usage:
   yongyi connect qwen --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect hermes --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect openclaw --url <service-url> --as <user> [--project P] [--dir D]
+  yongyi connect opencode --url <service-url> --as <user> [--project P] [--dir D]
   yongyi connect mcp --url <service-url> [--as <user>]
   yongyi connect dify --url <service-url> --as <user> [--project P]
   yongyi connect coze --url <service-url> --as <user>
   yongyi disconnect <harness>
   yongyi hook <harness> <event>        (reads hook event JSON on stdin)`;
 
-const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw"] as const;
+const HOOK_HARNESSES = ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode"] as const;
 
 // ── Recall-injection envelope, per harness (2026-11-18) ─────────────────────
 //
@@ -99,6 +102,10 @@ export const INJECTION_ENVELOPE: Record<string, InjectionEnvelope> = {
   // inject); recall would ride the before_prompt_build plugin hook, which this
   // adapter does not install. `none` is the honest answer until that lands.
   openclaw: "none",
+  // opencode's `prompt` hook receives the full message list and can rewrite it,
+  // so recall is achievable — but only once a real injection is observed. Until
+  // then `none`, per the rule this table exists to enforce.
+  opencode: "none",
 };
 
 /**
@@ -129,7 +136,7 @@ export function injectionPayload(harness: string, ctx: string): Record<string, u
 const RECIPE_HARNESSES = ["dify", "coze"] as const;
 
 export function connectHarnesses(): readonly string[] {
-  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "mcp", "dify", "coze"];
+  return ["claude-code", "zcode", "workbuddy", "gemini-cli", "qwen", "hermes", "openclaw", "opencode", "mcp", "dify", "coze"];
 }
 
 interface ParsedArgs {
@@ -276,6 +283,8 @@ export async function runConnect(argv: string[]): Promise<void> {
     report.files = applyHermes(t, url, envVar);
   } else if (harness === "openclaw") {
     report.files = applyOpenclaw(t, url, envVar);
+  } else if (harness === "opencode") {
+    report.files = applyOpencode(t, url, envVar);
   } else {
     report.snippet = genericMcpSnippet(url, envVar);
   }
@@ -382,6 +391,8 @@ export function runDisconnect(argv: string[]): void {
     files = disconnectHermes(t);
   } else if (harness === "openclaw") {
     files = disconnectOpenclaw(t);
+  } else if (harness === "opencode") {
+    files = disconnectOpencode(t);
   } else if (harness === "dify") {
     const boundUrl = loadCredentials(paths.creds).bindings["dify"]?.url ?? defaultServiceUrl();
     files = dropBinding("dify", paths.creds, paths.env);

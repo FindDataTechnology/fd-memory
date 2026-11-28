@@ -1068,3 +1068,56 @@ test("openclaw: recall envelope stays none until a real injection face is wired"
   assert.equal(INJECTION_ENVELOPE["openclaw"], "none");
   assert.deepEqual(injectionPayload("openclaw", "text"), {}, "none emits nothing rather than a guess");
 });
+
+// ── opencode (yongyi-capture-six-harnesses S4) ───────────────────────────────
+test("opencode: connect registers the plugin path and writes the bridge", async () => {
+  const { applyOpencode, opencodePluginPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-ocd-");
+  const proj = tmp("fdm-ocdp-");
+  const t = targetsFor(home, proj);
+  applyOpencode(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+
+  const cfg = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
+  assert.equal(cfg.mcp["fd-memory"].type, "remote");
+  assert.ok(Array.isArray(cfg.plugin), "plugin must be a path array");
+  assert.ok(cfg.plugin.includes(opencodePluginPath(t)), "our plugin path must be registered");
+
+  const body = readFileSync(opencodePluginPath(t), "utf8");
+  assert.ok(body.includes('ctx.session.hook("prompt"'), "must hook the prompt event");
+  assert.ok(body.includes('ctx.tool.hook("execute.after"'), "must hook tool completion");
+  assert.ok(body.includes("timeout: 10000"), "bounded");
+  assert.ok(body.includes("catch"), "fail-open");
+});
+
+test("opencode: re-running connect registers the plugin only once", async () => {
+  const { applyOpencode, opencodePluginPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-ocd2-");
+  const proj = tmp("fdm-ocd2p-");
+  const t = targetsFor(home, proj);
+  applyOpencode(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  applyOpencode(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  const cfg = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
+  assert.equal(cfg.plugin.filter((p: string) => p === opencodePluginPath(t)).length, 1);
+});
+
+test("opencode: disconnect unregisters the plugin and removes the file", async () => {
+  const { applyOpencode, disconnectOpencode, opencodePluginPath } = await import("../connect/adapters.js");
+  const home = tmp("fdm-ocd3-");
+  const proj = tmp("fdm-ocd3p-");
+  const t = targetsFor(home, proj);
+  // a user plugin that is not ours
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true });
+  writeFileSync(join(home, ".config", "opencode", "opencode.json"),
+    JSON.stringify({ plugin: ["/some/user/plugin.js"] }));
+  applyOpencode(t, "http://127.0.0.1:49376", "YONGYI_TOKEN_TEST");
+  disconnectOpencode(t);
+  const cfg = JSON.parse(readFileSync(join(home, ".config", "opencode", "opencode.json"), "utf8"));
+  assert.ok(!cfg.plugin.includes(opencodePluginPath(t)), "our plugin must be unregistered");
+  assert.ok(cfg.plugin.includes("/some/user/plugin.js"), "a user plugin must survive");
+  assert.equal(existsSync(opencodePluginPath(t)), false);
+});
+
+test("opencode: recall envelope stays none until an injection is observed", () => {
+  assert.equal(INJECTION_ENVELOPE["opencode"], "none");
+  assert.deepEqual(injectionPayload("opencode", "text"), {});
+});

@@ -24,7 +24,8 @@ export type Harness =
   | "dify"
   | "coze"
   | "hermes"
-  | "openclaw";
+  | "openclaw"
+  | "opencode";
 
 export interface Binding {
   url: string;
