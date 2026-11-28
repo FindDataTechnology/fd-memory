@@ -560,10 +560,16 @@ export function hermesConfigPath(t: ConnectTargets): string {
 }
 
 /** The hook events we install, mapped to the kebab spelling `hook` accepts. */
+// Only two entries on purpose.
+//
+// `on_session_start` is NOT installed: hermes documents its return value as
+// "Ignored", so wiring it to `yongyi hook hermes session-start` would inject
+// recall into a return slot nobody reads AND write a second observation for the
+// same session. `pre_llm_call` fires on every turn including the first, so it
+// covers both the recall injection and the session's first capture.
 const HERMES_HOOKS: ReadonlyArray<readonly [string, HookEventName]> = [
-  ["on_session_start", "SessionStart"],
+  ["pre_llm_call", "SessionStart"], // injects {"context": …} AND captures the turn
   ["post_tool_call", "PostToolUse"],
-  ["pre_llm_call", "SessionStart"], // recall injection rides SessionStart's payload
 ];
 
 function readYamlDoc(path: string): Record<string, unknown> {

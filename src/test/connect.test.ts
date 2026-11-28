@@ -947,10 +947,12 @@ test("hermes: connect writes mcp_servers + hooks into config.yaml, preserving th
   // hooks is a LIST of {event, command} — hermes reads that, not a map
   assert.ok(Array.isArray(doc.hooks), "hooks must stay a list");
   const ours = doc.hooks.filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes "));
-  assert.equal(ours.length, 3, "one entry per installed event");
+  // on_session_start is deliberately absent: hermes ignores its return value,
+  // so wiring it would double-capture without injecting anything.
+  assert.equal(ours.length, 2, "one entry per installed event");
   assert.deepEqual(
     ours.map((h: { event: string }) => h.event).sort(),
-    ["on_session_start", "post_tool_call", "pre_llm_call"],
+    ["post_tool_call", "pre_llm_call"],
   );
   // the user's own hook is untouched
   assert.ok(
@@ -971,7 +973,7 @@ test("hermes: re-running connect is idempotent", async () => {
   const second = readFileSync(join(home, ".hermes", "config.yaml"), "utf8");
   assert.equal(second, first, "a second run must not change the file");
   const doc = YAML.parse(second);
-  assert.equal(doc.hooks.filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes ")).length, 3);
+  assert.equal(doc.hooks.filter((h: { command?: string }) => String(h.command ?? "").includes(" hook hermes ")).length, 2);
 });
 
 test("hermes: disconnect removes our artifacts and keeps memory-side config", async () => {
